@@ -1,0 +1,7 @@
+numpy>=2.2.0
+PySide6>=6.8.0
+logbook>=1.9.2
+sqlalchemy==1.4.54
+beautifulsoup4>=4.13.0
+pyyaml>=6.0.3
+cryptography>=46.0.5
