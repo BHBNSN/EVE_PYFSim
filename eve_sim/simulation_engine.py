@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import logging
-import time
 
 from .agents import CommanderAgent, ShipAgent
 from .config import EngineConfig
@@ -94,9 +93,3 @@ class SimulationEngine:
             "intents": {k: asdict(v) for k, v in self.world.intents.items()},
             "squad_focus_queues": {k: list(v) for k, v in self.world.squad_focus_queues.items()},
         }
-
-    def run_blocking(self, seconds: float) -> dict:
-        end = time.perf_counter() + seconds
-        while time.perf_counter() < end:
-            self.step()
-        return self.snapshot()
