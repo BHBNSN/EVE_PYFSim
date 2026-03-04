@@ -843,44 +843,8 @@ class CombatSystem:
                 setattr(effective, attr, getattr(base, attr, getattr(effective, attr, 0.0)))
             return effective
 
-        factors = ship.runtime.diagnostics.get("pyfa_factors_map")
-        if not isinstance(factors, dict):
-            factors_raw = ship.runtime.diagnostics.get("pyfa_factors", [])
-            parsed: dict[str, float] = {}
-            for token in factors_raw:
-                if ":" not in token:
-                    continue
-                key, value = token.split(":", 1)
-                try:
-                    parsed[key.strip()] = float(value.strip())
-                except Exception:
-                    continue
-            ship.runtime.diagnostics["pyfa_factors_map"] = parsed
-            factors = parsed
-
-        def apply_pyfa_factors(profile_obj):
-            if not factors:
-                return
-            if "dps" in factors:
-                profile_obj.dps = max(0.0, profile_obj.dps * factors["dps"])
-            if "volley" in factors:
-                profile_obj.volley = max(0.0, profile_obj.volley * factors["volley"])
-            if "max_speed" in factors:
-                profile_obj.max_speed = max(1.0, profile_obj.max_speed * factors["max_speed"])
-            if "max_cap" in factors:
-                profile_obj.max_cap = max(1.0, profile_obj.max_cap * factors["max_cap"])
-            if "cap_recharge_time" in factors:
-                profile_obj.cap_recharge_time = max(1.0, profile_obj.cap_recharge_time * factors["cap_recharge_time"])
-            if "scan_resolution" in factors:
-                profile_obj.scan_resolution = max(1.0, profile_obj.scan_resolution * factors["scan_resolution"])
-            if "max_target_range" in factors:
-                profile_obj.max_target_range = max(1000.0, profile_obj.max_target_range * factors["max_target_range"])
-            if "sig_radius" in factors:
-                profile_obj.sig_radius = max(1.0, profile_obj.sig_radius * factors["sig_radius"])
-
         preserved = ship.profile
         base = replace(self.runtime.compute_base_profile(ship.runtime))
-        apply_pyfa_factors(base)
         for attr in (
             "weapon_system",
             "optimal_sig",
@@ -925,7 +889,6 @@ class CombatSystem:
         if not applied:
             return base
         effective = self.runtime.apply_projected_effects(base, applied)
-        apply_pyfa_factors(effective)
         for attr in (
             "weapon_system",
             "optimal_sig",

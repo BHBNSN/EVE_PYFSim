@@ -23,7 +23,6 @@ from .fit_runtime import (
     ModuleEffect,
     ModuleRuntime,
     ModuleState,
-    RuntimeStatEngine,
     SkillProfile,
 )
 from .math2d import Vector2
@@ -226,306 +225,172 @@ class RuntimeFromEftFactory:
         group_name = (item.group.name or "").lower()
         suffix = f"-{idx}"
 
+        def attr_opt(name: str) -> float | None:
+            value = item.getAttribute(name, None)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
         def attr(name: str, default: float = 0.0) -> float:
-            value = item.getAttribute(name, default)
+            value = attr_opt(name)
             return float(default if value is None else value)
 
-        def local(
-            module_id: str,
-            mult: dict[str, float],
-            add: dict[str, float] | None = None,
-            state: ModuleState = ModuleState.ONLINE,
-            cap_need: float = 0.0,
-            cycle: float = 5.0,
-        ):
-            return ModuleRuntime(
-                module_id=module_id,
-                group=item.group.name,
-                state=state,
-                effects=[
-                    ModuleEffect(
-                        name=module_id,
-                        effect_class=EffectClass.LOCAL,
-                        state_required=state,
-                        cap_need=max(0.0, cap_need),
-                        cycle_time=max(0.1, cycle),
-                        local_mult=mult,
-                        local_add=add or {},
-                    )
-                ],
-            )
-
-        def projected(module_id: str, mult: dict[str, float] | None = None, add: dict[str, float] | None = None, range_m: float = 0.0, falloff_m: float = 0.0, cap_need: float = 0.0, cycle: float = 5.0):
-            return ModuleRuntime(
-                module_id=module_id,
-                group=item.group.name,
-                state=ModuleState.ACTIVE,
-                effects=[
-                    ModuleEffect(
-                        name=module_id,
-                        effect_class=EffectClass.PROJECTED,
-                        state_required=ModuleState.ACTIVE,
-                        range_m=max(0.0, range_m),
-                        falloff_m=max(0.0, falloff_m),
-                        cap_need=max(0.0, cap_need),
-                        cycle_time=max(0.1, cycle),
-                        projected_mult=mult or {},
-                        projected_add=add or {},
-                    )
-                ],
-            )
-
-        if "stasis web" in group_name or "stasis grappler" in group_name:
-            factor = abs(attr("speedFactor", -55.0))
-            mult = max(0.01, 1.0 - factor / 100.0)
-            return projected(
-                f"web{suffix}",
-                mult={"speed": mult},
-                range_m=attr("maxRange", 13_000),
-                cap_need=attr("capacitorNeed", 45),
-                cycle=attr("duration", 5_000) / 1000.0,
-            )
-        if "sensor dampener" in group_name:
-            range_bonus = abs(attr("maxTargetRangeBonus", -24.0))
-            scan_bonus = abs(attr("scanResolutionBonus", -24.0))
-            return projected(
-                f"damp{suffix}",
-                mult={
-                    "range": max(0.01, 1.0 - range_bonus / 100.0),
-                    "scan": max(0.01, 1.0 - scan_bonus / 100.0),
-                },
-                range_m=attr("maxRange", 60_000),
-                falloff_m=attr("falloffEffectiveness", 20_000),
-                cap_need=attr("capacitorNeed", 55),
-                cycle=attr("duration", 8_000) / 1000.0,
-            )
-        if "tracking disruptor" in group_name or "weapon disruptor" in group_name:
-            tracking_bonus = abs(attr("trackingSpeedBonus", -25.0))
-            optimal_bonus = abs(attr("maxRangeBonus", -15.0))
-            falloff_bonus = abs(attr("falloffBonus", -15.0))
-            return projected(
-                f"td{suffix}",
-                mult={
-                    "tracking": max(0.01, 1.0 - tracking_bonus / 100.0),
-                    "optimal": max(0.01, 1.0 - optimal_bonus / 100.0),
-                    "falloff": max(0.01, 1.0 - falloff_bonus / 100.0),
-                },
-                range_m=attr("maxRange", 50_000),
-                falloff_m=attr("falloffEffectiveness", 20_000),
-                cap_need=attr("capacitorNeed", 35),
-                cycle=attr("duration", 10_000) / 1000.0,
-            )
-        if "ecm" in group_name and "burst" not in group_name:
-            jam_strength = max(
-                attr("scanGravimetricStrengthBonus", 0.0),
-                attr("scanLadarStrengthBonus", 0.0),
-                attr("scanMagnetometricStrengthBonus", 0.0),
-                attr("scanRadarStrengthBonus", 0.0),
-            )
-            suppression = max(0.0, min(0.95, jam_strength / (jam_strength + 10.0)))
-            return projected(
-                f"ecm{suffix}",
-                mult={
-                    "scan": max(0.05, 1.0 - suppression),
-                    "range": max(0.05, 1.0 - suppression),
-                },
-                range_m=attr("maxRange", 60_000),
-                falloff_m=attr("falloffEffectiveness", 20_000),
-                cap_need=attr("capacitorNeed", 40),
-                cycle=attr("duration", 20_000) / 1000.0,
-            )
-        if "target painter" in group_name:
-            sig_bonus = attr("signatureRadiusBonus", 28.0)
-            return projected(
-                f"paint{suffix}",
-                mult={"sig": 1.0 + sig_bonus / 100.0},
-                range_m=attr("maxRange", 55_000),
-                falloff_m=attr("falloffEffectiveness", 0),
-                cap_need=attr("capacitorNeed", 50),
-                cycle=attr("duration", 6_000) / 1000.0,
-            )
-        if "shield transporter" in group_name or "remote shield booster" in group_name:
-            amount = abs(attr("shieldBonus", 0.0))
-            if amount > 0:
-                return projected(
-                    f"shieldxfer{suffix}",
-                    add={"shield_rep": amount},
-                    range_m=attr("maxRange", 45_000),
-                    falloff_m=attr("falloffEffectiveness", 0),
-                    cap_need=attr("capacitorNeed", 80),
-                    cycle=attr("duration", 5_000) / 1000.0,
-                )
-        if "remote armor repair" in group_name:
-            amount = abs(attr("armorDamageAmount", 0.0))
-            if amount > 0:
-                return projected(
-                    f"armorxfer{suffix}",
-                    add={"armor_rep": amount},
-                    range_m=attr("maxRange", 30_000),
-                    falloff_m=attr("falloffEffectiveness", 0),
-                    cap_need=attr("capacitorNeed", 120),
-                    cycle=attr("duration", 6_000) / 1000.0,
-                )
-        if "energy neutralizer" in group_name:
-            return projected(
-                f"neut{suffix}",
-                add={"cap_drain": abs(attr("energyNeutralizerAmount", 220.0))},
-                range_m=attr("maxRange", 25_000),
-                cap_need=attr("capacitorNeed", 140),
-                cycle=attr("duration", 12_000) / 1000.0,
-            )
-        if "propulsion module" in group_name:
-            speed_factor = attr("speedFactor", 0.0)
-            sig_bonus = attr("signatureRadiusBonus", 0.0)
-            if speed_factor > 0:
-                return local(
-                    f"prop{suffix}",
-                    mult={"speed": 1.0 + speed_factor / 100.0, "sig": 1.0 + max(0.0, sig_bonus) / 100.0},
-                    state=ModuleState.ACTIVE,
-                    cap_need=attr("capacitorNeed", 0.0),
-                    cycle=max(0.1, attr("duration", attr("speed", 5000.0)) / 1000.0),
-                )
-        if "sensor booster" in group_name:
-            scan_bonus = attr("scanResolutionBonus", 0.0)
-            range_bonus = attr("maxTargetRangeBonus", 0.0)
-            return local(
-                f"sebo{suffix}",
-                {"scan": 1.0 + scan_bonus / 100.0, "range": 1.0 + range_bonus / 100.0},
-                state=ModuleState.ACTIVE,
-                cap_need=attr("capacitorNeed", 0.0),
-                cycle=max(0.1, attr("duration", attr("speed", 10_000.0)) / 1000.0),
-            )
-        if "tracking enhancer" in group_name:
-            tracking = attr("trackingSpeedBonus", 0.0)
-            optimal = attr("maxRangeBonus", 0.0)
-            falloff = attr("falloffBonus", 0.0)
-            return local(
-                f"te{suffix}",
-                {
-                    "tracking": 1.0 + tracking / 100.0,
-                    "optimal": 1.0 + optimal / 100.0,
-                    "falloff": 1.0 + falloff / 100.0,
-                },
-            )
-        if "tracking computer" in group_name:
-            tracking = attr("trackingSpeedBonus", 0.0)
-            optimal = attr("maxRangeBonus", 0.0)
-            falloff = attr("falloffBonus", 0.0)
-            return local(
-                f"tc{suffix}",
-                {
-                    "tracking": 1.0 + tracking / 100.0,
-                    "optimal": 1.0 + optimal / 100.0,
-                    "falloff": 1.0 + falloff / 100.0,
-                },
-                state=ModuleState.ACTIVE,
-                cap_need=attr("capacitorNeed", 0.0),
-                cycle=max(0.1, attr("duration", attr("speed", 10_000.0)) / 1000.0),
-            )
-        if "gyrostabilizer" in group_name:
-            damage_multiplier = attr("damageMultiplier", 1.0)
-            rof_multiplier = attr("speedMultiplier", 1.0)
-            dps_mult = max(0.01, damage_multiplier) * (1.0 / max(0.01, rof_multiplier))
-            return local(f"gyro{suffix}", {"dps": dps_mult})
-        if "heat sink" in group_name:
-            damage_multiplier = attr("damageMultiplier", 1.0)
-            rof_multiplier = attr("speedMultiplier", 1.0)
-            dps_mult = max(0.01, damage_multiplier) * (1.0 / max(0.01, rof_multiplier))
-            return local(f"heatsink{suffix}", {"dps": dps_mult})
-        if "ballistic control" in group_name:
-            damage_multiplier = attr("missileDamageMultiplierBonus", 1.0)
-            rof_multiplier = attr("speedMultiplier", 1.0)
-            dps_mult = max(0.01, damage_multiplier) * (1.0 / max(0.01, rof_multiplier))
-            return local(f"bcs{suffix}", {"dps": dps_mult})
-        if "damage control" in group_name:
-            return local(f"dcu{suffix}", {}, state=ModuleState.ONLINE)
-        if "magnetic field stabilizer" in group_name:
-            dmg = attr("damageMultiplierBonus", 10.0)
-            tracking = attr("trackingSpeedBonus", 0.0)
-            return local(f"magstab{suffix}", {"dps": 1.0 + dmg / 100.0, "tracking": 1.0 + tracking / 100.0})
-        if "armor repair unit" in group_name or "shield booster" in group_name:
-            rep = abs(attr("armorDamageAmount", 0.0)) + abs(attr("shieldBonus", 0.0))
-            if rep > 0:
-                return local(
-                    f"rep{suffix}",
-                    {"rep": 1.0 + min(2.0, rep / 1000.0)},
-                    state=ModuleState.ACTIVE,
-                    cap_need=attr("capacitorNeed", 0.0),
-                    cycle=max(0.1, attr("duration", attr("speed", 6000.0)) / 1000.0),
-                )
+        def pct_to_mult(value: float) -> float:
+            return max(0.01, 1.0 + value / 100.0)
 
         duration_ms = attr("duration", 0.0)
         speed_ms = attr("speed", 0.0)
         cycle_ms = duration_ms if duration_ms > 0 else speed_ms
-        duration_sec = max(0.1, cycle_ms / 1000.0)
+        cycle_sec = max(0.1, cycle_ms / 1000.0) if cycle_ms > 0 else 5.0
         cap_need = max(0.0, attr("capacitorNeed", 0.0))
-        is_active_module = (cap_need > 0.0) or (attr("duration", 0.0) > 0.0)
-        if self._is_weapon_like_group(group_name) and cycle_ms > 0.0:
-            is_active_module = True
+
+        range_m = max(0.0, attr("maxRange", 0.0))
+        falloff_m = max(0.0, attr("falloffEffectiveness", 0.0))
+        if falloff_m <= 0.0:
+            falloff_m = max(0.0, attr("falloff", 0.0))
 
         local_mult: dict[str, float] = {}
         local_add: dict[str, float] = {}
+        projected_mult: dict[str, float] = {}
+        projected_add: dict[str, float] = {}
 
-        speed_factor = attr("speedFactor", 0.0)
-        if speed_factor > 0:
-            local_mult["speed"] = max(local_mult.get("speed", 1.0), 1.0 + speed_factor / 100.0)
-        max_vel_bonus = attr("maxVelocityBonus", 0.0)
-        if max_vel_bonus > 0:
-            local_mult["speed"] = max(local_mult.get("speed", 1.0), 1.0 + max_vel_bonus / 100.0)
+        speed_factor = attr_opt("speedFactor")
+        if speed_factor is not None:
+            if speed_factor < 0 and range_m > 0:
+                projected_mult["speed"] = pct_to_mult(speed_factor)
+            elif speed_factor > 0:
+                local_mult["speed"] = max(local_mult.get("speed", 1.0), pct_to_mult(speed_factor))
 
-        sig_bonus = attr("signatureRadiusBonus", 0.0)
-        if sig_bonus != 0:
-            local_mult["sig"] = max(0.01, 1.0 + sig_bonus / 100.0)
+        max_velocity_bonus = attr_opt("maxVelocityBonus")
+        if max_velocity_bonus is not None and max_velocity_bonus > 0:
+            local_mult["speed"] = max(local_mult.get("speed", 1.0), pct_to_mult(max_velocity_bonus))
 
-        tracking_bonus = attr("trackingSpeedBonus", 0.0)
-        if tracking_bonus != 0:
-            local_mult["tracking"] = max(0.01, 1.0 + tracking_bonus / 100.0)
-        max_range_bonus = attr("maxRangeBonus", 0.0)
-        if max_range_bonus != 0:
-            local_mult["optimal"] = max(0.01, 1.0 + max_range_bonus / 100.0)
-        falloff_bonus = attr("falloffBonus", 0.0)
-        if falloff_bonus != 0:
-            local_mult["falloff"] = max(0.01, 1.0 + falloff_bonus / 100.0)
+        signature_radius_bonus = attr_opt("signatureRadiusBonus")
+        if signature_radius_bonus is not None:
+            if signature_radius_bonus > 0 and range_m > 0:
+                projected_mult["sig"] = pct_to_mult(signature_radius_bonus)
+            elif signature_radius_bonus != 0:
+                local_mult["sig"] = pct_to_mult(signature_radius_bonus)
 
-        scan_bonus = attr("scanResolutionBonus", 0.0)
-        if scan_bonus != 0:
-            local_mult["scan"] = max(0.01, 1.0 + scan_bonus / 100.0)
-        target_range_bonus = attr("maxTargetRangeBonus", 0.0)
-        if target_range_bonus != 0:
-            local_mult["range"] = max(0.01, 1.0 + target_range_bonus / 100.0)
+        for attr_name, key in (
+            ("scanResolutionBonus", "scan"),
+            ("maxTargetRangeBonus", "range"),
+            ("trackingSpeedBonus", "tracking"),
+            ("maxRangeBonus", "optimal"),
+            ("falloffBonus", "falloff"),
+        ):
+            value = attr_opt(attr_name)
+            if value is None or abs(value) < 1e-9:
+                continue
+            if value < 0 and range_m > 0:
+                projected_mult[key] = pct_to_mult(value)
+            else:
+                local_mult[key] = pct_to_mult(value)
 
-        dmg_bonus = attr("damageMultiplierBonus", 0.0)
-        if dmg_bonus == 0.0:
-            dmg_bonus = attr("missileDamageMultiplierBonus", 0.0)
-        rof_mult = attr("speedMultiplier", 1.0)
-        if dmg_bonus != 0.0 or (rof_mult > 0 and abs(rof_mult - 1.0) > 1e-6):
-            dps_mult = (1.0 + dmg_bonus / 100.0) * (1.0 / max(0.01, rof_mult))
-            local_mult["dps"] = max(0.01, dps_mult)
+        jam_strength = max(
+            attr("scanGravimetricStrengthBonus", 0.0),
+            attr("scanLadarStrengthBonus", 0.0),
+            attr("scanMagnetometricStrengthBonus", 0.0),
+            attr("scanRadarStrengthBonus", 0.0),
+        )
+        if jam_strength > 0.0 and range_m > 0.0:
+            suppression = max(0.0, min(0.95, jam_strength / (jam_strength + 10.0)))
+            projected_mult.setdefault("scan", max(0.05, 1.0 - suppression))
+            projected_mult.setdefault("range", max(0.05, 1.0 - suppression))
 
-        cap_capacity_bonus = attr("capacitorCapacityBonus", 0.0)
-        if cap_capacity_bonus != 0.0:
-            local_mult["cap_max"] = max(0.01, 1.0 + cap_capacity_bonus / 100.0)
-        cap_recharge_bonus = attr("capacitorRechargeRateMultiplier", 1.0)
-        if cap_recharge_bonus > 0 and abs(cap_recharge_bonus - 1.0) > 1e-6:
-            local_mult["cap_recharge"] = max(0.01, cap_recharge_bonus)
+        if range_m > 0.0:
+            shield_rep = abs(attr("shieldBonus", 0.0))
+            if shield_rep > 0.0:
+                projected_add["shield_rep"] = shield_rep
+            armor_rep = abs(attr("armorDamageAmount", 0.0))
+            if armor_rep > 0.0:
+                projected_add["armor_rep"] = armor_rep
+            cap_drain = abs(attr("energyNeutralizerAmount", 0.0))
+            if cap_drain > 0.0:
+                projected_add["cap_drain"] = cap_drain
+        else:
+            local_rep = abs(attr("shieldBonus", 0.0)) + abs(attr("armorDamageAmount", 0.0))
+            if local_rep > 0.0:
+                local_add["rep"] = local_add.get("rep", 0.0) + local_rep
+
+        cap_capacity_bonus = attr_opt("capacitorCapacityBonus")
+        if cap_capacity_bonus is not None and abs(cap_capacity_bonus) > 1e-9:
+            local_mult["cap_max"] = pct_to_mult(cap_capacity_bonus)
+
+        cap_recharge_mult = attr_opt("capacitorRechargeRateMultiplier")
+        if cap_recharge_mult is not None and cap_recharge_mult > 0 and abs(cap_recharge_mult - 1.0) > 1e-6:
+            local_mult["cap_recharge"] = max(0.01, cap_recharge_mult)
+
+        if not self._is_weapon_like_group(group_name):
+            damage_scale = 1.0
+            damage_multiplier_bonus = attr_opt("damageMultiplierBonus")
+            if damage_multiplier_bonus is not None and abs(damage_multiplier_bonus) > 1e-9:
+                damage_scale *= pct_to_mult(damage_multiplier_bonus)
+
+            missile_damage_bonus = attr_opt("missileDamageMultiplierBonus")
+            if missile_damage_bonus is not None and abs(missile_damage_bonus) > 1e-9:
+                if missile_damage_bonus > 2.0:
+                    damage_scale *= max(0.01, missile_damage_bonus)
+                else:
+                    damage_scale *= pct_to_mult(missile_damage_bonus)
+
+            direct_damage_multiplier = attr_opt("damageMultiplier")
+            if direct_damage_multiplier is not None and 0.0 < direct_damage_multiplier <= 2.0:
+                damage_scale *= max(0.01, direct_damage_multiplier)
+
+            rof_multiplier = attr_opt("speedMultiplier")
+            if rof_multiplier is not None and rof_multiplier > 0 and abs(rof_multiplier - 1.0) > 1e-6:
+                damage_scale *= 1.0 / max(0.01, rof_multiplier)
+
+            if abs(damage_scale - 1.0) > 1e-6:
+                local_mult["dps"] = max(0.01, damage_scale)
+
+        has_projected = bool(projected_mult or projected_add)
+        is_active_module = (cap_need > 0.0) or (cycle_ms > 0.0) or has_projected
+        if self._is_weapon_like_group(group_name) and cycle_ms > 0.0:
+            is_active_module = True
 
         state_required = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
         module_state = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
+        module_id = f"mod{suffix}"
+
+        if has_projected:
+            effect = ModuleEffect(
+                f"projected{suffix}",
+                EffectClass.PROJECTED,
+                ModuleState.ACTIVE,
+                range_m,
+                falloff_m,
+                cycle_sec,
+                cap_need,
+                {},
+                {},
+                projected_mult,
+                projected_add,
+            )
+        else:
+            effect = ModuleEffect(
+                f"local{suffix}",
+                EffectClass.LOCAL,
+                state_required,
+                0.0,
+                0.0,
+                cycle_sec,
+                cap_need if state_required == ModuleState.ACTIVE else 0.0,
+                local_mult,
+                local_add,
+                {},
+                {},
+            )
+
         return ModuleRuntime(
-            module_id=f"gen{suffix}",
-            group=item.group.name,
+            module_id=module_id,
+            group=str(item.group.name or ""),
             state=module_state,
-            effects=[
-                ModuleEffect(
-                    name=f"generic{suffix}",
-                    effect_class=EffectClass.LOCAL,
-                    state_required=state_required,
-                    cap_need=cap_need,
-                    cycle_time=duration_sec,
-                    local_mult=local_mult,
-                    local_add=local_add,
-                )
-            ],
+            effects=[effect],
         )
 
     def _hull_pyfa(self, ship_name: str) -> HullProfile | None:
@@ -543,9 +408,6 @@ class RuntimeFromEftFactory:
             role = "LOGI"
         elif any(x in group_name for x in ("electronic", "force recon", "combat recon")):
             role = "EWAR"
-
-        def resonance(name: str) -> float:
-            return max(0.01, min(1.0, attr(name, 1.0)))
 
         return HullProfile(
             ship_name=ship_item.typeName,
@@ -568,392 +430,11 @@ class RuntimeFromEftFactory:
             rep_cycle=5.0,
         )
 
-    def _derive_hull_from_fit(self, parsed: ParsedEftFit, base_hull: HullProfile) -> tuple[HullProfile, dict[str, float]]:
-        if not self._pyfa.available:
-            raise ValueError("pyfa 静态数据库不可用，无法解析数值")
-
-        total_dps = 0.0
-        total_volley = 0.0
-        weighted_optimal = 0.0
-        weighted_falloff = 0.0
-        weighted_tracking = 0.0
-        turret_weighted_optimal = 0.0
-        turret_weighted_falloff = 0.0
-        turret_weighted_tracking = 0.0
-        missile_weighted_optimal = 0.0
-        missile_weighted_falloff = 0.0
-        missile_weighted_tracking = 0.0
-        dps_weight = 0.0
-        missile_sig_radius = 0.0
-        missile_explosion_velocity = 0.0
-        missile_max_range = 0.0
-        missile_drf = 0.5
-        weighted_optimal_sig = 0.0
-        turret_dps = 0.0
-        missile_dps = 0.0
-        turret_em = turret_th = turret_ki = turret_ex = 0.0
-        missile_em = missile_th = missile_ki = missile_ex = 0.0
-        turret_cycle_weighted = 0.0
-        turret_cycle_weight = 0.0
-        missile_cycle_weighted = 0.0
-        missile_cycle_weight = 0.0
-        fitted_turret_count = 0
-        fitted_launcher_count = 0
-        turret_volley_total = 0.0
-        missile_volley_total = 0.0
-        shield_hp = base_hull.shield_hp
-        armor_hp = base_hull.armor_hp
-        structure_hp = base_hull.structure_hp
-        rep_amount = base_hull.rep_amount
-        rep_cycle = base_hull.rep_cycle
-
-        ship_item = self._pyfa.get_item(parsed.ship_name)
-        if ship_item is None:
-            raise ValueError(f"无法在 pyfa 数据库中找到舰船：{parsed.ship_name}")
-
-        def ship_attr(name: str, default: float = 1.0) -> float:
-            value = ship_item.getAttribute(name, default)
-            return float(default if value is None else value)
-
-        shield_res_em = max(0.01, min(1.0, ship_attr("shieldEmDamageResonance", 1.0)))
-        shield_res_th = max(0.01, min(1.0, ship_attr("shieldThermalDamageResonance", 1.0)))
-        shield_res_ki = max(0.01, min(1.0, ship_attr("shieldKineticDamageResonance", 1.0)))
-        shield_res_ex = max(0.01, min(1.0, ship_attr("shieldExplosiveDamageResonance", 1.0)))
-        armor_res_em = max(0.01, min(1.0, ship_attr("armorEmDamageResonance", 1.0)))
-        armor_res_th = max(0.01, min(1.0, ship_attr("armorThermalDamageResonance", 1.0)))
-        armor_res_ki = max(0.01, min(1.0, ship_attr("armorKineticDamageResonance", 1.0)))
-        armor_res_ex = max(0.01, min(1.0, ship_attr("armorExplosiveDamageResonance", 1.0)))
-        struct_res_em = max(0.01, min(1.0, ship_attr("emDamageResonance", 1.0)))
-        struct_res_th = max(0.01, min(1.0, ship_attr("thermalDamageResonance", 1.0)))
-        struct_res_ki = max(0.01, min(1.0, ship_attr("kineticDamageResonance", 1.0)))
-        struct_res_ex = max(0.01, min(1.0, ship_attr("explosiveDamageResonance", 1.0)) )
-
-        def apply_res_bonus(current: float, bonus_pct: float) -> float:
-            return max(0.01, min(1.0, current * (1.0 + bonus_pct / 100.0)))
-
-        for spec in parsed.module_specs:
-            if spec.offline:
-                continue
-            module_item_raw = self._pyfa.get_item(spec.module_name)
-            if module_item_raw is None:
-                raise ValueError(f"无法在 pyfa 数据库中找到模块：{spec.module_name}")
-            module_item = cast(Any, module_item_raw)
-
-            group_name = (module_item.group.name or "").lower()
-
-            def mod_attr(name: str, default: float = 0.0) -> float:
-                value = module_item.getAttribute(name, default)
-                return float(default if value is None else value)
-
-            charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
-            charge_item_raw = self._pyfa.get_item(charge_name) if charge_name else None
-            charge_item = cast(Any, charge_item_raw) if charge_item_raw is not None else None
-            if self._is_weapon_like_group(group_name):
-                if charge_item is None:
-                    raise ValueError(f"武器缺少可解析弹药：{spec.module_name}")
-                if not self._is_charge_compatible(module_item, charge_item):
-                    raise ValueError(f"弹药与武器口径/类型不匹配：{spec.module_name} <- {charge_name}")
-
-            def charge_attr(name: str, default: float = 0.0) -> float:
-                if charge_item is None:
-                    return float(default)
-                value = charge_item.getAttribute(name, default)
-                return float(default if value is None else value)
-
-            if "armor repair" in group_name or "shield booster" in group_name:
-                rep = abs(mod_attr("armorDamageAmount", 0.0)) + abs(mod_attr("shieldBonus", 0.0))
-                duration = mod_attr("duration", rep_cycle * 1000.0) / 1000.0
-                if rep > 0:
-                    rep_amount += rep
-                    rep_cycle = max(0.1, min(rep_cycle, duration))
-
-            shield_hp += max(0.0, mod_attr("shieldBonus", 0.0))
-            armor_hp += max(0.0, mod_attr("armorHPBonus", 0.0))
-            structure_hp += max(0.0, mod_attr("hpBonus", 0.0))
-
-            armor_em_direct = mod_attr("armorEmDamageResonance", 0.0)
-            armor_th_direct = mod_attr("armorThermalDamageResonance", 0.0)
-            armor_ki_direct = mod_attr("armorKineticDamageResonance", 0.0)
-            armor_ex_direct = mod_attr("armorExplosiveDamageResonance", 0.0)
-            shield_em_direct = mod_attr("shieldEmDamageResonance", 0.0)
-            shield_th_direct = mod_attr("shieldThermalDamageResonance", 0.0)
-            shield_ki_direct = mod_attr("shieldKineticDamageResonance", 0.0)
-            shield_ex_direct = mod_attr("shieldExplosiveDamageResonance", 0.0)
-            hull_em_direct = mod_attr("hullEmDamageResonance", 0.0)
-            hull_th_direct = mod_attr("hullThermalDamageResonance", 0.0)
-            hull_ki_direct = mod_attr("hullKineticDamageResonance", 0.0)
-            hull_ex_direct = mod_attr("hullExplosiveDamageResonance", 0.0)
-
-            if armor_em_direct > 0:
-                armor_res_em *= armor_em_direct
-            if armor_th_direct > 0:
-                armor_res_th *= armor_th_direct
-            if armor_ki_direct > 0:
-                armor_res_ki *= armor_ki_direct
-            if armor_ex_direct > 0:
-                armor_res_ex *= armor_ex_direct
-            if shield_em_direct > 0:
-                shield_res_em *= shield_em_direct
-            if shield_th_direct > 0:
-                shield_res_th *= shield_th_direct
-            if shield_ki_direct > 0:
-                shield_res_ki *= shield_ki_direct
-            if shield_ex_direct > 0:
-                shield_res_ex *= shield_ex_direct
-            if hull_em_direct > 0:
-                struct_res_em *= hull_em_direct
-            if hull_th_direct > 0:
-                struct_res_th *= hull_th_direct
-            if hull_ki_direct > 0:
-                struct_res_ki *= hull_ki_direct
-            if hull_ex_direct > 0:
-                struct_res_ex *= hull_ex_direct
-
-            em_bonus = mod_attr("emDamageResistanceBonus", 0.0)
-            th_bonus = mod_attr("thermalDamageResistanceBonus", 0.0)
-            ki_bonus = mod_attr("kineticDamageResistanceBonus", 0.0)
-            ex_bonus = mod_attr("explosiveDamageResistanceBonus", 0.0)
-
-            is_armor_resist_module = (
-                ("armor" in group_name)
-                or ("energized armor" in group_name)
-                or ("rig armor" in group_name)
-            )
-            is_shield_resist_module = ("shield" in group_name) and ("booster" not in group_name)
-
-            if is_armor_resist_module:
-                armor_res_em = apply_res_bonus(armor_res_em, em_bonus)
-                armor_res_th = apply_res_bonus(armor_res_th, th_bonus)
-                armor_res_ki = apply_res_bonus(armor_res_ki, ki_bonus)
-                armor_res_ex = apply_res_bonus(armor_res_ex, ex_bonus)
-            if is_shield_resist_module:
-                shield_res_em = apply_res_bonus(shield_res_em, em_bonus)
-                shield_res_th = apply_res_bonus(shield_res_th, th_bonus)
-                shield_res_ki = apply_res_bonus(shield_res_ki, ki_bonus)
-                shield_res_ex = apply_res_bonus(shield_res_ex, ex_bonus)
-
-            is_turret = self._is_weapon_like_group(group_name) and ("launcher" not in group_name)
-            is_launcher = "launcher" in group_name
-            if not (is_turret or is_launcher):
-                continue
-
-            cycle_time = mod_attr("speed", 0.0) / 1000.0
-            if cycle_time <= 0:
-                continue
-
-            raw_damage = (
-                charge_attr("emDamage", 0.0)
-                + charge_attr("thermalDamage", 0.0)
-                + charge_attr("kineticDamage", 0.0)
-                + charge_attr("explosiveDamage", 0.0)
-            )
-            if raw_damage <= 0:
-                continue
-
-            if is_turret:
-                fitted_turret_count += 1
-                damage_multiplier = mod_attr("damageMultiplier", 1.0)
-                volley = raw_damage * max(0.1, damage_multiplier)
-                turret_volley_total += volley
-                optimal = mod_attr("maxRange", base_hull.optimal)
-                falloff = mod_attr("falloff", base_hull.falloff)
-                tracking = mod_attr("trackingSpeed", base_hull.tracking)
-                weapon_dps = volley / max(0.1, cycle_time)
-                turret_dps += weapon_dps
-                turret_em += charge_attr("emDamage", 0.0) * max(0.1, damage_multiplier) / max(0.1, cycle_time)
-                turret_th += charge_attr("thermalDamage", 0.0) * max(0.1, damage_multiplier) / max(0.1, cycle_time)
-                turret_ki += charge_attr("kineticDamage", 0.0) * max(0.1, damage_multiplier) / max(0.1, cycle_time)
-                turret_ex += charge_attr("explosiveDamage", 0.0) * max(0.1, damage_multiplier) / max(0.1, cycle_time)
-                turret_cycle_weighted += cycle_time * weapon_dps
-                turret_cycle_weight += weapon_dps
-                weighted_optimal_sig += mod_attr("optimalSigRadius", 40000.0) * (volley / max(0.1, cycle_time))
-            else:
-                fitted_launcher_count += 1
-                volley = raw_damage
-                missile_volley_total += volley
-                velocity = charge_attr("maxVelocity", 0.0)
-                delay = charge_attr("explosionDelay", 0.0) / 1000.0
-                optimal = velocity * delay if velocity > 0 and delay > 0 else base_hull.optimal
-                falloff = 0.0
-                tracking = base_hull.tracking
-                missile_sig_radius = max(missile_sig_radius, charge_attr("aoeCloudSize", 0.0))
-                missile_explosion_velocity = max(missile_explosion_velocity, charge_attr("aoeVelocity", 0.0))
-                missile_max_range = max(missile_max_range, optimal)
-                missile_drf = charge_attr("damageReductionFactor", missile_drf)
-                weapon_dps = volley / max(0.1, cycle_time)
-                missile_dps += weapon_dps
-                missile_em += charge_attr("emDamage", 0.0) / max(0.1, cycle_time)
-                missile_th += charge_attr("thermalDamage", 0.0) / max(0.1, cycle_time)
-                missile_ki += charge_attr("kineticDamage", 0.0) / max(0.1, cycle_time)
-                missile_ex += charge_attr("explosiveDamage", 0.0) / max(0.1, cycle_time)
-                missile_cycle_weighted += cycle_time * weapon_dps
-                missile_cycle_weight += weapon_dps
-
-            dps = volley / max(0.1, cycle_time)
-            total_dps += dps
-            total_volley += volley
-            if is_turret:
-                turret_weighted_optimal += optimal * dps
-                turret_weighted_falloff += falloff * dps
-                turret_weighted_tracking += tracking * dps
-            else:
-                missile_weighted_optimal += optimal * dps
-                missile_weighted_falloff += falloff * dps
-                missile_weighted_tracking += tracking * dps
-            dps_weight += dps
-
-        hi_slots = int(max(0.0, ship_attr("hiSlots", 0.0)))
-        turret_slots = int(max(0.0, ship_attr("turretSlotsLeft", 0.0)))
-        launcher_slots = int(max(0.0, ship_attr("launcherSlotsLeft", 0.0)))
-
-        if fitted_turret_count > 0:
-            if hi_slots > 0 and fitted_launcher_count == 0:
-                target_turrets = max(turret_slots, hi_slots)
-            elif hi_slots > 0:
-                target_turrets = max(turret_slots, max(0, hi_slots - fitted_launcher_count))
-            else:
-                target_turrets = turret_slots
-            if target_turrets > fitted_turret_count:
-                turret_scale = target_turrets / max(1, fitted_turret_count)
-                total_dps += turret_dps * (turret_scale - 1.0)
-                total_volley += turret_volley_total * (turret_scale - 1.0)
-                turret_weighted_optimal *= turret_scale
-                turret_weighted_falloff *= turret_scale
-                turret_weighted_tracking *= turret_scale
-                turret_dps *= turret_scale
-                turret_em *= turret_scale
-                turret_th *= turret_scale
-                turret_ki *= turret_scale
-                turret_ex *= turret_scale
-                turret_cycle_weighted *= turret_scale
-                turret_cycle_weight *= turret_scale
-                weighted_optimal_sig *= turret_scale
-
-        if fitted_launcher_count > 0 and launcher_slots > fitted_launcher_count:
-            launcher_scale = launcher_slots / max(1, fitted_launcher_count)
-            total_dps += missile_dps * (launcher_scale - 1.0)
-            total_volley += missile_volley_total * (launcher_scale - 1.0)
-            missile_weighted_optimal *= launcher_scale
-            missile_weighted_falloff *= launcher_scale
-            missile_weighted_tracking *= launcher_scale
-            missile_dps *= launcher_scale
-            missile_em *= launcher_scale
-            missile_th *= launcher_scale
-            missile_ki *= launcher_scale
-            missile_ex *= launcher_scale
-            missile_cycle_weighted *= launcher_scale
-            missile_cycle_weight *= launcher_scale
-
-        weighted_optimal = turret_weighted_optimal + missile_weighted_optimal
-        weighted_falloff = turret_weighted_falloff + missile_weighted_falloff
-        weighted_tracking = turret_weighted_tracking + missile_weighted_tracking
-        dps_weight = total_dps
-
-        if total_dps <= 0:
-            hull = HullProfile(
-                ship_name=base_hull.ship_name,
-                role=base_hull.role,
-                base_dps=0.0,
-                volley=0.0,
-                optimal=base_hull.max_target_range,
-                falloff=1.0,
-                tracking=0.0001,
-                sig_radius=base_hull.sig_radius,
-                scan_resolution=base_hull.scan_resolution,
-                max_target_range=base_hull.max_target_range,
-                max_speed=base_hull.max_speed,
-                cap_max=base_hull.cap_max,
-                cap_recharge_time=base_hull.cap_recharge_time,
-                shield_hp=max(1.0, shield_hp),
-                armor_hp=max(1.0, armor_hp),
-                structure_hp=max(1.0, structure_hp),
-                rep_amount=rep_amount,
-                rep_cycle=rep_cycle,
-            )
-        else:
-            hull = HullProfile(
-                ship_name=base_hull.ship_name,
-                role=base_hull.role,
-                base_dps=total_dps,
-                volley=total_volley,
-                optimal=weighted_optimal / max(1e-6, dps_weight),
-                falloff=max(1.0, weighted_falloff / max(1e-6, dps_weight)),
-                tracking=max(0.0001, weighted_tracking / max(1e-6, dps_weight)),
-                sig_radius=base_hull.sig_radius,
-                scan_resolution=base_hull.scan_resolution,
-                max_target_range=base_hull.max_target_range,
-                max_speed=base_hull.max_speed,
-                cap_max=base_hull.cap_max,
-                cap_recharge_time=base_hull.cap_recharge_time,
-                shield_hp=max(1.0, shield_hp),
-                armor_hp=max(1.0, armor_hp),
-                structure_hp=max(1.0, structure_hp),
-                rep_amount=rep_amount,
-                rep_cycle=rep_cycle,
-            )
-        extras = {
-            "turret_dps": turret_dps,
-            "missile_dps": missile_dps,
-            "turret_em_dps": turret_em,
-            "turret_thermal_dps": turret_th,
-            "turret_kinetic_dps": turret_ki,
-            "turret_explosive_dps": turret_ex,
-            "missile_em_dps": missile_em,
-            "missile_thermal_dps": missile_th,
-            "missile_kinetic_dps": missile_ki,
-            "missile_explosive_dps": missile_ex,
-            "damage_em": turret_em + missile_em,
-            "damage_thermal": turret_th + missile_th,
-            "damage_kinetic": turret_ki + missile_ki,
-            "damage_explosive": turret_ex + missile_ex,
-            "turret_cycle": (turret_cycle_weighted / max(1e-6, turret_cycle_weight)) if turret_dps > 0 else 0.0,
-            "missile_cycle": (missile_cycle_weighted / max(1e-6, missile_cycle_weight)) if missile_dps > 0 else 0.0,
-            "optimal_sig": weighted_optimal_sig / max(1e-6, turret_dps) if turret_dps > 0 else 40000.0,
-            "missile_explosion_radius": missile_sig_radius,
-            "missile_explosion_velocity": missile_explosion_velocity,
-            "missile_max_range": missile_max_range,
-            "missile_damage_reduction_factor": max(0.1, min(2.0, missile_drf)),
-            "shield_resonance_em": max(0.01, min(1.0, shield_res_em)),
-            "shield_resonance_thermal": max(0.01, min(1.0, shield_res_th)),
-            "shield_resonance_kinetic": max(0.01, min(1.0, shield_res_ki)),
-            "shield_resonance_explosive": max(0.01, min(1.0, shield_res_ex)),
-            "armor_resonance_em": max(0.01, min(1.0, armor_res_em)),
-            "armor_resonance_thermal": max(0.01, min(1.0, armor_res_th)),
-            "armor_resonance_kinetic": max(0.01, min(1.0, armor_res_ki)),
-            "armor_resonance_explosive": max(0.01, min(1.0, armor_res_ex)),
-            "structure_resonance_em": max(0.01, min(1.0, struct_res_em)),
-            "structure_resonance_thermal": max(0.01, min(1.0, struct_res_th)),
-            "structure_resonance_kinetic": max(0.01, min(1.0, struct_res_ki)),
-            "structure_resonance_explosive": max(0.01, min(1.0, struct_res_ex)),
-        }
-        return hull, extras
-
-    def _select_charge_from_cargo(self, weapon_item, cargo_names: list[str]) -> str | None:
-        if not cargo_names:
-            return None
-
-        best_name: str | None = None
-        best_damage = -1.0
-        for name in cargo_names:
-            item = self._pyfa.get_item(name)
-            if item is None:
-                continue
-            if not self._is_charge_compatible(weapon_item, item):
-                continue
-            total_damage = float(item.getAttribute("emDamage", 0.0) or 0.0)
-            total_damage += float(item.getAttribute("thermalDamage", 0.0) or 0.0)
-            total_damage += float(item.getAttribute("kineticDamage", 0.0) or 0.0)
-            total_damage += float(item.getAttribute("explosiveDamage", 0.0) or 0.0)
-            if total_damage > best_damage:
-                best_damage = total_damage
-                best_name = name
-
-        return best_name
-
     @staticmethod
     def _collect_pyfa_weapon_stats(modules: list[Any], ship: Any, *, require_volley: bool) -> dict[str, float]:
         turret_dps = 0.0
         missile_dps = 0.0
+        weighted_optimal_sig = 0.0
         turret_cycle_weighted = 0.0
         turret_cycle_weight = 0.0
         missile_cycle_weighted = 0.0
@@ -1041,6 +522,8 @@ class RuntimeFromEftFactory:
                 turret_weighted_optimal += optimal * dps_total
                 turret_weighted_falloff += falloff * dps_total
                 turret_weighted_tracking += tracking * dps_total
+                turret_optimal_sig = float(module.getModifiedItemAttr("optimalSigRadius") or 40_000.0)
+                weighted_optimal_sig += turret_optimal_sig * dps_total
                 turret_em += em_dps
                 turret_th += th_dps
                 turret_ki += ki_dps
@@ -1082,6 +565,7 @@ class RuntimeFromEftFactory:
             "optimal": optimal,
             "falloff": falloff,
             "tracking": tracking,
+            "optimal_sig": weighted_optimal_sig / max(1e-6, turret_dps) if turret_dps > 0 else 40_000.0,
         }
 
     def _compute_pyfa_final_stats(self, parsed: ParsedEftFit) -> dict[str, float]:
@@ -1093,11 +577,13 @@ class RuntimeFromEftFactory:
         module_cls = self._pyfa._module_cls
         character_cls = self._pyfa._character_cls
         active_state = self._pyfa._fitting_module_state_active
+        offline_state = self._pyfa._fitting_module_state_offline
         assert fit_cls is not None
         assert ship_cls is not None
         assert module_cls is not None
         assert character_cls is not None
         assert active_state is not None
+        assert offline_state is not None
 
         ship_name = self._pyfa.resolve_type_name(parsed.ship_name)
         ship_item = self._pyfa.get_item(ship_name)
@@ -1114,7 +600,7 @@ class RuntimeFromEftFactory:
                 raise ValueError(f"pyfa中未找到模块：{spec.module_name}")
             module = module_cls(module_item)
             module.owner = fit
-            module.state = active_state
+            module.state = offline_state if spec.offline else active_state
 
             group_name = (module_item.group.name or "").lower()
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
@@ -1157,6 +643,7 @@ class RuntimeFromEftFactory:
             "optimal": weapon_stats["optimal"],
             "falloff": weapon_stats["falloff"],
             "tracking": weapon_stats["tracking"],
+            "optimal_sig": weapon_stats["optimal_sig"],
             "max_speed": float(ship.getModifiedItemAttr("maxVelocity") or 0.0),
             "mass": float(ship.getModifiedItemAttr("mass") or 0.0),
             "agility": float(ship.getModifiedItemAttr("agility") or 0.0),
@@ -1194,7 +681,9 @@ class RuntimeFromEftFactory:
         hull_base = self._hull_pyfa(parsed.ship_name)
         if hull_base is None:
             raise ValueError(f"无法在 pyfa 数据库中找到舰船：{parsed.ship_name}")
-        hull, extras = self._derive_hull_from_fit(parsed, hull_base)
+
+        pyfa_final = self._compute_pyfa_final_stats(parsed)
+
         modules: list[ModuleRuntime] = []
         pyfa_blueprint_modules: list[dict[str, Any]] = []
         for idx, spec in enumerate(parsed.module_specs, start=1):
@@ -1202,13 +691,12 @@ class RuntimeFromEftFactory:
             if module_item_raw is None:
                 raise ValueError(f"无法在 pyfa 数据库中找到模块：{spec.module_name}")
             module_item = cast(Any, module_item_raw)
-            group_name = (module_item.group.name or "").lower()
             effective_charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
 
             module = self._module_effect_pyfa(spec.module_name, idx)
-            if module is not None and spec.offline:
-                module.state = ModuleState.ONLINE
             if module is not None:
+                if spec.offline:
+                    module.state = ModuleState.OFFLINE
                 modules.append(module)
                 pyfa_blueprint_modules.append(
                     {
@@ -1218,6 +706,87 @@ class RuntimeFromEftFactory:
                         "offline": bool(spec.offline),
                     }
                 )
+
+        turret_dps = max(0.0, float(pyfa_final.get("turret_dps", 0.0) or 0.0))
+        missile_dps = max(0.0, float(pyfa_final.get("missile_dps", 0.0) or 0.0))
+
+        profile = ShipProfile(
+            dps=max(0.0, float(pyfa_final.get("dps", 0.0) or 0.0)),
+            volley=max(0.0, float(pyfa_final.get("volley", 0.0) or 0.0)),
+            optimal=max(1.0, float(pyfa_final.get("optimal", 0.0) or 0.0)),
+            falloff=max(1.0, float(pyfa_final.get("falloff", 0.0) or 0.0)),
+            tracking=max(0.0001, float(pyfa_final.get("tracking", 0.0) or 0.0)),
+            optimal_sig=max(1.0, float(pyfa_final.get("optimal_sig", 40_000.0) or 40_000.0)),
+            sig_radius=max(1.0, float(pyfa_final.get("sig_radius", 0.0) or 0.0)),
+            scan_resolution=max(1.0, float(pyfa_final.get("scan_resolution", 0.0) or 0.0)),
+            max_target_range=max(1000.0, float(pyfa_final.get("max_target_range", 0.0) or 0.0)),
+            max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
+            max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
+            cap_recharge_time=max(1.0, float(pyfa_final.get("cap_recharge_time", 0.0) or 0.0)),
+            shield_hp=max(1.0, float(pyfa_final.get("shield_hp", 0.0) or 0.0)),
+            armor_hp=max(1.0, float(pyfa_final.get("armor_hp", 0.0) or 0.0)),
+            structure_hp=max(1.0, float(pyfa_final.get("structure_hp", 0.0) or 0.0)),
+            rep_amount=0.0,
+            rep_cycle=5.0,
+            weapon_system=(
+                "mixed"
+                if turret_dps > 0.0 and missile_dps > 0.0
+                else ("missile" if missile_dps > 0.0 else "turret")
+            ),
+            turret_dps=turret_dps,
+            missile_dps=missile_dps,
+            turret_cycle=max(0.0, float(pyfa_final.get("turret_cycle", 0.0) or 0.0)),
+            missile_cycle=max(0.0, float(pyfa_final.get("missile_cycle", 0.0) or 0.0)),
+            damage_em=max(0.0, float(pyfa_final.get("damage_em", 0.0) or 0.0)),
+            damage_thermal=max(0.0, float(pyfa_final.get("damage_thermal", 0.0) or 0.0)),
+            damage_kinetic=max(0.0, float(pyfa_final.get("damage_kinetic", 0.0) or 0.0)),
+            damage_explosive=max(0.0, float(pyfa_final.get("damage_explosive", 0.0) or 0.0)),
+            turret_em_dps=max(0.0, float(pyfa_final.get("turret_em_dps", 0.0) or 0.0)),
+            turret_thermal_dps=max(0.0, float(pyfa_final.get("turret_thermal_dps", 0.0) or 0.0)),
+            turret_kinetic_dps=max(0.0, float(pyfa_final.get("turret_kinetic_dps", 0.0) or 0.0)),
+            turret_explosive_dps=max(0.0, float(pyfa_final.get("turret_explosive_dps", 0.0) or 0.0)),
+            missile_em_dps=max(0.0, float(pyfa_final.get("missile_em_dps", 0.0) or 0.0)),
+            missile_thermal_dps=max(0.0, float(pyfa_final.get("missile_thermal_dps", 0.0) or 0.0)),
+            missile_kinetic_dps=max(0.0, float(pyfa_final.get("missile_kinetic_dps", 0.0) or 0.0)),
+            missile_explosive_dps=max(0.0, float(pyfa_final.get("missile_explosive_dps", 0.0) or 0.0)),
+            missile_explosion_radius=max(0.0, float(pyfa_final.get("missile_explosion_radius", 0.0) or 0.0)),
+            missile_explosion_velocity=max(0.0, float(pyfa_final.get("missile_explosion_velocity", 0.0) or 0.0)),
+            missile_max_range=max(0.0, float(pyfa_final.get("missile_max_range", 0.0) or 0.0)),
+            missile_damage_reduction_factor=max(0.1, min(2.0, float(pyfa_final.get("missile_damage_reduction_factor", 0.5) or 0.5))),
+            shield_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_em", 1.0) or 1.0))),
+            shield_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_thermal", 1.0) or 1.0))),
+            shield_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_kinetic", 1.0) or 1.0))),
+            shield_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_explosive", 1.0) or 1.0))),
+            armor_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_em", 1.0) or 1.0))),
+            armor_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_thermal", 1.0) or 1.0))),
+            armor_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_kinetic", 1.0) or 1.0))),
+            armor_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_explosive", 1.0) or 1.0))),
+            structure_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_em", 1.0) or 1.0))),
+            structure_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_thermal", 1.0) or 1.0))),
+            structure_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_kinetic", 1.0) or 1.0))),
+            structure_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_explosive", 1.0) or 1.0))),
+        )
+
+        hull = HullProfile(
+            ship_name=hull_base.ship_name,
+            role=hull_base.role,
+            base_dps=profile.dps,
+            volley=profile.volley,
+            optimal=profile.optimal,
+            falloff=profile.falloff,
+            tracking=profile.tracking,
+            sig_radius=profile.sig_radius,
+            scan_resolution=profile.scan_resolution,
+            max_target_range=profile.max_target_range,
+            max_speed=profile.max_speed,
+            cap_max=profile.max_cap,
+            cap_recharge_time=profile.cap_recharge_time,
+            shield_hp=profile.shield_hp,
+            armor_hp=profile.armor_hp,
+            structure_hp=profile.structure_hp,
+            rep_amount=profile.rep_amount,
+            rep_cycle=profile.rep_cycle,
+        )
 
         runtime = FitRuntime(
             fit_key=parsed.fit_key,
@@ -1230,115 +799,6 @@ class RuntimeFromEftFactory:
             "fit_name": parsed.fit_name,
             "modules": pyfa_blueprint_modules,
         }
-        profile = RuntimeStatEngine().compute_base_profile(runtime)
-        pyfa_factors: dict[str, float] = {}
-        total_component = extras["turret_dps"] + extras["missile_dps"]
-        scale = profile.dps / total_component if total_component > 0 else 1.0
-        profile.weapon_system = "mixed" if extras["turret_dps"] > 0 and extras["missile_dps"] > 0 else ("missile" if extras["missile_dps"] > 0 else "turret")
-        profile.optimal_sig = extras["optimal_sig"]
-        profile.turret_dps = extras["turret_dps"] * scale
-        profile.missile_dps = extras["missile_dps"] * scale
-        profile.turret_cycle = extras["turret_cycle"]
-        profile.missile_cycle = extras["missile_cycle"]
-        profile.turret_em_dps = extras["turret_em_dps"] * scale
-        profile.turret_thermal_dps = extras["turret_thermal_dps"] * scale
-        profile.turret_kinetic_dps = extras["turret_kinetic_dps"] * scale
-        profile.turret_explosive_dps = extras["turret_explosive_dps"] * scale
-        profile.missile_em_dps = extras["missile_em_dps"] * scale
-        profile.missile_thermal_dps = extras["missile_thermal_dps"] * scale
-        profile.missile_kinetic_dps = extras["missile_kinetic_dps"] * scale
-        profile.missile_explosive_dps = extras["missile_explosive_dps"] * scale
-        profile.damage_em = profile.turret_em_dps + profile.missile_em_dps
-        profile.damage_thermal = profile.turret_thermal_dps + profile.missile_thermal_dps
-        profile.damage_kinetic = profile.turret_kinetic_dps + profile.missile_kinetic_dps
-        profile.damage_explosive = profile.turret_explosive_dps + profile.missile_explosive_dps
-        profile.missile_explosion_radius = extras["missile_explosion_radius"]
-        profile.missile_explosion_velocity = extras["missile_explosion_velocity"]
-        profile.missile_max_range = extras["missile_max_range"]
-        profile.missile_damage_reduction_factor = extras["missile_damage_reduction_factor"]
-        profile.shield_hp = hull.shield_hp
-        profile.armor_hp = hull.armor_hp
-        profile.structure_hp = hull.structure_hp
-        profile.shield_resonance_em = extras["shield_resonance_em"]
-        profile.shield_resonance_thermal = extras["shield_resonance_thermal"]
-        profile.shield_resonance_kinetic = extras["shield_resonance_kinetic"]
-        profile.shield_resonance_explosive = extras["shield_resonance_explosive"]
-        profile.armor_resonance_em = extras["armor_resonance_em"]
-        profile.armor_resonance_thermal = extras["armor_resonance_thermal"]
-        profile.armor_resonance_kinetic = extras["armor_resonance_kinetic"]
-        profile.armor_resonance_explosive = extras["armor_resonance_explosive"]
-        profile.structure_resonance_em = extras["structure_resonance_em"]
-        profile.structure_resonance_thermal = extras["structure_resonance_thermal"]
-        profile.structure_resonance_kinetic = extras["structure_resonance_kinetic"]
-        profile.structure_resonance_explosive = extras["structure_resonance_explosive"]
-
-        pyfa_final = self._compute_pyfa_final_stats(parsed)
-        if profile.dps > 0:
-            pyfa_factors["dps"] = pyfa_final.get("dps", profile.dps) / profile.dps
-        if profile.volley > 0:
-            pyfa_factors["volley"] = pyfa_final.get("volley", profile.volley) / profile.volley
-        if profile.max_speed > 0:
-            pyfa_factors["max_speed"] = pyfa_final.get("max_speed", profile.max_speed) / profile.max_speed
-        if profile.max_cap > 0:
-            pyfa_factors["max_cap"] = pyfa_final.get("max_cap", profile.max_cap) / profile.max_cap
-        if profile.cap_recharge_time > 0:
-            pyfa_factors["cap_recharge_time"] = pyfa_final.get("cap_recharge_time", profile.cap_recharge_time) / profile.cap_recharge_time
-        if profile.scan_resolution > 0:
-            pyfa_factors["scan_resolution"] = pyfa_final.get("scan_resolution", profile.scan_resolution) / profile.scan_resolution
-        if profile.max_target_range > 0:
-            pyfa_factors["max_target_range"] = pyfa_final.get("max_target_range", profile.max_target_range) / profile.max_target_range
-        if profile.sig_radius > 0:
-            pyfa_factors["sig_radius"] = pyfa_final.get("sig_radius", profile.sig_radius) / profile.sig_radius
-
-        profile.dps = max(0.0, pyfa_final.get("dps", profile.dps))
-        profile.volley = max(0.0, pyfa_final.get("volley", profile.volley))
-        profile.turret_dps = max(0.0, pyfa_final.get("turret_dps", profile.turret_dps))
-        profile.missile_dps = max(0.0, pyfa_final.get("missile_dps", profile.missile_dps))
-        profile.weapon_system = "mixed" if profile.turret_dps > 0 and profile.missile_dps > 0 else ("missile" if profile.missile_dps > 0 else "turret")
-        profile.turret_cycle = max(0.0, pyfa_final.get("turret_cycle", profile.turret_cycle))
-        profile.missile_cycle = max(0.0, pyfa_final.get("missile_cycle", profile.missile_cycle))
-        profile.damage_em = max(0.0, pyfa_final.get("damage_em", profile.damage_em))
-        profile.damage_thermal = max(0.0, pyfa_final.get("damage_thermal", profile.damage_thermal))
-        profile.damage_kinetic = max(0.0, pyfa_final.get("damage_kinetic", profile.damage_kinetic))
-        profile.damage_explosive = max(0.0, pyfa_final.get("damage_explosive", profile.damage_explosive))
-        profile.turret_em_dps = max(0.0, pyfa_final.get("turret_em_dps", profile.turret_em_dps))
-        profile.turret_thermal_dps = max(0.0, pyfa_final.get("turret_thermal_dps", profile.turret_thermal_dps))
-        profile.turret_kinetic_dps = max(0.0, pyfa_final.get("turret_kinetic_dps", profile.turret_kinetic_dps))
-        profile.turret_explosive_dps = max(0.0, pyfa_final.get("turret_explosive_dps", profile.turret_explosive_dps))
-        profile.missile_em_dps = max(0.0, pyfa_final.get("missile_em_dps", profile.missile_em_dps))
-        profile.missile_thermal_dps = max(0.0, pyfa_final.get("missile_thermal_dps", profile.missile_thermal_dps))
-        profile.missile_kinetic_dps = max(0.0, pyfa_final.get("missile_kinetic_dps", profile.missile_kinetic_dps))
-        profile.missile_explosive_dps = max(0.0, pyfa_final.get("missile_explosive_dps", profile.missile_explosive_dps))
-        profile.missile_explosion_radius = max(0.0, pyfa_final.get("missile_explosion_radius", profile.missile_explosion_radius))
-        profile.missile_explosion_velocity = max(0.0, pyfa_final.get("missile_explosion_velocity", profile.missile_explosion_velocity))
-        profile.missile_max_range = max(0.0, pyfa_final.get("missile_max_range", profile.missile_max_range))
-        profile.missile_damage_reduction_factor = max(0.1, min(2.0, pyfa_final.get("missile_damage_reduction_factor", profile.missile_damage_reduction_factor)))
-        profile.optimal = max(1.0, pyfa_final.get("optimal", profile.optimal))
-        profile.falloff = max(1.0, pyfa_final.get("falloff", profile.falloff))
-        profile.tracking = max(0.0001, pyfa_final.get("tracking", profile.tracking))
-        profile.max_speed = max(1.0, pyfa_final.get("max_speed", profile.max_speed))
-        profile.sig_radius = max(1.0, pyfa_final.get("sig_radius", profile.sig_radius))
-        profile.scan_resolution = max(1.0, pyfa_final.get("scan_resolution", profile.scan_resolution))
-        profile.max_target_range = max(1000.0, pyfa_final.get("max_target_range", profile.max_target_range))
-        profile.max_cap = max(1.0, pyfa_final.get("max_cap", profile.max_cap))
-        profile.cap_recharge_time = max(1.0, pyfa_final.get("cap_recharge_time", profile.cap_recharge_time))
-        profile.shield_hp = max(1.0, pyfa_final.get("shield_hp", profile.shield_hp))
-        profile.armor_hp = max(1.0, pyfa_final.get("armor_hp", profile.armor_hp))
-        profile.structure_hp = max(1.0, pyfa_final.get("structure_hp", profile.structure_hp))
-        profile.shield_resonance_em = max(0.01, min(1.0, pyfa_final.get("shield_resonance_em", profile.shield_resonance_em)))
-        profile.shield_resonance_thermal = max(0.01, min(1.0, pyfa_final.get("shield_resonance_thermal", profile.shield_resonance_thermal)))
-        profile.shield_resonance_kinetic = max(0.01, min(1.0, pyfa_final.get("shield_resonance_kinetic", profile.shield_resonance_kinetic)))
-        profile.shield_resonance_explosive = max(0.01, min(1.0, pyfa_final.get("shield_resonance_explosive", profile.shield_resonance_explosive)))
-        profile.armor_resonance_em = max(0.01, min(1.0, pyfa_final.get("armor_resonance_em", profile.armor_resonance_em)))
-        profile.armor_resonance_thermal = max(0.01, min(1.0, pyfa_final.get("armor_resonance_thermal", profile.armor_resonance_thermal)))
-        profile.armor_resonance_kinetic = max(0.01, min(1.0, pyfa_final.get("armor_resonance_kinetic", profile.armor_resonance_kinetic)))
-        profile.armor_resonance_explosive = max(0.01, min(1.0, pyfa_final.get("armor_resonance_explosive", profile.armor_resonance_explosive)))
-        profile.structure_resonance_em = max(0.01, min(1.0, pyfa_final.get("structure_resonance_em", profile.structure_resonance_em)))
-        profile.structure_resonance_thermal = max(0.01, min(1.0, pyfa_final.get("structure_resonance_thermal", profile.structure_resonance_thermal)))
-        profile.structure_resonance_kinetic = max(0.01, min(1.0, pyfa_final.get("structure_resonance_kinetic", profile.structure_resonance_kinetic)))
-        profile.structure_resonance_explosive = max(0.01, min(1.0, pyfa_final.get("structure_resonance_explosive", profile.structure_resonance_explosive)))
-        if pyfa_factors:
-            runtime.diagnostics["pyfa_factors"] = [f"{k}:{v:.8f}" for k, v in pyfa_factors.items()]
         runtime.diagnostics["motion_params"] = {
             "mass": float(pyfa_final.get("mass", 0.0) or 0.0),
             "agility": float(pyfa_final.get("agility", 0.0) or 0.0),
@@ -1636,7 +1096,7 @@ class _PyfaStaticBackend:
 
 
 _STATIC_BACKEND: _PyfaStaticBackend | None = None
-_PYFA_RUNTIME_PROFILE_CACHE: dict[tuple[str, tuple[tuple[str, str], ...]], ShipProfile] = {}
+_PYFA_RUNTIME_PROFILE_CACHE: dict[tuple[Any, ...], ShipProfile] = {}
 
 
 def _get_static_backend() -> _PyfaStaticBackend:
@@ -1665,7 +1125,19 @@ def recompute_profile_from_pyfa_runtime(runtime: FitRuntime) -> ShipProfile | No
         return None
 
     signature = tuple(sorted((m.module_id, m.state.value) for m in runtime.modules))
-    cache_key = (runtime.fit_key, signature)
+    blueprint_signature = tuple(
+        sorted(
+            (
+                str(raw.get("module_id", "") or ""),
+                str(raw.get("module_name", "") or ""),
+                str(raw.get("charge_name", "") or ""),
+                bool(raw.get("offline", False)),
+            )
+            for raw in module_specs
+            if isinstance(raw, dict)
+        )
+    )
+    cache_key = (runtime.fit_key, blueprint_signature, signature)
     cached = _PYFA_RUNTIME_PROFILE_CACHE.get(cache_key)
     if cached is not None:
         return replace(cached)
@@ -1731,6 +1203,7 @@ def recompute_profile_from_pyfa_runtime(runtime: FitRuntime) -> ShipProfile | No
             optimal=weapon_stats["optimal"],
             falloff=weapon_stats["falloff"],
             tracking=weapon_stats["tracking"],
+            optimal_sig=max(1.0, weapon_stats.get("optimal_sig", 40_000.0)),
             sig_radius=max(1.0, float(ship.getModifiedItemAttr("signatureRadius") or 0.0)),
             scan_resolution=max(1.0, float(ship.getModifiedItemAttr("scanResolution") or 0.0)),
             max_target_range=max(1000.0, float(ship.getModifiedItemAttr("maxTargetRange") or 0.0)),

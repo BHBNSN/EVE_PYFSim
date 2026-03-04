@@ -45,6 +45,7 @@ from .fleet_setup import (
     build_world_from_manual_setup,
     EftFitParser,
     RuntimeFromEftFactory,
+    recompute_profile_from_pyfa_runtime,
     get_ammo_options_for_weapon,
     get_fit_backend_status,
     get_common_weapons,
@@ -1633,23 +1634,6 @@ class ShipStatusDialog(QDialog):
         g = (group_name or "").lower()
         return ("weapon" in g) or ("turret" in g) or ("launcher" in g)
 
-    @staticmethod
-    def _parse_pyfa_factors(ship) -> dict[str, float]:
-        runtime = ship.runtime
-        if runtime is None:
-            return {}
-        factors_raw = runtime.diagnostics.get("pyfa_factors", [])
-        factors: dict[str, float] = {}
-        for token in factors_raw:
-            if ":" not in token:
-                continue
-            key, value = token.split(":", 1)
-            try:
-                factors[key.strip()] = float(value.strip())
-            except Exception:
-                continue
-        return factors
-
     def _stable_profile(self, ship):
         if ship.runtime is None:
             return ship.profile
@@ -1657,16 +1641,11 @@ class ShipStatusDialog(QDialog):
         cache_key = (fit_text, id(ship.runtime))
         if self._stable_profile_cache is not None and self._stable_profile_cache_key == cache_key:
             return self._stable_profile_cache
-        base = replace(self._runtime_engine.compute_base_profile(ship.runtime))
-        factors = self._parse_pyfa_factors(ship)
-        if "dps" in factors:
-            base.dps = max(0.0, base.dps * factors["dps"])
-        if "volley" in factors:
-            base.volley = max(0.0, base.volley * factors["volley"])
-        if "max_cap" in factors:
-            base.max_cap = max(1.0, base.max_cap * factors["max_cap"])
-        if "cap_recharge_time" in factors:
-            base.cap_recharge_time = max(1.0, base.cap_recharge_time * factors["cap_recharge_time"])
+        pyfa_profile = recompute_profile_from_pyfa_runtime(ship.runtime)
+        if pyfa_profile is not None:
+            base = replace(pyfa_profile)
+        else:
+            base = replace(self._runtime_engine.compute_base_profile(ship.runtime))
         self._stable_profile_cache = base
         self._stable_profile_cache_key = cache_key
         return base
