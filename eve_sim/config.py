@@ -11,7 +11,7 @@ class EngineConfig:
     physics_substeps: int = 1
     lockstep: bool = True
     battlefield_radius: float = 800_000.0
-    detailed_logging: bool = True
+    detailed_logging: bool = False
     detail_log_file: str = "logs/sim_detail.log"
 
 

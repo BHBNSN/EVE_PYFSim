@@ -15,6 +15,22 @@ STRINGS: dict[str, dict[str, str]] = {
     "setup_fleet_empty_msg": {"zh_CN": "该队当前没有舰船可保存。", "en_US": "This side has no ships to save."},
     "setup_blue_preview": {"zh_CN": "蓝队预览", "en_US": "Blue Preview"},
     "setup_red_preview": {"zh_CN": "红队预览", "en_US": "Red Preview"},
+    "setup_tab_preview": {"zh_CN": "舰队预览", "en_US": "Fleet Preview"},
+    "setup_tab_settings": {"zh_CN": "仿真设置", "en_US": "Simulation Settings"},
+    "setup_cfg_tick_rate": {"zh_CN": "仿真 Tick 率 (Hz)", "en_US": "Tick Rate (Hz)"},
+    "setup_cfg_physics_substeps": {"zh_CN": "物理子步数", "en_US": "Physics Substeps"},
+    "setup_cfg_battlefield_radius": {"zh_CN": "战场半径 (m)", "en_US": "Battlefield Radius (m)"},
+    "setup_cfg_lockstep": {"zh_CN": "锁步模式", "en_US": "Lockstep"},
+    "setup_cfg_detailed_logging": {"zh_CN": "详细日志", "en_US": "Detailed Logging"},
+    "setup_cfg_log_file": {"zh_CN": "日志文件", "en_US": "Log File"},
+    "setup_cfg_local_persist": {
+        "zh_CN": "以下参数会保存在本机偏好中，下次启动自动带入。",
+        "en_US": "These settings are saved locally and will be restored on next launch."
+    },
+    "setup_cfg_host_authority": {
+        "zh_CN": "联机客户端参数以 Host 为准；当前不可编辑，仅显示本机偏好。",
+        "en_US": "In LAN client mode, Host settings are authoritative. Values are read-only local preferences."
+    },
     "setup_preview_empty": {"zh_CN": "未选择舰队", "en_US": "No fleet selected"},
     "setup_preview_invalid": {"zh_CN": "配装无效", "en_US": "Invalid Fit"},
     "setup_validate_need_fleets": {"zh_CN": "请先为蓝队和红队各选择一个舰队。", "en_US": "Please select one fleet for both Blue and Red."},

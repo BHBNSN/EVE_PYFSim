@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QStyledItemDelegate,
     QTableView,
@@ -42,7 +43,6 @@ from .config import EngineConfig, UiConfig
 from .fleet_setup import (
     ManualShipSetup,
     build_world_from_manual_setup,
-    default_manual_setup,
     EftFitParser,
     RuntimeFromEftFactory,
     get_ammo_options_for_weapon,
@@ -119,7 +119,7 @@ class UiState:
 
 @dataclass(slots=True)
 class UiPreferences:
-    config_version: int = 2
+    config_version: int = 3
     selected_squad: str = "BLUE-ALPHA"
     filter_team: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"] = "ALL"
     filter_role: str = "ALL"
@@ -129,6 +129,12 @@ class UiPreferences:
     sort_order: str = "ASC"
     zoom: float | None = None
     language: str = "zh_CN"
+    engine_tick_rate: int = 30
+    engine_physics_substeps: int = 1
+    engine_lockstep: bool = True
+    engine_battlefield_radius: float = 800_000.0
+    engine_detailed_logging: bool = True
+    engine_detail_log_file: str = "logs/sim_detail.log"
 
 
 @dataclass(slots=True)
@@ -575,10 +581,12 @@ class FleetLibraryDialog(QDialog):
 
 
 class FleetSetupDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, network_mode: str = "local", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = PreferencesStore()
         self._pref = self._store.load()
+        self._network_mode = network_mode
+        self._engine_pref_loading = False
         self._lang = self._detect_initial_language()
         self.setWindowTitle(tr(self._lang, "setup_title"))
         self.resize(1060, 680)
@@ -628,7 +636,10 @@ class FleetSetupDialog(QDialog):
         fleet_row.addWidget(self.red_fleet_combo, 1)
         layout.addLayout(fleet_row)
 
-        preview_row = QHBoxLayout()
+        self.setup_tabs = QTabWidget(self)
+
+        preview_tab = QWidget(self)
+        preview_row = QHBoxLayout(preview_tab)
         blue_col = QVBoxLayout()
         self.lbl_blue_preview = QLabel(tr(self._lang, "setup_blue_preview"))
         self.blue_preview = QPlainTextEdit(self)
@@ -643,7 +654,49 @@ class FleetSetupDialog(QDialog):
         red_col.addWidget(self.red_preview)
         preview_row.addLayout(blue_col, 1)
         preview_row.addLayout(red_col, 1)
-        layout.addLayout(preview_row, 1)
+        self.setup_tabs.addTab(preview_tab, tr(self._lang, "setup_tab_preview"))
+
+        settings_tab = QWidget(self)
+        settings_layout = QVBoxLayout(settings_tab)
+        self.lbl_engine_hint = QLabel(settings_tab)
+        self.lbl_engine_hint.setWordWrap(True)
+        settings_layout.addWidget(self.lbl_engine_hint)
+
+        settings_form = QFormLayout()
+        self.lbl_cfg_tick_rate = QLabel(settings_tab)
+        self.spin_cfg_tick_rate = QSpinBox(settings_tab)
+        self.spin_cfg_tick_rate.setRange(1, 240)
+
+        self.lbl_cfg_substeps = QLabel(settings_tab)
+        self.spin_cfg_substeps = QSpinBox(settings_tab)
+        self.spin_cfg_substeps.setRange(1, 16)
+
+        self.lbl_cfg_radius = QLabel(settings_tab)
+        self.spin_cfg_radius = QDoubleSpinBox(settings_tab)
+        self.spin_cfg_radius.setRange(1_000.0, 20_000_000.0)
+        self.spin_cfg_radius.setDecimals(0)
+        self.spin_cfg_radius.setSingleStep(10_000.0)
+
+        self.lbl_cfg_lockstep = QLabel(settings_tab)
+        self.chk_cfg_lockstep = QCheckBox(settings_tab)
+
+        self.lbl_cfg_detailed_log = QLabel(settings_tab)
+        self.chk_cfg_detailed_log = QCheckBox(settings_tab)
+
+        self.lbl_cfg_log_file = QLabel(settings_tab)
+        self.edit_cfg_log_file = QLineEdit(settings_tab)
+
+        settings_form.addRow(self.lbl_cfg_tick_rate, self.spin_cfg_tick_rate)
+        settings_form.addRow(self.lbl_cfg_substeps, self.spin_cfg_substeps)
+        settings_form.addRow(self.lbl_cfg_radius, self.spin_cfg_radius)
+        settings_form.addRow(self.lbl_cfg_lockstep, self.chk_cfg_lockstep)
+        settings_form.addRow(self.lbl_cfg_detailed_log, self.chk_cfg_detailed_log)
+        settings_form.addRow(self.lbl_cfg_log_file, self.edit_cfg_log_file)
+        settings_layout.addLayout(settings_form)
+        settings_layout.addStretch(1)
+
+        self.setup_tabs.addTab(settings_tab, tr(self._lang, "setup_tab_settings"))
+        layout.addWidget(self.setup_tabs, 1)
 
         top = QHBoxLayout()
         self.table = QTableView()
@@ -692,6 +745,15 @@ class FleetSetupDialog(QDialog):
         self.btns.rejected.connect(self.reject)
         self.table.selectionModel().currentRowChanged.connect(self._on_row_changed)
         self.fit_editor.textChanged.connect(self._on_fit_changed)
+        self.spin_cfg_tick_rate.valueChanged.connect(self._on_engine_pref_changed)
+        self.spin_cfg_substeps.valueChanged.connect(self._on_engine_pref_changed)
+        self.spin_cfg_radius.valueChanged.connect(self._on_engine_pref_changed)
+        self.chk_cfg_lockstep.toggled.connect(self._on_engine_pref_changed)
+        self.chk_cfg_detailed_log.toggled.connect(self._on_engine_pref_changed)
+        self.edit_cfg_log_file.textChanged.connect(self._on_engine_pref_changed)
+
+        self._load_engine_preferences_into_controls()
+        self._set_engine_settings_enabled(self._network_mode != "client")
         self._refresh_fleet_combo_items()
         self._apply_setup_language()
         self._rebuild_rows_from_selected_fleets()
@@ -869,6 +931,64 @@ class FleetSetupDialog(QDialog):
         self.model.notify_headers_changed()
         self._refresh_previews()
 
+        self.setup_tabs.setTabText(0, tr(lang, "setup_tab_preview"))
+        self.setup_tabs.setTabText(1, tr(lang, "setup_tab_settings"))
+        self.lbl_cfg_tick_rate.setText(tr(lang, "setup_cfg_tick_rate"))
+        self.lbl_cfg_substeps.setText(tr(lang, "setup_cfg_physics_substeps"))
+        self.lbl_cfg_radius.setText(tr(lang, "setup_cfg_battlefield_radius"))
+        self.lbl_cfg_lockstep.setText(tr(lang, "setup_cfg_lockstep"))
+        self.lbl_cfg_detailed_log.setText(tr(lang, "setup_cfg_detailed_logging"))
+        self.lbl_cfg_log_file.setText(tr(lang, "setup_cfg_log_file"))
+        if self._network_mode == "client":
+            self.lbl_engine_hint.setText(tr(lang, "setup_cfg_host_authority"))
+        else:
+            self.lbl_engine_hint.setText(tr(lang, "setup_cfg_local_persist"))
+
+    def _set_engine_settings_enabled(self, enabled: bool) -> None:
+        self.spin_cfg_tick_rate.setEnabled(enabled)
+        self.spin_cfg_substeps.setEnabled(enabled)
+        self.spin_cfg_radius.setEnabled(enabled)
+        self.chk_cfg_lockstep.setEnabled(enabled)
+        self.chk_cfg_detailed_log.setEnabled(enabled)
+        self.edit_cfg_log_file.setEnabled(enabled)
+
+    def _load_engine_preferences_into_controls(self) -> None:
+        defaults = EngineConfig()
+        self._engine_pref_loading = True
+        try:
+            self.spin_cfg_tick_rate.setValue(max(1, int(self._pref.engine_tick_rate)))
+            self.spin_cfg_substeps.setValue(max(1, int(self._pref.engine_physics_substeps)))
+            self.spin_cfg_radius.setValue(max(1_000.0, float(self._pref.engine_battlefield_radius)))
+            self.chk_cfg_lockstep.setChecked(bool(self._pref.engine_lockstep))
+            self.chk_cfg_detailed_log.setChecked(bool(self._pref.engine_detailed_logging))
+            log_path = str(self._pref.engine_detail_log_file or "").strip() or defaults.detail_log_file
+            self.edit_cfg_log_file.setText(log_path)
+        finally:
+            self._engine_pref_loading = False
+
+    def _on_engine_pref_changed(self, *_args) -> None:
+        if self._engine_pref_loading:
+            return
+        defaults = EngineConfig()
+        self._pref.engine_tick_rate = max(1, int(self.spin_cfg_tick_rate.value()))
+        self._pref.engine_physics_substeps = max(1, int(self.spin_cfg_substeps.value()))
+        self._pref.engine_battlefield_radius = max(1_000.0, float(self.spin_cfg_radius.value()))
+        self._pref.engine_lockstep = bool(self.chk_cfg_lockstep.isChecked())
+        self._pref.engine_detailed_logging = bool(self.chk_cfg_detailed_log.isChecked())
+        self._pref.engine_detail_log_file = self.edit_cfg_log_file.text().strip() or defaults.detail_log_file
+        self._store.save(self._pref)
+
+    def to_engine_config(self) -> EngineConfig:
+        defaults = EngineConfig()
+        return EngineConfig(
+            tick_rate=max(1, int(self.spin_cfg_tick_rate.value())),
+            physics_substeps=max(1, int(self.spin_cfg_substeps.value())),
+            lockstep=bool(self.chk_cfg_lockstep.isChecked()),
+            battlefield_radius=max(1_000.0, float(self.spin_cfg_radius.value())),
+            detailed_logging=bool(self.chk_cfg_detailed_log.isChecked()),
+            detail_log_file=self.edit_cfg_log_file.text().strip() or defaults.detail_log_file,
+        )
+
     def _default_fit_text(self, ship: str = "Ferox", fit_name: str = "Manual") -> str:
         return f"[{ship}, {fit_name}]\nMagnetic Field Stabilizer II\nTracking Enhancer II\n"
 
@@ -995,7 +1115,7 @@ class FleetSetupDialog(QDialog):
 
 
 class PreferencesStore:
-    CURRENT_VERSION = 2
+    CURRENT_VERSION = 3
 
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
@@ -1034,6 +1154,41 @@ class PreferencesStore:
             return default
 
     @staticmethod
+    def _read_float(data: dict[str, object], key: str, default: float, min_value: float) -> float:
+        value = data.get(key, default)
+        if not isinstance(value, (int, float, str)):
+            return default
+        try:
+            return max(min_value, float(value))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _read_int(data: dict[str, object], key: str, default: int, min_value: int) -> int:
+        value = data.get(key, default)
+        if not isinstance(value, (int, float, str)):
+            return default
+        try:
+            return max(min_value, int(float(value)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _read_bool(data: dict[str, object], key: str, default: bool) -> bool:
+        value = data.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("1", "true", "yes", "y", "on"):
+                return True
+            if text in ("0", "false", "no", "n", "off", ""):
+                return False
+        return default
+
+    @staticmethod
     def _read_filter_team(data: dict[str, object], default: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"]) -> Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"]:
         value = str(data.get("filter_team", default) or default).upper()
         if value in ("ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"):
@@ -1058,6 +1213,25 @@ class PreferencesStore:
                 sort_order=self._read_str(migrated, "sort_order", defaults.sort_order),
                 zoom=self._read_float_or_none(migrated, "zoom", defaults.zoom),
                 language=self._read_str(migrated, "language", defaults.language),
+                engine_tick_rate=self._read_int(migrated, "engine_tick_rate", defaults.engine_tick_rate, 1),
+                engine_physics_substeps=self._read_int(migrated, "engine_physics_substeps", defaults.engine_physics_substeps, 1),
+                engine_lockstep=self._read_bool(migrated, "engine_lockstep", defaults.engine_lockstep),
+                engine_battlefield_radius=self._read_float(
+                    migrated,
+                    "engine_battlefield_radius",
+                    defaults.engine_battlefield_radius,
+                    1_000.0,
+                ),
+                engine_detailed_logging=self._read_bool(
+                    migrated,
+                    "engine_detailed_logging",
+                    defaults.engine_detailed_logging,
+                ),
+                engine_detail_log_file=self._read_str(
+                    migrated,
+                    "engine_detail_log_file",
+                    defaults.engine_detail_log_file,
+                ),
             )
         except Exception:
             return UiPreferences()
@@ -1141,6 +1315,12 @@ class OverviewOptionsDialog(QDialog):
             sort_order=prefs.sort_order,
             zoom=prefs.zoom,
             language=prefs.language,
+            engine_tick_rate=prefs.engine_tick_rate,
+            engine_physics_substeps=prefs.engine_physics_substeps,
+            engine_lockstep=prefs.engine_lockstep,
+            engine_battlefield_radius=prefs.engine_battlefield_radius,
+            engine_detailed_logging=prefs.engine_detailed_logging,
+            engine_detail_log_file=prefs.engine_detail_log_file,
         )
 
 
@@ -2464,7 +2644,17 @@ class MainWindow(QMainWindow):
     def reset_overview_options(self) -> None:
         selected = self.ui_state.selected_squad
         zoom = self.canvas.zoom
-        self.prefs = UiPreferences(selected_squad=selected, zoom=zoom)
+        self.prefs = UiPreferences(
+            selected_squad=selected,
+            zoom=zoom,
+            language=self.prefs.language,
+            engine_tick_rate=self.prefs.engine_tick_rate,
+            engine_physics_substeps=self.prefs.engine_physics_substeps,
+            engine_lockstep=self.prefs.engine_lockstep,
+            engine_battlefield_radius=self.prefs.engine_battlefield_radius,
+            engine_detailed_logging=self.prefs.engine_detailed_logging,
+            engine_detail_log_file=self.prefs.engine_detail_log_file,
+        )
         self.store.save(self.prefs)
         self.overview_proxy.apply_preferences()
         self.request_overview_refresh(force=True)
@@ -3337,6 +3527,11 @@ class MainWindow(QMainWindow):
 
     def _apply_remote_snapshot(self, packet: dict) -> None:
         self._lan_debug("recv-snapshot")
+        lan = packet.get("lan") if isinstance(packet.get("lan"), dict) else None
+        if isinstance(lan, dict):
+            cfg_payload = lan.get("engine_config")
+            if isinstance(cfg_payload, dict):
+                self._apply_host_engine_config(cfg_payload)
         snapshot = packet.get("snapshot") if isinstance(packet.get("snapshot"), dict) else packet
         if isinstance(snapshot, dict):
             try:
@@ -3448,6 +3643,49 @@ class MainWindow(QMainWindow):
             tuple(sorted((str(k), str(v)) for k, v in module_states.items())),
         )
 
+    def _engine_config_payload(self) -> dict[str, object]:
+        cfg = self.engine.config
+        return {
+            "tick_rate": int(cfg.tick_rate),
+            "physics_substeps": int(cfg.physics_substeps),
+            "lockstep": bool(cfg.lockstep),
+            "battlefield_radius": float(cfg.battlefield_radius),
+            "detailed_logging": bool(cfg.detailed_logging),
+            "detail_log_file": str(cfg.detail_log_file),
+        }
+
+    def _apply_host_engine_config(self, payload: dict) -> None:
+        if self.network_mode != "client":
+            return
+        try:
+            tick_rate = max(1, int(float(payload.get("tick_rate", self.engine.config.tick_rate))))
+        except Exception:
+            tick_rate = max(1, int(self.engine.config.tick_rate))
+        try:
+            substeps = max(1, int(float(payload.get("physics_substeps", self.engine.config.physics_substeps))))
+        except Exception:
+            substeps = max(1, int(self.engine.config.physics_substeps))
+        try:
+            radius = max(1_000.0, float(payload.get("battlefield_radius", self.engine.config.battlefield_radius)))
+        except Exception:
+            radius = max(1_000.0, float(self.engine.config.battlefield_radius))
+
+        old_tick_rate = int(self.engine.config.tick_rate)
+        self.engine.config.tick_rate = tick_rate
+        self.engine.config.physics_substeps = substeps
+        self.engine.config.lockstep = bool(payload.get("lockstep", self.engine.config.lockstep))
+        self.engine.config.battlefield_radius = radius
+        self.engine.config.detailed_logging = bool(payload.get("detailed_logging", self.engine.config.detailed_logging))
+        self.engine.config.detail_log_file = str(payload.get("detail_log_file", self.engine.config.detail_log_file))
+
+        if hasattr(self.engine, "_dt"):
+            self.engine._dt = 1.0 / float(tick_rate)
+        if hasattr(self.engine, "movement") and hasattr(self.engine.movement, "battlefield_radius"):
+            self.engine.movement.battlefield_radius = radius
+
+        if old_tick_rate != tick_rate:
+            self.tick_timer.setInterval(max(1, int(1000 / tick_rate)))
+
     def _send_host_state(self, countdown_left: float | None = None, started: bool = True) -> None:
         if self.lan_server is None:
             return
@@ -3503,6 +3741,7 @@ class MainWindow(QMainWindow):
             "lan": {
                 "started": bool(started),
                 "countdown_left": float(max(0.0, countdown_left or 0.0)),
+                "engine_config": self._engine_config_payload(),
             },
         }
         self._lan_debug(
@@ -3617,7 +3856,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def run_gui(engine_config: EngineConfig | None = None) -> None:
+def run_gui() -> None:
     app = QApplication.instance() or QApplication([])
 
     mode_options = ["Local", "Host LAN", "Join LAN"]
@@ -3657,7 +3896,7 @@ def run_gui(engine_config: EngineConfig | None = None) -> None:
         network_mode = "client"
         controlled_team = Team.RED
 
-    setup_dialog = FleetSetupDialog()
+    setup_dialog = FleetSetupDialog(network_mode=network_mode)
     if setup_dialog.exec() != QDialog.DialogCode.Accepted:
         if lan_server is not None:
             lan_server.stop()
@@ -3679,7 +3918,7 @@ def run_gui(engine_config: EngineConfig | None = None) -> None:
         return
     pyfa = PyfaBridge()
     world = build_world_from_manual_setup(manual_setup)
-    cfg = engine_config or EngineConfig()
+    cfg = setup_dialog.to_engine_config()
     engine = SimulationEngine(world=world, config=cfg, combat_system=CombatSystem(pyfa))
 
     blue_squads = sorted({s.squad_id for s in world.ships.values() if s.team == Team.BLUE})
