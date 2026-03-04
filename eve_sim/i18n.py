@@ -23,6 +23,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "setup_cfg_lockstep": {"zh_CN": "锁步模式", "en_US": "Lockstep"},
     "setup_cfg_detailed_logging": {"zh_CN": "详细日志", "en_US": "Detailed Logging"},
     "setup_cfg_log_file": {"zh_CN": "日志文件", "en_US": "Log File"},
+    "setup_cfg_log_merge_window": {"zh_CN": "日志聚合窗口(秒)", "en_US": "Log Merge Window (sec)"},
     "setup_cfg_local_persist": {
         "zh_CN": "以下参数会保存在本机偏好中，下次启动自动带入。",
         "en_US": "These settings are saved locally and will be restored on next launch."

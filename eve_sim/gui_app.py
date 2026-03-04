@@ -84,6 +84,7 @@ from .models import (
     VitalState,
 )
 from .pyfa_bridge import PyfaBridge
+from .sim_logging import get_sim_logger, log_sim_event
 from .simulation_engine import SimulationEngine
 from .systems import CombatSystem
 
@@ -119,7 +120,7 @@ class UiState:
 
 @dataclass(slots=True)
 class UiPreferences:
-    config_version: int = 3
+    config_version: int = 4
     selected_squad: str = "BLUE-ALPHA"
     filter_team: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"] = "ALL"
     filter_role: str = "ALL"
@@ -135,6 +136,7 @@ class UiPreferences:
     engine_battlefield_radius: float = 800_000.0
     engine_detailed_logging: bool = True
     engine_detail_log_file: str = "logs/sim_detail.log"
+    engine_log_merge_window_sec: float = 1.0
 
 
 @dataclass(slots=True)
@@ -686,12 +688,19 @@ class FleetSetupDialog(QDialog):
         self.lbl_cfg_log_file = QLabel(settings_tab)
         self.edit_cfg_log_file = QLineEdit(settings_tab)
 
+        self.lbl_cfg_log_merge_window = QLabel(settings_tab)
+        self.spin_cfg_log_merge_window = QDoubleSpinBox(settings_tab)
+        self.spin_cfg_log_merge_window.setRange(0.1, 30.0)
+        self.spin_cfg_log_merge_window.setDecimals(1)
+        self.spin_cfg_log_merge_window.setSingleStep(0.1)
+
         settings_form.addRow(self.lbl_cfg_tick_rate, self.spin_cfg_tick_rate)
         settings_form.addRow(self.lbl_cfg_substeps, self.spin_cfg_substeps)
         settings_form.addRow(self.lbl_cfg_radius, self.spin_cfg_radius)
         settings_form.addRow(self.lbl_cfg_lockstep, self.chk_cfg_lockstep)
         settings_form.addRow(self.lbl_cfg_detailed_log, self.chk_cfg_detailed_log)
         settings_form.addRow(self.lbl_cfg_log_file, self.edit_cfg_log_file)
+        settings_form.addRow(self.lbl_cfg_log_merge_window, self.spin_cfg_log_merge_window)
         settings_layout.addLayout(settings_form)
         settings_layout.addStretch(1)
 
@@ -751,6 +760,7 @@ class FleetSetupDialog(QDialog):
         self.chk_cfg_lockstep.toggled.connect(self._on_engine_pref_changed)
         self.chk_cfg_detailed_log.toggled.connect(self._on_engine_pref_changed)
         self.edit_cfg_log_file.textChanged.connect(self._on_engine_pref_changed)
+        self.spin_cfg_log_merge_window.valueChanged.connect(self._on_engine_pref_changed)
 
         self._load_engine_preferences_into_controls()
         self._set_engine_settings_enabled(self._network_mode != "client")
@@ -939,6 +949,7 @@ class FleetSetupDialog(QDialog):
         self.lbl_cfg_lockstep.setText(tr(lang, "setup_cfg_lockstep"))
         self.lbl_cfg_detailed_log.setText(tr(lang, "setup_cfg_detailed_logging"))
         self.lbl_cfg_log_file.setText(tr(lang, "setup_cfg_log_file"))
+        self.lbl_cfg_log_merge_window.setText(tr(lang, "setup_cfg_log_merge_window"))
         if self._network_mode == "client":
             self.lbl_engine_hint.setText(tr(lang, "setup_cfg_host_authority"))
         else:
@@ -951,6 +962,7 @@ class FleetSetupDialog(QDialog):
         self.chk_cfg_lockstep.setEnabled(enabled)
         self.chk_cfg_detailed_log.setEnabled(enabled)
         self.edit_cfg_log_file.setEnabled(enabled)
+        self.spin_cfg_log_merge_window.setEnabled(enabled)
 
     def _load_engine_preferences_into_controls(self) -> None:
         defaults = EngineConfig()
@@ -963,6 +975,7 @@ class FleetSetupDialog(QDialog):
             self.chk_cfg_detailed_log.setChecked(bool(self._pref.engine_detailed_logging))
             log_path = str(self._pref.engine_detail_log_file or "").strip() or defaults.detail_log_file
             self.edit_cfg_log_file.setText(log_path)
+            self.spin_cfg_log_merge_window.setValue(max(0.1, float(self._pref.engine_log_merge_window_sec)))
         finally:
             self._engine_pref_loading = False
 
@@ -976,6 +989,7 @@ class FleetSetupDialog(QDialog):
         self._pref.engine_lockstep = bool(self.chk_cfg_lockstep.isChecked())
         self._pref.engine_detailed_logging = bool(self.chk_cfg_detailed_log.isChecked())
         self._pref.engine_detail_log_file = self.edit_cfg_log_file.text().strip() or defaults.detail_log_file
+        self._pref.engine_log_merge_window_sec = max(0.1, float(self.spin_cfg_log_merge_window.value()))
         self._store.save(self._pref)
 
     def to_engine_config(self) -> EngineConfig:
@@ -987,6 +1001,7 @@ class FleetSetupDialog(QDialog):
             battlefield_radius=max(1_000.0, float(self.spin_cfg_radius.value())),
             detailed_logging=bool(self.chk_cfg_detailed_log.isChecked()),
             detail_log_file=self.edit_cfg_log_file.text().strip() or defaults.detail_log_file,
+            log_merge_window_sec=max(0.1, float(self.spin_cfg_log_merge_window.value())),
         )
 
     def _default_fit_text(self, ship: str = "Ferox", fit_name: str = "Manual") -> str:
@@ -1115,7 +1130,7 @@ class FleetSetupDialog(QDialog):
 
 
 class PreferencesStore:
-    CURRENT_VERSION = 3
+    CURRENT_VERSION = 4
 
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
@@ -1232,6 +1247,12 @@ class PreferencesStore:
                     "engine_detail_log_file",
                     defaults.engine_detail_log_file,
                 ),
+                engine_log_merge_window_sec=self._read_float(
+                    migrated,
+                    "engine_log_merge_window_sec",
+                    defaults.engine_log_merge_window_sec,
+                    0.1,
+                ),
             )
         except Exception:
             return UiPreferences()
@@ -1321,6 +1342,7 @@ class OverviewOptionsDialog(QDialog):
             engine_battlefield_radius=prefs.engine_battlefield_radius,
             engine_detailed_logging=prefs.engine_detailed_logging,
             engine_detail_log_file=prefs.engine_detail_log_file,
+            engine_log_merge_window_sec=prefs.engine_log_merge_window_sec,
         )
 
 
@@ -2270,6 +2292,18 @@ class MainWindow(QMainWindow):
             return
         print(f"[LAN][{self.network_mode}] {message}")
 
+    def _log_user_action(self, action: str, **fields) -> None:
+        if not bool(self.engine.config.detailed_logging):
+            return
+        payload: dict[str, object] = {
+            "action": action,
+            "mode": self.network_mode,
+            "team": self.controlled_team.value,
+            "tick": int(self.engine.world.tick),
+        }
+        payload.update(fields)
+        log_sim_event(getattr(self.engine, "_logger", None), "user_operation", **payload)
+
     def _flush_tick_ops(self) -> None:
         if not self._pending_tick_ops:
             return
@@ -2454,6 +2488,7 @@ class MainWindow(QMainWindow):
             focus_target=old.focus_target if old else None,
             propulsion_active=new_state,
         )
+        self._log_user_action("toggle_propulsion", squad=squad, enabled=new_state)
         self._refresh_propulsion_button_text()
 
     def _refresh_common_weapons(self) -> None:
@@ -2567,6 +2602,13 @@ class MainWindow(QMainWindow):
             tr(lang, "ammo_title"),
             tr(lang, "ammo_switch_done", weapon=weapon_name, ammo=ammo_name, count=updated_ships, reload=reload_sec),
         )
+        self._log_user_action(
+            "apply_ammo",
+            weapon=weapon_name,
+            ammo=ammo_name,
+            updated_ships=updated_ships,
+            reload_sec=reload_sec,
+        )
 
     def _build_overview_tab(self) -> QWidget:
         page = QWidget(self)
@@ -2654,6 +2696,7 @@ class MainWindow(QMainWindow):
             engine_battlefield_radius=self.prefs.engine_battlefield_radius,
             engine_detailed_logging=self.prefs.engine_detailed_logging,
             engine_detail_log_file=self.prefs.engine_detail_log_file,
+            engine_log_merge_window_sec=self.prefs.engine_log_merge_window_sec,
         )
         self.store.save(self.prefs)
         self.overview_proxy.apply_preferences()
@@ -2718,6 +2761,7 @@ class MainWindow(QMainWindow):
             self.engine.world.squad_leader_speed_limits.pop(key, None)
         else:
             self.engine.world.squad_leader_speed_limits[key] = float(value)
+        self._log_user_action("leader_speed_limit", squad=self.ui_state.selected_squad, limit=value)
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command(
                 {
@@ -2801,6 +2845,7 @@ class MainWindow(QMainWindow):
         squad = squad_id.strip()
         if not squad:
             return
+        self._log_user_action("induce_squad", squad=squad, x=target.x, y=target.y)
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_INDUCE_SQUAD_AT, "squad_id": squad, "x": target.x, "y": target.y})
             return
@@ -2812,6 +2857,7 @@ class MainWindow(QMainWindow):
         self._enqueue_tick_op(apply)
 
     def induce_spawn_fleet_at(self, target: Vector2) -> None:
+        self._log_user_action("induce_fleet", x=target.x, y=target.y)
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_INDUCE_FLEET_AT, "x": target.x, "y": target.y})
             return
@@ -2827,6 +2873,7 @@ class MainWindow(QMainWindow):
         target = target_id.strip()
         if not squad or not target:
             return
+        self._log_user_action("squad_approach", squad=squad, target=target)
 
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_APPROACH, "squad_id": squad, "target_id": target})
@@ -2884,6 +2931,7 @@ class MainWindow(QMainWindow):
             self._squad_guidance_targets.pop(squad, None)
 
     def issue_move_to(self, squad_id: str, target: Vector2) -> None:
+        self._log_user_action("squad_move", squad=squad_id, x=target.x, y=target.y)
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_MOVE, "squad_id": squad_id, "x": target.x, "y": target.y})
             self._squad_approach_targets.pop(squad_id, None)
@@ -2923,6 +2971,7 @@ class MainWindow(QMainWindow):
     def issue_focus_target(self, target_id: str) -> None:
         squad = self.ui_state.selected_squad
         focus_key = self._focus_key(self.controlled_team, squad)
+        self._log_user_action("squad_focus", squad=squad, target=target_id)
 
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_ATTACK, "squad_id": squad, "target_id": target_id})
@@ -2954,6 +3003,7 @@ class MainWindow(QMainWindow):
     def issue_prefocus_target(self, target_id: str) -> None:
         squad = self.ui_state.selected_squad
         focus_key = self._focus_key(self.controlled_team, squad)
+        self._log_user_action("squad_prefocus", squad=squad, target=target_id)
 
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_PREFOCUS, "squad_id": squad, "target_id": target_id})
@@ -2996,6 +3046,7 @@ class MainWindow(QMainWindow):
     def cancel_prefocus_target(self, target_id: str) -> None:
         squad = self.ui_state.selected_squad
         focus_key = self._focus_key(self.controlled_team, squad)
+        self._log_user_action("squad_cancel_prefocus", squad=squad, target=target_id)
 
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_CANCEL_PREFOCUS, "squad_id": squad, "target_id": target_id})
@@ -3036,6 +3087,7 @@ class MainWindow(QMainWindow):
     def clear_focus_targets(self) -> None:
         squad = self.ui_state.selected_squad
         focus_key = self._focus_key(self.controlled_team, squad)
+        self._log_user_action("squad_clear_focus", squad=squad)
 
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_CLEAR_FOCUS, "squad_id": squad})
@@ -3173,6 +3225,8 @@ class MainWindow(QMainWindow):
                 continue
             ship_ids.append(str(row_data["ship_id"]))
 
+        self._log_user_action("assign_squad", target_squad=target_squad, ship_count=len(ship_ids))
+
         def apply() -> None:
             for ship_id in ship_ids:
                 ship = self.engine.world.ships.get(ship_id)
@@ -3187,6 +3241,12 @@ class MainWindow(QMainWindow):
     def _apply_remote_command(self, cmd: dict) -> None:
         kind = str(cmd.get("kind", "")).upper()
         self._lan_debug(f"recv-cmd kind={kind} payload={cmd}")
+        self._log_user_action(
+            "remote_command",
+            kind=kind,
+            squad=str(cmd.get("squad_id", "") or ""),
+            target=str(cmd.get("target_id", "") or ""),
+        )
         team = Team.RED
         if kind == CMD_SQUAD_LEADER_SPEED_LIMIT:
             squad = str(cmd.get("squad_id", "")).strip()
@@ -3652,6 +3712,7 @@ class MainWindow(QMainWindow):
             "battlefield_radius": float(cfg.battlefield_radius),
             "detailed_logging": bool(cfg.detailed_logging),
             "detail_log_file": str(cfg.detail_log_file),
+            "log_merge_window_sec": float(cfg.log_merge_window_sec),
         }
 
     def _apply_host_engine_config(self, payload: dict) -> None:
@@ -3669,6 +3730,10 @@ class MainWindow(QMainWindow):
             radius = max(1_000.0, float(payload.get("battlefield_radius", self.engine.config.battlefield_radius)))
         except Exception:
             radius = max(1_000.0, float(self.engine.config.battlefield_radius))
+        try:
+            merge_window = max(0.1, float(payload.get("log_merge_window_sec", self.engine.config.log_merge_window_sec)))
+        except Exception:
+            merge_window = max(0.1, float(self.engine.config.log_merge_window_sec))
 
         old_tick_rate = int(self.engine.config.tick_rate)
         self.engine.config.tick_rate = tick_rate
@@ -3677,6 +3742,15 @@ class MainWindow(QMainWindow):
         self.engine.config.battlefield_radius = radius
         self.engine.config.detailed_logging = bool(payload.get("detailed_logging", self.engine.config.detailed_logging))
         self.engine.config.detail_log_file = str(payload.get("detail_log_file", self.engine.config.detail_log_file))
+        self.engine.config.log_merge_window_sec = merge_window
+
+        new_logger = get_sim_logger(self.engine.config)
+        self.engine._logger = new_logger
+        self.engine.combat.attach_logger(
+            new_logger,
+            self.engine.config.detailed_logging,
+            self.engine.config.log_merge_window_sec,
+        )
 
         if hasattr(self.engine, "_dt"):
             self.engine._dt = 1.0 / float(tick_rate)
@@ -3849,6 +3923,8 @@ class MainWindow(QMainWindow):
         self.prefs.selected_squad = self.ui_state.selected_squad
         self.prefs.zoom = self.canvas.zoom
         self.store.save(self.prefs)
+        if hasattr(self.engine, "combat") and hasattr(self.engine.combat, "flush_pending_events"):
+            self.engine.combat.flush_pending_events()
         if self.lan_server is not None:
             self.lan_server.stop()
         if self.lan_client is not None:

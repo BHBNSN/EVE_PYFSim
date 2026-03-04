@@ -13,6 +13,7 @@ from .fit_runtime import EffectClass, ProjectedImpact, RuntimeStatEngine
 from .math2d import Vector2
 from .models import ShipProfile, Team
 from .pyfa_bridge import PyfaBridge
+from .sim_logging import log_sim_event
 from .world import WorldState
 
 
@@ -262,12 +263,145 @@ class CombatSystem:
         self.runtime = RuntimeStatEngine()
         self.logger: logging.Logger | None = None
         self.detailed_logging: bool = False
+        self.event_logging_enabled: bool = False
+        self.event_merge_window_sec: float = 1.0
         self._diag_logged_ships: set[str] = set()
         self._lock_time_cache: dict[tuple[float, float], float] = {}
+        self._projected_cycle_totals: dict[tuple[str, str, str], dict[str, float]] = {}
+        self._merged_event_buckets: dict[tuple, dict[str, Any]] = {}
+        self._merge_window_start_time: float | None = None
+        self._merge_window_end_time: float | None = None
 
-    def attach_logger(self, logger: logging.Logger, detailed_logging: bool) -> None:
+    def attach_logger(self, logger: logging.Logger, detailed_logging: bool, merge_window_sec: float = 1.0) -> None:
         self.logger = logger
-        self.detailed_logging = detailed_logging
+        self.event_logging_enabled = bool(detailed_logging)
+        self.detailed_logging = False
+        try:
+            self.event_merge_window_sec = max(0.1, float(merge_window_sec))
+        except Exception:
+            self.event_merge_window_sec = 1.0
+        self._merge_window_start_time = None
+        self._merge_window_end_time = None
+        self._merged_event_buckets.clear()
+
+    def _log_event(self, event: str, **fields: Any) -> None:
+        if not self.event_logging_enabled:
+            return
+        log_sim_event(self.logger, event, **fields)
+
+    @staticmethod
+    def _normalize_merge_value(value: Any) -> Any:
+        if isinstance(value, float):
+            return round(value, 4)
+        if isinstance(value, (list, tuple, set)):
+            return tuple(CombatSystem._normalize_merge_value(v) for v in value)
+        if isinstance(value, dict):
+            return tuple(sorted((str(k), CombatSystem._normalize_merge_value(v)) for k, v in value.items()))
+        return value
+
+    def _queue_merged_event(
+        self,
+        event: str,
+        merge_fields: dict[str, Any],
+        sum_fields: dict[str, float] | None = None,
+        count: int = 1,
+    ) -> None:
+        if not self.event_logging_enabled:
+            return
+        key = (event,) + tuple(
+            (k, self._normalize_merge_value(v))
+            for k, v in sorted(merge_fields.items())
+        )
+        bucket = self._merged_event_buckets.get(key)
+        if bucket is None:
+            bucket = {
+                "event": event,
+                "merge_fields": dict(merge_fields),
+                "sum_fields": {},
+                "count": 0,
+            }
+            self._merged_event_buckets[key] = bucket
+        bucket["count"] = int(bucket["count"]) + max(1, int(count))
+        if sum_fields:
+            sums = bucket["sum_fields"]
+            for field, value in sum_fields.items():
+                sums[field] = float(sums.get(field, 0.0)) + float(value)
+
+    def _flush_merged_events(self, window_start: float | None = None, window_end: float | None = None) -> None:
+        if not self._merged_event_buckets:
+            return
+        for bucket in self._merged_event_buckets.values():
+            payload = dict(bucket["merge_fields"])
+            event_count = int(bucket.get("count", 0))
+            if event_count > 1:
+                payload["count"] = event_count
+            for field, value in bucket.get("sum_fields", {}).items():
+                payload[field] = float(value)
+            if window_start is not None and window_end is not None:
+                payload["window_start"] = float(window_start)
+                payload["window_end"] = float(window_end)
+            self._log_event(str(bucket["event"]), **payload)
+        self._merged_event_buckets.clear()
+
+    def _advance_merge_window(self, now: float) -> None:
+        window = max(0.1, float(self.event_merge_window_sec))
+        if self._merge_window_end_time is None or self._merge_window_start_time is None:
+            self._merge_window_start_time = float(now)
+            self._merge_window_end_time = float(now) + window
+            return
+        while now >= self._merge_window_end_time:
+            self._flush_merged_events(self._merge_window_start_time, self._merge_window_end_time)
+            self._merge_window_start_time = self._merge_window_end_time
+            self._merge_window_end_time = self._merge_window_start_time + window
+
+    def flush_pending_events(self) -> None:
+        self._flush_merged_events(self._merge_window_start_time, self._merge_window_end_time)
+
+    def _add_projected_cycle_total(
+        self,
+        source_ship_id: str,
+        module_id: str,
+        target_ship_id: str,
+        shield_repaired: float,
+        armor_repaired: float,
+        cap_drained: float,
+    ) -> None:
+        key = (source_ship_id, module_id, target_ship_id)
+        entry = self._projected_cycle_totals.setdefault(
+            key,
+            {"shield_repaired": 0.0, "armor_repaired": 0.0, "cap_drained": 0.0},
+        )
+        entry["shield_repaired"] += max(0.0, float(shield_repaired))
+        entry["armor_repaired"] += max(0.0, float(armor_repaired))
+        entry["cap_drained"] += max(0.0, float(cap_drained))
+
+    def _flush_projected_cycle_total(self, world: WorldState, source_ship_id: str, module, target_ship_id: str | None) -> None:
+        if not target_ship_id:
+            return
+        key = (source_ship_id, module.module_id, target_ship_id)
+        totals = self._projected_cycle_totals.pop(key, None)
+        if not totals:
+            return
+        if totals["shield_repaired"] <= 0.0 and totals["armor_repaired"] <= 0.0 and totals["cap_drained"] <= 0.0:
+            return
+        source_ship = world.ships.get(source_ship_id)
+        target_ship = world.ships.get(target_ship_id)
+        self._queue_merged_event(
+            "active_module_cycle_effect",
+            merge_fields={
+                "team": source_ship.team.value if source_ship is not None else "",
+                "squad": source_ship.squad_id if source_ship is not None else "",
+                "ship_type": source_ship.fit.ship_name if source_ship is not None else "",
+                "module": module.module_id,
+                "group": module.group,
+                "target_type": target_ship.fit.ship_name if target_ship is not None else "",
+            },
+            sum_fields={
+                "shield_repaired": totals["shield_repaired"],
+                "armor_repaired": totals["armor_repaired"],
+                "cap_drained": totals["cap_drained"],
+            },
+        )
 
     def _resolve_cap_recharge(self, cap_now: float, cap_max: float, recharge_time: float, dt: float) -> float:
         if cap_max <= 0 or recharge_time <= 0:
@@ -468,12 +602,17 @@ class CombatSystem:
                 if module.state == module.state.OFFLINE:
                     continue
 
+                previous_state = module.state
+                previous_projected_target = ship.combat.projected_targets.get(module.module_id)
+
                 active_effects = [
                     effect
                     for effect in module.effects
                     if str(effect.state_required.value).upper() == "ACTIVE"
                 ]
                 if not active_effects:
+                    if previous_state == module.state.ACTIVE:
+                        self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
                     module.state = module.state.ONLINE
                     ship.combat.module_cycle_timers.pop(module.module_id, None)
                     ship.combat.projected_targets.pop(module.module_id, None)
@@ -490,11 +629,13 @@ class CombatSystem:
                     if timer_left > 0:
                         ship.combat.module_cycle_timers[module.module_id] = timer_left
                         continue
+                    self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
 
                 desired_active = False
                 projected_target_id: str | None = None
                 group_name = module.group.lower()
                 has_projected = self._module_has_projected(module)
+                cycle_started = False
 
                 if self._is_propulsion_module(group_name):
                     desired_active = bool(ship.nav.propulsion_command_active)
@@ -567,6 +708,7 @@ class CombatSystem:
                         else:
                             ship.vital.cap = max(0.0, ship.vital.cap - cycle_cost)
                             ship.combat.module_cycle_timers[module.module_id] = cycle_time
+                            cycle_started = True
                     else:
                         ship.combat.module_cycle_timers.pop(module.module_id, None)
                 else:
@@ -578,31 +720,75 @@ class CombatSystem:
                 elif module.module_id in ship.combat.projected_targets:
                     ship.combat.projected_targets.pop(module.module_id, None)
 
+                if previous_projected_target and (
+                    module.state != module.state.ACTIVE or previous_projected_target != projected_target_id
+                ):
+                    self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
+
+                if previous_state != module.state:
+                    state_target_id = projected_target_id or previous_projected_target
+                    state_target = world.ships.get(state_target_id) if state_target_id else None
+                    self._queue_merged_event(
+                        "active_module_state_switch",
+                        merge_fields={
+                            "team": ship.team.value,
+                            "squad": ship.squad_id,
+                            "ship_type": ship.fit.ship_name,
+                            "module": module.module_id,
+                            "group": module.group,
+                            "from_state": previous_state.value,
+                            "to_state": module.state.value,
+                            "target_type": state_target.fit.ship_name if state_target is not None else "",
+                        },
+                    )
+
+                if cycle_started:
+                    effects = ",".join(effect.name for effect in active_effects)
+                    cycle_target = world.ships.get(projected_target_id) if projected_target_id else None
+                    self._queue_merged_event(
+                        "active_module_cycle",
+                        merge_fields={
+                            "team": ship.team.value,
+                            "squad": ship.squad_id,
+                            "ship_type": ship.fit.ship_name,
+                            "module": module.module_id,
+                            "group": module.group,
+                            "effects": effects,
+                            "cycle_time": cycle_time,
+                            "target_type": cycle_target.fit.ship_name if cycle_target is not None else "",
+                        },
+                        sum_fields={
+                            "cap_cost": cycle_cost,
+                        },
+                    )
+
     @staticmethod
-    def _apply_projected_support_effects(source, target, effect, dt: float, strength: float) -> float:
+    def _apply_projected_support_effects(source, target, effect, dt: float, strength: float) -> tuple[float, float, float]:
         if target is None:
-            return 0.0
-        reward = 0.0
+            return 0.0, 0.0, 0.0
         strength = max(0.0, min(1.0, strength))
+        shield_repaired = 0.0
+        armor_repaired = 0.0
+        cap_drained = 0.0
         shield_rep = float(effect.projected_add.get("shield_rep", 0.0) or 0.0)
         armor_rep = float(effect.projected_add.get("armor_rep", 0.0) or 0.0)
         if shield_rep > 0:
             amount = shield_rep * strength * (dt / max(0.1, effect.cycle_time))
             before = target.vital.shield
             target.vital.shield = min(target.vital.shield_max, target.vital.shield + amount)
-            repaired = target.vital.shield - before
-            reward += max(0.0, repaired)
+            shield_repaired = max(0.0, target.vital.shield - before)
         if armor_rep > 0:
             amount = armor_rep * strength * (dt / max(0.1, effect.cycle_time))
             before = target.vital.armor
             target.vital.armor = min(target.vital.armor_max, target.vital.armor + amount)
-            repaired = target.vital.armor - before
-            reward += max(0.0, repaired)
+            armor_repaired = max(0.0, target.vital.armor - before)
         cap_drain = float(effect.projected_add.get("cap_drain", 0.0) or 0.0)
         if cap_drain > 0:
             amount = cap_drain * strength * (dt / max(0.1, effect.cycle_time))
+            before_cap = target.vital.cap
             target.vital.cap = max(0.0, target.vital.cap - amount)
-        return reward
+            cap_drained = max(0.0, before_cap - target.vital.cap)
+        return shield_repaired, armor_repaired, cap_drained
 
     def _effective_profile(self, ship, impacts: dict[str, list[ProjectedImpact]]):
         if ship.runtime is None:
@@ -922,6 +1108,12 @@ class CombatSystem:
                 world.squad_prelock_timers.pop(focus_key, None)
 
     def run(self, world: WorldState, dt: float) -> None:
+        if self.event_logging_enabled:
+            self._advance_merge_window(world.now)
+        else:
+            self._merged_event_buckets.clear()
+            self._merge_window_start_time = None
+            self._merge_window_end_time = None
         self._update_module_states(world, dt)
         projected = self._collect_projected_impacts(world, dt)
 
@@ -962,8 +1154,16 @@ class CombatSystem:
                         strength = self.pyfa.turret_range_factor(effect.range_m, effect.falloff_m, distance)
                     else:
                         strength = 1.0
-                    reward = self._apply_projected_support_effects(source, target, effect, dt, strength)
-                    del reward
+                    shield_repaired, armor_repaired, cap_drained = self._apply_projected_support_effects(source, target, effect, dt, strength)
+                    if shield_repaired > 0.0 or armor_repaired > 0.0 or cap_drained > 0.0:
+                        self._add_projected_cycle_total(
+                            source_ship_id=source.ship_id,
+                            module_id=module.module_id,
+                            target_ship_id=target.ship_id,
+                            shield_repaired=shield_repaired,
+                            armor_repaired=armor_repaired,
+                            cap_drained=cap_drained,
+                        )
 
         if self.detailed_logging and self.logger is not None:
             total_impacts = sum(len(v) for v in projected.values())
@@ -1172,8 +1372,30 @@ class CombatSystem:
             if turret_fired or missile_fired:
                 ship.combat.last_attack_target = target_id
                 ship.combat.fire_delay_timers.pop(target_id, None)
-            if _sum_damage(dmg) <= 0:
+            total_damage = _sum_damage(dmg)
+            if total_damage <= 0:
                 continue
+
+            self._queue_merged_event(
+                "active_module_cycle_effect",
+                merge_fields={
+                    "team": ship.team.value,
+                    "squad": ship.squad_id,
+                    "ship_type": ship.fit.ship_name,
+                    "module": "weapon",
+                    "weapon_system": ship_profile.weapon_system,
+                    "target_type": target.fit.ship_name,
+                    "turret_fired": turret_fired,
+                    "missile_fired": missile_fired,
+                },
+                sum_fields={
+                    "em": dmg[0],
+                    "thermal": dmg[1],
+                    "kinetic": dmg[2],
+                    "explosive": dmg[3],
+                    "total_damage": total_damage,
+                },
+            )
 
             if self.detailed_logging and self.logger is not None:
                 best_turret_dph = ship_profile.turret_dps * max(0.0, ship_profile.turret_cycle) * self.pyfa.turret_damage_multiplier(1.0)
@@ -1238,6 +1460,9 @@ class CombatSystem:
                 target.nav.velocity = Vector2(0.0, 0.0)
                 if self.detailed_logging and self.logger is not None:
                     self.logger.debug(f"destroyed attacker={ship.ship_id} target={target.ship_id}")
+
+        if self.event_logging_enabled:
+            self._advance_merge_window(world.now)
 
 
 class LogisticsSystem:

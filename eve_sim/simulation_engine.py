@@ -21,7 +21,7 @@ class SimulationEngine:
         self.perception = PerceptionSystem()
         self.movement = MovementSystem(config.battlefield_radius)
         self.combat = combat_system
-        self.combat.attach_logger(self._logger, self.config.detailed_logging)
+        self.combat.attach_logger(self._logger, self.config.detailed_logging, self.config.log_merge_window_sec)
         self.logistics = LogisticsSystem()
 
         self._dt = 1.0 / config.tick_rate
@@ -35,9 +35,6 @@ class SimulationEngine:
     def step(self) -> None:
         self.world.tick += 1
         self.world.now += self._dt
-        if self.config.detailed_logging:
-            alive = sum(1 for s in self.world.ships.values() if s.vital.alive)
-            self._logger.debug(f"tick_start tick={self.world.tick} now={self.world.now:.3f} alive={alive}")
 
         self.perception.run(self.world)
 
@@ -53,11 +50,6 @@ class SimulationEngine:
             self.movement.run(self.world, sub_dt)
             self.combat.run(self.world, sub_dt)
             self.logistics.run(self.world, sub_dt)
-
-        if self.config.detailed_logging:
-            alive_blue = sum(1 for s in self.world.ships.values() if s.team.value == "BLUE" and s.vital.alive)
-            alive_red = sum(1 for s in self.world.ships.values() if s.team.value == "RED" and s.vital.alive)
-            self._logger.debug(f"tick_end tick={self.world.tick} blue_alive={alive_blue} red_alive={alive_red}")
 
     def snapshot(self) -> dict:
         ships = {}

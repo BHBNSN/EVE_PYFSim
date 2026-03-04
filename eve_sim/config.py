@@ -13,6 +13,7 @@ class EngineConfig:
     battlefield_radius: float = 800_000.0
     detailed_logging: bool = False
     detail_log_file: str = "logs/sim_detail.log"
+    log_merge_window_sec: float = 1.0
 
 
 @dataclass(slots=True)
