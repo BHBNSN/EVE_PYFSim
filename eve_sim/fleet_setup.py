@@ -216,17 +216,19 @@ class RuntimeFromEftFactory:
                 return False
         return True
 
-    def _module_effect_pyfa(self, module_name: str, idx: int) -> ModuleRuntime | None:
-        item = self._pyfa.get_item(module_name)
+    def _module_effect_pyfa(self, fitted_module, idx: int) -> ModuleRuntime | None:
+        item = getattr(fitted_module, "item", None)
         if item is None:
             return None
-        assert item is not None
 
         group_name = (item.group.name or "").lower()
         suffix = f"-{idx}"
 
         def attr_opt(name: str) -> float | None:
-            value = item.getAttribute(name, None)
+            try:
+                value = fitted_module.getModifiedItemAttr(name)
+            except Exception:
+                value = None
             if value is None:
                 return None
             try:
@@ -393,43 +395,6 @@ class RuntimeFromEftFactory:
             effects=[effect],
         )
 
-    def _hull_pyfa(self, ship_name: str) -> HullProfile | None:
-        ship_item = self._pyfa.get_item(ship_name)
-        if ship_item is None:
-            return None
-
-        def attr(name: str, default: float) -> float:
-            value = ship_item.getAttribute(name, default)
-            return float(default if value is None else value)
-
-        role = "DPS"
-        group_name = (ship_item.group.name or "").lower()
-        if "logistics" in group_name:
-            role = "LOGI"
-        elif any(x in group_name for x in ("electronic", "force recon", "combat recon")):
-            role = "EWAR"
-
-        return HullProfile(
-            ship_name=ship_item.typeName,
-            role=role,
-            base_dps=0.0,
-            volley=0.0,
-            optimal=1.0,
-            falloff=1.0,
-            tracking=0.0001,
-            sig_radius=attr("signatureRadius", 120.0),
-            scan_resolution=attr("scanResolution", 300.0),
-            max_target_range=attr("maxTargetRange", 90_000.0),
-            max_speed=attr("maxVelocity", 1500.0),
-            cap_max=attr("capacitorCapacity", 3000.0),
-            cap_recharge_time=attr("rechargeRate", 400_000.0) / 1000.0,
-            shield_hp=attr("shieldCapacity", 5000.0),
-            armor_hp=attr("armorHP", 4000.0),
-            structure_hp=attr("hp", 4000.0),
-            rep_amount=0.0,
-            rep_cycle=5.0,
-        )
-
     @staticmethod
     def _collect_pyfa_weapon_stats(modules: list[Any], ship: Any, *, require_volley: bool) -> dict[str, float]:
         turret_dps = 0.0
@@ -568,7 +533,7 @@ class RuntimeFromEftFactory:
             "optimal_sig": weighted_optimal_sig / max(1e-6, turret_dps) if turret_dps > 0 else 40_000.0,
         }
 
-    def _compute_pyfa_final_stats(self, parsed: ParsedEftFit) -> dict[str, float]:
+    def _build_pyfa_fit(self, parsed: ParsedEftFit) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
         if not self._pyfa.fit_engine_ready:
             raise ValueError("pyfa Fit计算链不可用")
 
@@ -592,6 +557,7 @@ class RuntimeFromEftFactory:
 
         fit = fit_cls(ship=ship_cls(ship_item), name=parsed.fit_name)
         fit.character = character_cls.getAll5()
+        fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]] = []
 
         for spec in parsed.module_specs:
             module_name = self._pyfa.resolve_type_name(spec.module_name)
@@ -613,8 +579,12 @@ class RuntimeFromEftFactory:
                 module.charge = charge_item
 
             fit.modules.append(module)
+            fitted_modules.append((spec, module, charge_name))
 
         fit.calculateModifiedAttributes()
+        return fit, fitted_modules
+
+    def _compute_pyfa_final_stats(self, fit) -> dict[str, float]:
         ship = fit.ship
         weapon_stats = self._collect_pyfa_weapon_stats(cast(list[Any], fit.modules), ship, require_volley=True)
         return {
@@ -678,22 +648,22 @@ class RuntimeFromEftFactory:
         if cached_runtime is not None and cached_fit is not None:
             return cached_runtime, cached_fit
 
-        hull_base = self._hull_pyfa(parsed.ship_name)
-        if hull_base is None:
-            raise ValueError(f"无法在 pyfa 数据库中找到舰船：{parsed.ship_name}")
+        fit_ctx, fitted_modules = self._build_pyfa_fit(parsed)
+        pyfa_final = self._compute_pyfa_final_stats(fit_ctx)
 
-        pyfa_final = self._compute_pyfa_final_stats(parsed)
+        ship_item = getattr(getattr(fit_ctx, "ship", None), "item", None)
+        ship_name = str(getattr(ship_item, "typeName", parsed.ship_name) or parsed.ship_name)
+        role = "DPS"
+        ship_group_name = str(getattr(getattr(ship_item, "group", None), "name", "") or "").lower()
+        if "logistics" in ship_group_name:
+            role = "LOGI"
+        elif any(x in ship_group_name for x in ("electronic", "force recon", "combat recon")):
+            role = "EWAR"
 
         modules: list[ModuleRuntime] = []
         pyfa_blueprint_modules: list[dict[str, Any]] = []
-        for idx, spec in enumerate(parsed.module_specs, start=1):
-            module_item_raw = self._pyfa.get_item(spec.module_name)
-            if module_item_raw is None:
-                raise ValueError(f"无法在 pyfa 数据库中找到模块：{spec.module_name}")
-            module_item = cast(Any, module_item_raw)
-            effective_charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
-
-            module = self._module_effect_pyfa(spec.module_name, idx)
+        for idx, (spec, fitted_module, effective_charge_name) in enumerate(fitted_modules, start=1):
+            module = self._module_effect_pyfa(fitted_module, idx)
             if module is not None:
                 if spec.offline:
                     module.state = ModuleState.OFFLINE
@@ -768,8 +738,8 @@ class RuntimeFromEftFactory:
         )
 
         hull = HullProfile(
-            ship_name=hull_base.ship_name,
-            role=hull_base.role,
+            ship_name=ship_name,
+            role=role,
             base_dps=profile.dps,
             volley=profile.volley,
             optimal=profile.optimal,
