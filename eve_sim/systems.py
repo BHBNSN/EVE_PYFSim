@@ -601,6 +601,8 @@ class CombatSystem:
             for module in ship.runtime.modules:
                 if module.state == module.state.OFFLINE:
                     ship.combat.module_reactivation_timers.pop(module.module_id, None)
+                    ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
+                    ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
                     continue
 
                 previous_state = module.state
@@ -617,6 +619,8 @@ class CombatSystem:
                     module.state = module.state.ONLINE
                     ship.combat.module_cycle_timers.pop(module.module_id, None)
                     ship.combat.module_reactivation_timers.pop(module.module_id, None)
+                    ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
+                    ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
                     ship.combat.projected_targets.pop(module.module_id, None)
                     continue
 
@@ -630,6 +634,7 @@ class CombatSystem:
                     default=0.0,
                 )
                 cycle_just_completed = False
+                ammo_reload_started_this_tick = False
 
                 if module.state == module.state.ACTIVE and cycle_time > 0:
                     timer_left = ship.combat.module_cycle_timers.get(module.module_id, cycle_time) - dt
@@ -644,6 +649,14 @@ class CombatSystem:
                             ship.combat.module_reactivation_timers.get(module.module_id, 0.0),
                             reactivation_delay,
                         )
+                    pending_ammo_reload = max(
+                        0.0,
+                        float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                    )
+                    if pending_ammo_reload > 0.0:
+                        ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload
+                        ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                        ammo_reload_started_this_tick = True
 
                 desired_active = False
                 projected_target_id: str | None = None
@@ -738,6 +751,36 @@ class CombatSystem:
                             desired_active = True
                     else:
                         desired_active = module.state == module.state.ACTIVE
+
+                ammo_reload_left = max(
+                    0.0,
+                    float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                )
+                if ammo_reload_left > 0.0:
+                    if not ammo_reload_started_this_tick:
+                        ammo_reload_left = max(0.0, ammo_reload_left - dt)
+                    if ammo_reload_left > 0.0:
+                        ship.combat.module_ammo_reload_timers[module.module_id] = ammo_reload_left
+                        desired_active = False
+                    else:
+                        ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
+
+                pending_ammo_reload_left = max(
+                    0.0,
+                    float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                )
+                active_ammo_reload_left = max(
+                    0.0,
+                    float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                )
+                current_cycle_left = max(
+                    0.0,
+                    float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0),
+                )
+                if active_ammo_reload_left <= 0.0 and pending_ammo_reload_left > 0.0 and current_cycle_left <= 0.0:
+                    ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload_left
+                    ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                    desired_active = False
 
                 cooldown_left = ship.combat.module_reactivation_timers.get(module.module_id)
                 if cooldown_left is not None:
@@ -1311,9 +1354,10 @@ class CombatSystem:
             expected_mult = 0.0
             turret_fired = False
             if ship_profile.turret_dps > 0 and turret_active_ratio > 0:
-                if ship.combat.turret_reload_timer <= 0:
-                    ship.combat.turret_reload_timer = max(0.0, ship_profile.turret_cycle)
-                ship.combat.turret_reload_timer = max(0.0, ship.combat.turret_reload_timer - dt)
+                turret_cycle = max(0.0, ship_profile.turret_cycle)
+                cycle_timer = max(0.0, float(ship.combat.turret_reload_timer))
+                ammo_reload_timer = max(0.0, float(ship.combat.turret_ammo_reload_timer))
+                pending_ammo_reload_timer = max(0.0, float(ship.combat.turret_pending_ammo_reload_timer))
                 chance = self.pyfa.turret_chance_to_hit(
                     tracking=ship_profile.tracking,
                     optimal_sig=max(1.0, ship_profile.optimal_sig),
@@ -1328,10 +1372,36 @@ class CombatSystem:
                 range_factor = self.pyfa.turret_range_factor(ship_profile.optimal, ship_profile.falloff, distance)
                 tracking_factor = 0.0 if range_factor <= 0 else max(0.0, min(1.0, chance / max(1e-9, range_factor)))
                 expected_mult = self.pyfa.turret_damage_multiplier(chance)
-                if ship.combat.turret_reload_timer <= 0 and ship_profile.turret_cycle > 0:
-                    turret_fired = True
-                    turret_damage = _scale_damage(self._turret_damage(ship_profile, chance), expected_mult * turret_active_ratio)
-                    ship.combat.turret_reload_timer += ship_profile.turret_cycle
+
+                if ammo_reload_timer > 0.0:
+                    ammo_reload_timer = max(0.0, ammo_reload_timer - dt)
+                else:
+                    cycle_in_progress = cycle_timer > 0.0
+                    if not cycle_in_progress and pending_ammo_reload_timer <= 0.0 and turret_cycle > 0.0:
+                        cycle_timer = turret_cycle
+                        cycle_in_progress = cycle_timer > 0.0
+                    if cycle_in_progress:
+                        cycle_timer = max(0.0, cycle_timer - dt)
+
+                    cycle_completed = cycle_in_progress and cycle_timer <= 0.0
+                    if cycle_completed:
+                        turret_fired = True
+                        turret_damage = _scale_damage(self._turret_damage(ship_profile, chance), expected_mult * turret_active_ratio)
+                        if pending_ammo_reload_timer > 0.0:
+                            ammo_reload_timer = pending_ammo_reload_timer
+                            pending_ammo_reload_timer = 0.0
+                            cycle_timer = 0.0
+                        elif turret_cycle > 0.0:
+                            cycle_timer += turret_cycle
+
+                if ammo_reload_timer <= 0.0 and pending_ammo_reload_timer > 0.0 and cycle_timer <= 0.0:
+                    ammo_reload_timer = pending_ammo_reload_timer
+                    pending_ammo_reload_timer = 0.0
+
+                ship.combat.turret_reload_timer = cycle_timer
+                ship.combat.turret_ammo_reload_timer = ammo_reload_timer
+                ship.combat.turret_pending_ammo_reload_timer = pending_ammo_reload_timer
+
                 if self.detailed_logging and self.logger is not None:
                     tracking_term = 0.0
                     if ship_profile.tracking > 0 and target_profile.sig_radius > 0:
@@ -1354,16 +1424,42 @@ class CombatSystem:
             missile_damage = (0.0, 0.0, 0.0, 0.0)
             missile_fired = False
             if ship_profile.missile_dps > 0 and missile_active_ratio > 0:
-                if ship.combat.missile_reload_timer <= 0:
-                    ship.combat.missile_reload_timer = max(0.0, ship_profile.missile_cycle)
-                ship.combat.missile_reload_timer = max(0.0, ship.combat.missile_reload_timer - dt)
-                if ship.combat.missile_reload_timer <= 0 and ship_profile.missile_cycle > 0:
-                    missile_fired = True
-                    missile_damage = _scale_damage(
-                        self._missile_damage(ship_profile, target_profile, distance, relative_speed),
-                        missile_active_ratio,
-                    )
-                    ship.combat.missile_reload_timer += ship_profile.missile_cycle
+                missile_cycle = max(0.0, ship_profile.missile_cycle)
+                cycle_timer = max(0.0, float(ship.combat.missile_reload_timer))
+                ammo_reload_timer = max(0.0, float(ship.combat.missile_ammo_reload_timer))
+                pending_ammo_reload_timer = max(0.0, float(ship.combat.missile_pending_ammo_reload_timer))
+
+                if ammo_reload_timer > 0.0:
+                    ammo_reload_timer = max(0.0, ammo_reload_timer - dt)
+                else:
+                    cycle_in_progress = cycle_timer > 0.0
+                    if not cycle_in_progress and pending_ammo_reload_timer <= 0.0 and missile_cycle > 0.0:
+                        cycle_timer = missile_cycle
+                        cycle_in_progress = cycle_timer > 0.0
+                    if cycle_in_progress:
+                        cycle_timer = max(0.0, cycle_timer - dt)
+
+                    cycle_completed = cycle_in_progress and cycle_timer <= 0.0
+                    if cycle_completed:
+                        missile_fired = True
+                        missile_damage = _scale_damage(
+                            self._missile_damage(ship_profile, target_profile, distance, relative_speed),
+                            missile_active_ratio,
+                        )
+                        if pending_ammo_reload_timer > 0.0:
+                            ammo_reload_timer = pending_ammo_reload_timer
+                            pending_ammo_reload_timer = 0.0
+                            cycle_timer = 0.0
+                        elif missile_cycle > 0.0:
+                            cycle_timer += missile_cycle
+
+                if ammo_reload_timer <= 0.0 and pending_ammo_reload_timer > 0.0 and cycle_timer <= 0.0:
+                    ammo_reload_timer = pending_ammo_reload_timer
+                    pending_ammo_reload_timer = 0.0
+
+                ship.combat.missile_reload_timer = cycle_timer
+                ship.combat.missile_ammo_reload_timer = ammo_reload_timer
+                ship.combat.missile_pending_ammo_reload_timer = pending_ammo_reload_timer
             if self.detailed_logging and self.logger is not None and ship_profile.missile_dps > 0:
                 sig_factor = target_profile.sig_radius / max(1.0, ship_profile.missile_explosion_radius)
                 vel_term = (sig_factor * ship_profile.missile_explosion_velocity) / max(1.0, relative_speed)

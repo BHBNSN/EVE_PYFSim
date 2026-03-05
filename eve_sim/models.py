@@ -120,6 +120,12 @@ class CombatState:
     reload_timer: float = 0.0
     turret_reload_timer: float = 0.0
     missile_reload_timer: float = 0.0
+    turret_ammo_reload_timer: float = 0.0
+    missile_ammo_reload_timer: float = 0.0
+    turret_pending_ammo_reload_timer: float = 0.0
+    missile_pending_ammo_reload_timer: float = 0.0
+    module_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
+    module_pending_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
     fire_delay_timers: dict[str, float] = field(default_factory=dict)
     projected_targets: dict[str, str] = field(default_factory=dict)
     last_damaged_at: float = -1e9

@@ -51,6 +51,7 @@ from .fleet_setup import (
     get_common_chargeable_modules,
     get_module_reload_channel,
     get_module_reload_time_sec,
+    resolve_module_type_name,
     get_type_display_name,
     replace_module_charge_in_fit_text,
 )
@@ -2546,6 +2547,7 @@ class MainWindow(QMainWindow):
 
         self._charge_module_ammo_selection[module_name] = ammo_name
         self._factory.set_charge_module_ammo_override(module_name, ammo_name)
+        canonical_module_name = resolve_module_type_name(module_name).strip().lower()
 
         changed = False
         for row in self.manual_setup:
@@ -2589,14 +2591,50 @@ class MainWindow(QMainWindow):
             ship.runtime = runtime
             ship.fit = fit
             ship.profile = profile
+
+            runtime_module_ids = {m.module_id for m in runtime.modules}
+            for timer_map in (
+                ship.combat.module_cycle_timers,
+                ship.combat.module_reactivation_timers,
+                ship.combat.module_ammo_reload_timers,
+                ship.combat.module_pending_ammo_reload_timers,
+            ):
+                for module_id in list(timer_map.keys()):
+                    if module_id not in runtime_module_ids:
+                        timer_map.pop(module_id, None)
+
             self._ship_fit_texts[ship_id] = new_text
             if idx < len(self.manual_setup) and self._is_ammo_configurable_team(self.manual_setup[idx].team):
                 self.manual_setup[idx].fit_text = new_text
 
-            if reload_channel == "launcher":
-                ship.combat.missile_reload_timer = max(ship.combat.missile_reload_timer, reload_sec)
-            elif reload_channel == "turret":
-                ship.combat.turret_reload_timer = max(ship.combat.turret_reload_timer, reload_sec)
+            if reload_sec > 0.0:
+                if reload_channel == "launcher":
+                    if ship.combat.missile_ammo_reload_timer > 0.0 or ship.combat.missile_reload_timer > 0.0:
+                        ship.combat.missile_pending_ammo_reload_timer = reload_sec
+                    else:
+                        ship.combat.missile_ammo_reload_timer = reload_sec
+                        ship.combat.missile_pending_ammo_reload_timer = 0.0
+                elif reload_channel == "turret":
+                    if ship.combat.turret_ammo_reload_timer > 0.0 or ship.combat.turret_reload_timer > 0.0:
+                        ship.combat.turret_pending_ammo_reload_timer = reload_sec
+                    else:
+                        ship.combat.turret_ammo_reload_timer = reload_sec
+                        ship.combat.turret_pending_ammo_reload_timer = 0.0
+                else:
+                    target_prefix = f"{canonical_module_name}-" if canonical_module_name else ""
+                    changed_module_ids = [
+                        module.module_id
+                        for module in runtime.modules
+                        if target_prefix and module.module_id.startswith(target_prefix)
+                    ]
+                    for module_id in changed_module_ids:
+                        cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
+                        active_reload_left = max(0.0, float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0))
+                        if cycle_left > 0.0 or active_reload_left > 0.0:
+                            ship.combat.module_pending_ammo_reload_timers[module_id] = reload_sec
+                        else:
+                            ship.combat.module_ammo_reload_timers[module_id] = reload_sec
+                            ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
             updated_ships += 1
 
         self.request_overview_refresh(force=True)

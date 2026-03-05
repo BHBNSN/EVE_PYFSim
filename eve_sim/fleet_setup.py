@@ -1356,6 +1356,11 @@ def get_type_display_name(type_name: str, language: str = "en") -> str:
     return backend.localize_type_name(type_name, language)
 
 
+def resolve_module_type_name(type_name: str) -> str:
+    backend = _get_static_backend()
+    return backend.resolve_type_name(type_name)
+
+
 def get_module_reload_time_sec(module_name: str) -> float:
     backend = _get_static_backend()
     canonical_module = backend.resolve_type_name(module_name)
