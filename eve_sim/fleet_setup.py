@@ -145,20 +145,20 @@ class RuntimeFromEftFactory:
         self._fit_cache: dict[str, FitDescriptor] = {}
         self._profile_cache: dict[str, ShipProfile] = {}
         self._pyfa = _PyfaStaticBackend()
-        self._weapon_ammo_overrides: dict[str, str] = {}
+        self._charge_module_ammo_overrides: dict[str, str] = {}
 
-    def set_weapon_ammo_override(self, weapon_name: str, ammo_name: str) -> None:
-        weapon = self._pyfa.resolve_type_name(weapon_name)
+    def set_charge_module_ammo_override(self, module_name: str, ammo_name: str) -> None:
+        module = self._pyfa.resolve_type_name(module_name)
         ammo = self._pyfa.resolve_type_name(ammo_name)
-        if weapon and ammo:
-            self._weapon_ammo_overrides[weapon.lower()] = ammo
+        if module and ammo:
+            self._charge_module_ammo_overrides[module.lower()] = ammo
             self._runtime_cache.clear()
             self._fit_cache.clear()
             self._profile_cache.clear()
 
-    def clear_weapon_ammo_overrides(self) -> None:
-        if self._weapon_ammo_overrides:
-            self._weapon_ammo_overrides.clear()
+    def clear_charge_module_ammo_overrides(self) -> None:
+        if self._charge_module_ammo_overrides:
+            self._charge_module_ammo_overrides.clear()
             self._runtime_cache.clear()
             self._fit_cache.clear()
             self._profile_cache.clear()
@@ -166,17 +166,15 @@ class RuntimeFromEftFactory:
     def _resolve_module_charge_name(self, module_item, explicit_charge_name: str | None) -> str | None:
         if explicit_charge_name:
             return self._pyfa.resolve_type_name(explicit_charge_name)
-        group_name = (module_item.group.name or "").lower()
-        if not self._is_weapon_like_group(group_name):
+        module_name = self._pyfa.resolve_type_name(str(getattr(module_item, "typeName", "") or ""))
+        if not module_name:
             return None
-        weapon_name = self._pyfa.resolve_type_name(str(getattr(module_item, "typeName", "") or ""))
-        if weapon_name:
-            override = self._weapon_ammo_overrides.get(weapon_name.lower())
-            if override:
-                return override
-            ammo = self._pyfa.list_ammo_for_weapon(weapon_name)
-            if ammo:
-                return ammo[0]
+        override = self._charge_module_ammo_overrides.get(module_name.lower())
+        if override:
+            return override
+        ammo = self._pyfa.list_charge_options_for_module(module_name)
+        if ammo:
+            return ammo[0]
         return None
 
     @staticmethod
@@ -191,12 +189,12 @@ class RuntimeFromEftFactory:
         return ("launcher" in g) or ("turret" in g) or ("weapon" in g)
 
     @staticmethod
-    def _is_charge_compatible(weapon_item, charge_item) -> bool:
-        if weapon_item is None or charge_item is None:
+    def _is_charge_compatible(module_item, charge_item) -> bool:
+        if module_item is None or charge_item is None:
             return False
         group_ids: set[int] = set()
         for idx in range(1, 5):
-            value = weapon_item.getAttribute(f"chargeGroup{idx}", None)
+            value = module_item.getAttribute(f"chargeGroup{idx}", None)
             if value is None:
                 continue
             gid = int(value)
@@ -207,10 +205,10 @@ class RuntimeFromEftFactory:
         if int(getattr(charge_item.group, "ID", 0)) not in group_ids:
             return False
 
-        weapon_size = weapon_item.getAttribute("chargeSize", None)
+        module_size = module_item.getAttribute("chargeSize", None)
         charge_size = charge_item.getAttribute("chargeSize", None)
-        if weapon_size is not None and charge_size is not None:
-            ws = int(float(weapon_size))
+        if module_size is not None and charge_size is not None:
+            ws = int(float(module_size))
             cs = int(float(charge_size))
             if ws > 0 and cs > 0 and ws != cs:
                 return False
@@ -934,15 +932,15 @@ class _PyfaStaticBackend:
             )
         )
 
-    def list_ammo_for_weapon(self, weapon_name: str) -> list[str]:
-        weapon = self.get_item(weapon_name)
-        if weapon is None or self._get_group is None:
+    def list_charge_options_for_module(self, module_name: str) -> list[str]:
+        module = self.get_item(module_name)
+        if module is None or self._get_group is None:
             return []
-        weapon_size_attr = weapon.getAttribute("chargeSize", None)
-        weapon_size = int(float(weapon_size_attr)) if weapon_size_attr is not None else 0
+        module_size_attr = module.getAttribute("chargeSize", None)
+        module_size = int(float(module_size_attr)) if module_size_attr is not None else 0
         group_ids: list[int] = []
         for i in range(1, 5):
-            value = weapon.getAttribute(f"chargeGroup{i}", None)
+            value = module.getAttribute(f"chargeGroup{i}", None)
             if value is None:
                 continue
             gid = int(value)
@@ -957,40 +955,48 @@ class _PyfaStaticBackend:
                 for item in group.items:
                     charge_size_attr = item.getAttribute("chargeSize", None)
                     charge_size = int(float(charge_size_attr)) if charge_size_attr is not None else 0
-                    if weapon_size > 0 and charge_size > 0 and charge_size != weapon_size:
+                    if module_size > 0 and charge_size > 0 and charge_size != module_size:
                         continue
                     ammo_names.append(item.typeName)
             except Exception:
                 continue
         return sorted(set(ammo_names))
 
-    def weapon_reload_time_sec(self, weapon_name: str) -> float:
-        weapon = self.get_item(weapon_name)
-        if weapon is None:
+    def module_reload_time_sec(self, module_name: str) -> float:
+        module = self.get_item(module_name)
+        if module is None:
             return 0.0
-        reload_ms = weapon.getAttribute("reloadTime", None)
+        reload_ms = module.getAttribute("reloadTime", None)
         if reload_ms is None:
             return 0.0
         return max(0.0, float(reload_ms) / 1000.0)
 
-    def weapon_kind(self, weapon_name: str) -> str:
-        weapon = self.get_item(weapon_name)
-        if weapon is None:
-            return "unknown"
-        group_name = (weapon.group.name or "").lower()
+    def module_reload_channel(self, module_name: str) -> str:
+        module = self.get_item(module_name)
+        if module is None:
+            return "none"
+        group_name = (module.group.name or "").lower()
         if "launcher" in group_name:
             return "launcher"
         if ("weapon" in group_name) or ("turret" in group_name):
             return "turret"
-        return "unknown"
+        return "none"
 
-    def is_weapon(self, module_name: str) -> bool:
+    def is_charge_loadable_module(self, module_name: str) -> bool:
         canonical = self.resolve_type_name(module_name)
         item = self.get_item(canonical)
         if item is None:
             return False
-        group_name = (item.group.name or "").lower()
-        return ("weapon" in group_name) or ("launcher" in group_name)
+        for i in range(1, 5):
+            value = item.getAttribute(f"chargeGroup{i}", None)
+            if value is None:
+                continue
+            try:
+                if int(value) > 0:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def resolve_type_name(self, type_name: str) -> str:
         name = (type_name or "").strip()
@@ -1233,31 +1239,43 @@ def recompute_profile_from_pyfa_runtime(runtime: FitRuntime) -> ShipProfile | No
     return profile
 
 
-def get_common_weapons(fit_texts: list[str], usage_threshold: float = 0.05, language: str = "en") -> list[str]:
+def get_common_chargeable_modules(fit_texts: list[str], usage_threshold: float = 0.05, language: str = "en") -> list[str]:
     parser = EftFitParser()
     backend = _get_static_backend()
     if not backend.available:
         return []
-    total = max(1, len(fit_texts))
+    total = 0
     counts: Counter[str] = Counter()
+    chargeable_cache: dict[str, bool] = {}
     for text in fit_texts:
         try:
             parsed = parser.parse(text)
         except Exception:
             continue
-        weapons = set(spec.module_name for spec in parsed.module_specs if backend.is_weapon(spec.module_name))
-        for weapon in weapons:
-            counts[weapon] += 1
+        for spec in parsed.module_specs:
+            module_name = backend.resolve_type_name(spec.module_name)
+            if not module_name:
+                continue
+            key = module_name.lower()
+            is_chargeable = chargeable_cache.get(key)
+            if is_chargeable is None:
+                is_chargeable = backend.is_charge_loadable_module(module_name)
+                chargeable_cache[key] = is_chargeable
+            if not is_chargeable:
+                continue
+            counts[module_name] += 1
+            total += 1
+    total = max(1, total)
     threshold = 1 if usage_threshold <= 0 else max(1, int(total * usage_threshold + 0.9999))
     rows = [(name, count) for name, count in counts.items() if count >= threshold]
     rows.sort(key=lambda item: (-item[1], backend.localize_type_name(item[0], language).lower()))
     return [backend.localize_type_name(name, language) for name, _ in rows]
 
 
-def get_ammo_options_for_weapon(weapon_name: str, language: str = "en") -> list[str]:
+def get_charge_options_for_module(module_name: str, language: str = "en") -> list[str]:
     backend = _get_static_backend()
-    canonical_weapon = backend.resolve_type_name(weapon_name)
-    ammo = backend.list_ammo_for_weapon(canonical_weapon)
+    canonical_module = backend.resolve_type_name(module_name)
+    ammo = backend.list_charge_options_for_module(canonical_module)
     return [backend.localize_type_name(name, language) for name in ammo]
 
 
@@ -1266,25 +1284,25 @@ def get_type_display_name(type_name: str, language: str = "en") -> str:
     return backend.localize_type_name(type_name, language)
 
 
-def get_weapon_reload_time_sec(weapon_name: str) -> float:
+def get_module_reload_time_sec(module_name: str) -> float:
     backend = _get_static_backend()
-    canonical_weapon = backend.resolve_type_name(weapon_name)
-    return backend.weapon_reload_time_sec(canonical_weapon)
+    canonical_module = backend.resolve_type_name(module_name)
+    return backend.module_reload_time_sec(canonical_module)
 
 
-def get_weapon_kind(weapon_name: str) -> str:
+def get_module_reload_channel(module_name: str) -> str:
     backend = _get_static_backend()
-    canonical_weapon = backend.resolve_type_name(weapon_name)
-    return backend.weapon_kind(canonical_weapon)
+    canonical_module = backend.resolve_type_name(module_name)
+    return backend.module_reload_channel(canonical_module)
 
 
-def replace_weapon_ammo_in_fit_text(fit_text: str, weapon_name: str, ammo_name: str) -> str:
+def replace_module_charge_in_fit_text(fit_text: str, module_name: str, ammo_name: str) -> str:
     backend = _get_static_backend()
-    weapon_name = backend.resolve_type_name(weapon_name)
+    module_name = backend.resolve_type_name(module_name)
     ammo_name = backend.resolve_type_name(ammo_name)
     lines = fit_text.splitlines()
     out: list[str] = []
-    target = weapon_name.strip().lower()
+    target = module_name.strip().lower()
     for line in lines:
         raw = line.strip()
         if not raw or raw.startswith("[") or raw.lower().startswith("dna:"):

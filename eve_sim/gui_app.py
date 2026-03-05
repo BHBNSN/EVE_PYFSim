@@ -46,13 +46,13 @@ from .fleet_setup import (
     EftFitParser,
     RuntimeFromEftFactory,
     recompute_profile_from_pyfa_runtime,
-    get_ammo_options_for_weapon,
+    get_charge_options_for_module,
     get_fit_backend_status,
-    get_common_weapons,
-    get_weapon_kind,
-    get_weapon_reload_time_sec,
+    get_common_chargeable_modules,
+    get_module_reload_channel,
+    get_module_reload_time_sec,
     get_type_display_name,
-    replace_weapon_ammo_in_fit_text,
+    replace_module_charge_in_fit_text,
 )
 from .fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
 from .i18n import tr
@@ -2181,7 +2181,7 @@ class MainWindow(QMainWindow):
         self._parser = EftFitParser()
         self._factory = RuntimeFromEftFactory()
         self._ship_fit_texts: dict[str, str] = {}
-        self._weapon_ammo_selection: dict[str, str] = {}
+        self._charge_module_ammo_selection: dict[str, str] = {}
         self._squad_approach_targets: dict[str, str] = {}
         self._squad_guidance_targets: dict[str, Vector2] = {}
         self._undeployed_ship_ids: set[str] = set()
@@ -2397,11 +2397,11 @@ class MainWindow(QMainWindow):
 
         ammo_layout = QVBoxLayout()
         ammo_row1 = QHBoxLayout()
-        self.lbl_freq_weapon = QLabel(tr(self.current_language(), "freq_weapon"))
-        ammo_row1.addWidget(self.lbl_freq_weapon)
-        self.weapon_combo = QComboBox()
-        self.weapon_combo.setMinimumWidth(260)
-        ammo_row1.addWidget(self.weapon_combo, 1)
+        self.lbl_freq_charge_module = QLabel(tr(self.current_language(), "freq_charge_module"))
+        ammo_row1.addWidget(self.lbl_freq_charge_module)
+        self.charge_module_combo = QComboBox()
+        self.charge_module_combo.setMinimumWidth(260)
+        ammo_row1.addWidget(self.charge_module_combo, 1)
         ammo_layout.addLayout(ammo_row1)
 
         ammo_row2 = QHBoxLayout()
@@ -2426,9 +2426,9 @@ class MainWindow(QMainWindow):
         self.btn_propulsion_toggle.clicked.connect(self.toggle_selected_squad_propulsion)
         self.btn_clear_focus.clicked.connect(self.clear_focus_targets)
         self.spin_leader_speed_limit.valueChanged.connect(self.on_selected_squad_leader_speed_limit_changed)
-        self.weapon_combo.currentTextChanged.connect(self._on_weapon_changed)
+        self.charge_module_combo.currentTextChanged.connect(self._on_charge_module_changed)
         self.apply_ammo_btn.clicked.connect(self._apply_selected_ammo)
-        self._refresh_common_weapons()
+        self._refresh_common_charge_modules()
         self._refresh_selected_squad_leader_speed_limit()
         self._refresh_propulsion_button_text()
         return side
@@ -2441,7 +2441,7 @@ class MainWindow(QMainWindow):
         self.prefs.language = lang
         self.store.save(self.prefs)
         self.retranslate_ui()
-        self._refresh_common_weapons()
+        self._refresh_common_charge_modules()
         self.request_overview_refresh(force=True)
 
     def retranslate_ui(self) -> None:
@@ -2454,7 +2454,7 @@ class MainWindow(QMainWindow):
         self.lbl_language.setText(tr(lang, "lang_label"))
         self.lbl_leader_speed_limit.setText(tr(lang, "leader_speed_limit"))
         self.btn_clear_focus.setText(tr(lang, "btn_clear_focus"))
-        self.lbl_freq_weapon.setText(tr(lang, "freq_weapon"))
+        self.lbl_freq_charge_module.setText(tr(lang, "freq_charge_module"))
         self.lbl_ammo.setText(tr(lang, "ammo"))
         self.apply_ammo_btn.setText(tr(lang, "apply_all"))
         self.tabs.setTabText(0, tr(lang, "tab_overview"))
@@ -2472,6 +2472,11 @@ class MainWindow(QMainWindow):
         lang = self.current_language()
         self.btn_propulsion_toggle.setText(tr(lang, "btn_prop_off") if active else tr(lang, "btn_prop_on"))
 
+    def _is_ammo_configurable_team(self, team: Team) -> bool:
+        if self.network_mode == "local":
+            return team == self.controlled_team
+        return True
+
     def toggle_selected_squad_propulsion(self) -> None:
         squad = self.ui_state.selected_squad
         old = self.engine.world.intents.get(squad)
@@ -2486,79 +2491,86 @@ class MainWindow(QMainWindow):
         self._log_user_action("toggle_propulsion", squad=squad, enabled=new_state)
         self._refresh_propulsion_button_text()
 
-    def _refresh_common_weapons(self) -> None:
-        fit_texts = [r.fit_text for r in self.manual_setup]
-        current = self.weapon_combo.currentText()
-        weapons = get_common_weapons(fit_texts, usage_threshold=0.0, language=self.current_language())
-        self.weapon_combo.blockSignals(True)
-        self.weapon_combo.clear()
-        self.weapon_combo.addItems(weapons)
-        if current and current in weapons:
-            self.weapon_combo.setCurrentText(current)
-        self.weapon_combo.blockSignals(False)
+    def _refresh_common_charge_modules(self) -> None:
+        fit_texts = [r.fit_text for r in self.manual_setup if self._is_ammo_configurable_team(r.team)]
+        current = self.charge_module_combo.currentText()
+        charge_modules = get_common_chargeable_modules(fit_texts, usage_threshold=0.0, language=self.current_language())
+        self.charge_module_combo.blockSignals(True)
+        self.charge_module_combo.clear()
+        self.charge_module_combo.addItems(charge_modules)
+        if current and current in charge_modules:
+            self.charge_module_combo.setCurrentText(current)
+        self.charge_module_combo.blockSignals(False)
 
-        for weapon in weapons:
-            ammo_list = get_ammo_options_for_weapon(weapon, language=self.current_language())
+        for module_name in charge_modules:
+            ammo_list = get_charge_options_for_module(module_name, language=self.current_language())
             if not ammo_list:
                 continue
-            selected = self._weapon_ammo_selection.get(weapon)
+            selected = self._charge_module_ammo_selection.get(module_name)
             if not selected or selected not in ammo_list:
-                self._weapon_ammo_selection[weapon] = ammo_list[0]
+                self._charge_module_ammo_selection[module_name] = ammo_list[0]
             try:
-                self._factory.set_weapon_ammo_override(weapon, self._weapon_ammo_selection[weapon])
+                self._factory.set_charge_module_ammo_override(
+                    module_name,
+                    self._charge_module_ammo_selection[module_name],
+                )
             except Exception:
                 continue
 
-        self._on_weapon_changed(self.weapon_combo.currentText())
+        self._on_charge_module_changed(self.charge_module_combo.currentText())
 
-    def _on_weapon_changed(self, weapon_name: str) -> None:
+    def _on_charge_module_changed(self, module_name: str) -> None:
         self.ammo_combo.clear()
-        if not weapon_name:
+        if not module_name:
             return
-        ammo = get_ammo_options_for_weapon(weapon_name, language=self.current_language())
+        ammo = get_charge_options_for_module(module_name, language=self.current_language())
         self.ammo_combo.addItems(ammo)
         if not ammo:
             return
-        selected = self._weapon_ammo_selection.get(weapon_name)
+        selected = self._charge_module_ammo_selection.get(module_name)
         if not selected or selected not in ammo:
             selected = ammo[0]
-            self._weapon_ammo_selection[weapon_name] = selected
+            self._charge_module_ammo_selection[module_name] = selected
             try:
-                self._factory.set_weapon_ammo_override(weapon_name, selected)
+                self._factory.set_charge_module_ammo_override(module_name, selected)
             except Exception:
                 pass
         self.ammo_combo.setCurrentText(selected)
 
     def _apply_selected_ammo(self) -> None:
         lang = self.current_language()
-        weapon_name = self.weapon_combo.currentText().strip()
+        module_name = self.charge_module_combo.currentText().strip()
         ammo_name = self.ammo_combo.currentText().strip()
-        if not weapon_name or not ammo_name:
+        if not module_name or not ammo_name:
             return
 
-        self._weapon_ammo_selection[weapon_name] = ammo_name
-        self._factory.set_weapon_ammo_override(weapon_name, ammo_name)
+        self._charge_module_ammo_selection[module_name] = ammo_name
+        self._factory.set_charge_module_ammo_override(module_name, ammo_name)
 
         changed = False
         for row in self.manual_setup:
-            updated = replace_weapon_ammo_in_fit_text(row.fit_text, weapon_name, ammo_name)
+            if not self._is_ammo_configurable_team(row.team):
+                continue
+            updated = replace_module_charge_in_fit_text(row.fit_text, module_name, ammo_name)
             if updated != row.fit_text:
                 row.fit_text = updated
                 changed = True
 
-        reload_sec = max(0.0, get_weapon_reload_time_sec(weapon_name))
-        weapon_kind = get_weapon_kind(weapon_name)
+        reload_sec = max(0.0, get_module_reload_time_sec(module_name))
+        reload_channel = get_module_reload_channel(module_name)
         updated_ships = 0
         for idx, ship_id in enumerate(list(self.engine.world.ships.keys())):
             ship = self.engine.world.ships.get(ship_id)
             if ship is None:
                 continue
+            if not self._is_ammo_configurable_team(ship.team):
+                continue
             old_text = self._ship_fit_texts.get(ship_id)
-            if old_text is None and idx < len(self.manual_setup):
+            if old_text is None and idx < len(self.manual_setup) and self._is_ammo_configurable_team(self.manual_setup[idx].team):
                 old_text = self.manual_setup[idx].fit_text
             if old_text is None:
                 continue
-            new_text = replace_weapon_ammo_in_fit_text(old_text, weapon_name, ammo_name)
+            new_text = replace_module_charge_in_fit_text(old_text, module_name, ammo_name)
             if new_text == old_text:
                 continue
             try:
@@ -2578,12 +2590,12 @@ class MainWindow(QMainWindow):
             ship.fit = fit
             ship.profile = profile
             self._ship_fit_texts[ship_id] = new_text
-            if idx < len(self.manual_setup):
+            if idx < len(self.manual_setup) and self._is_ammo_configurable_team(self.manual_setup[idx].team):
                 self.manual_setup[idx].fit_text = new_text
 
-            if weapon_kind == "launcher":
+            if reload_channel == "launcher":
                 ship.combat.missile_reload_timer = max(ship.combat.missile_reload_timer, reload_sec)
-            else:
+            elif reload_channel == "turret":
                 ship.combat.turret_reload_timer = max(ship.combat.turret_reload_timer, reload_sec)
             updated_ships += 1
 
@@ -2595,11 +2607,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             tr(lang, "ammo_title"),
-            tr(lang, "ammo_switch_done", weapon=weapon_name, ammo=ammo_name, count=updated_ships, reload=reload_sec),
+            tr(lang, "ammo_switch_done", module=module_name, ammo=ammo_name, count=updated_ships, reload=reload_sec),
         )
         self._log_user_action(
             "apply_ammo",
-            weapon=weapon_name,
+            module=module_name,
             ammo=ammo_name,
             updated_ships=updated_ships,
             reload_sec=reload_sec,
