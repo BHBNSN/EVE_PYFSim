@@ -192,27 +192,46 @@ class RuntimeFromEftFactory:
     def _is_charge_compatible(module_item, charge_item) -> bool:
         if module_item is None or charge_item is None:
             return False
-        group_ids: set[int] = set()
-        for idx in range(1, 5):
-            value = module_item.getAttribute(f"chargeGroup{idx}", None)
-            if value is None:
-                continue
-            gid = int(value)
-            if gid > 0:
-                group_ids.add(gid)
-        if not group_ids:
-            return False
-        if int(getattr(charge_item.group, "ID", 0)) not in group_ids:
-            return False
+        module_capacity = module_item.getAttribute("capacity", None)
+        charge_volume = charge_item.getAttribute("volume", None)
+        if module_capacity is not None and charge_volume is not None:
+            try:
+                if float(charge_volume) > float(module_capacity):
+                    return False
+            except Exception:
+                pass
 
         module_size = module_item.getAttribute("chargeSize", None)
         charge_size = charge_item.getAttribute("chargeSize", None)
         if module_size is not None and charge_size is not None:
-            ws = int(float(module_size))
-            cs = int(float(charge_size))
-            if ws > 0 and cs > 0 and ws != cs:
-                return False
-        return True
+            try:
+                ws = int(float(module_size))
+                cs = int(float(charge_size))
+                if ws > 0 and ws != cs:
+                    return False
+            except Exception:
+                pass
+
+        charge_group = getattr(charge_item, "groupID", None)
+        if charge_group is None:
+            charge_group = getattr(getattr(charge_item, "group", None), "ID", None)
+        try:
+            charge_group_id = int(float(charge_group)) if charge_group is not None else 0
+        except Exception:
+            charge_group_id = 0
+        if charge_group_id <= 0:
+            return False
+
+        for idx in range(0, 5):
+            value = module_item.getAttribute(f"chargeGroup{idx}", None)
+            if value is None:
+                continue
+            try:
+                if int(float(value)) == charge_group_id:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _module_effect_pyfa(self, fitted_module, idx: int) -> ModuleRuntime | None:
         item = getattr(fitted_module, "item", None)
@@ -934,18 +953,55 @@ class _PyfaStaticBackend:
 
     def list_charge_options_for_module(self, module_name: str) -> list[str]:
         module = self.get_item(module_name)
-        if module is None or self._get_group is None:
+        if module is None:
             return []
+
+        if self._module_cls is not None:
+            try:
+                module_obj = self._module_cls(module)
+                charges = module_obj.getValidCharges()
+                names = sorted(
+                    {
+                        str(charge.typeName)
+                        for charge in charges
+                        if charge is not None and getattr(charge, "typeName", None)
+                    }
+                )
+                return names
+            except Exception:
+                pass
+
+        if self._get_group is None:
+            return []
+
         module_size_attr = module.getAttribute("chargeSize", None)
-        module_size = int(float(module_size_attr)) if module_size_attr is not None else 0
+        module_size = 0
+        if module_size_attr is not None:
+            try:
+                module_size = int(float(module_size_attr))
+            except Exception:
+                module_size = 0
+
+        module_capacity_attr = module.getAttribute("capacity", None)
+        module_capacity: float | None = None
+        if module_capacity_attr is not None:
+            try:
+                module_capacity = float(module_capacity_attr)
+            except Exception:
+                module_capacity = None
+
         group_ids: list[int] = []
-        for i in range(1, 5):
+        for i in range(0, 5):
             value = module.getAttribute(f"chargeGroup{i}", None)
             if value is None:
                 continue
-            gid = int(value)
+            try:
+                gid = int(float(value))
+            except Exception:
+                continue
             if gid > 0 and gid not in group_ids:
                 group_ids.append(gid)
+
         ammo_names: list[str] = []
         for gid in group_ids:
             try:
@@ -953,8 +1009,24 @@ class _PyfaStaticBackend:
                 if group is None:
                     continue
                 for item in group.items:
+                    if not bool(getattr(item, "published", True)):
+                        continue
+
+                    charge_volume_attr = item.getAttribute("volume", None)
+                    if module_capacity is not None and charge_volume_attr is not None:
+                        try:
+                            if float(charge_volume_attr) > module_capacity:
+                                continue
+                        except Exception:
+                            pass
+
                     charge_size_attr = item.getAttribute("chargeSize", None)
-                    charge_size = int(float(charge_size_attr)) if charge_size_attr is not None else 0
+                    charge_size = 0
+                    if charge_size_attr is not None:
+                        try:
+                            charge_size = int(float(charge_size_attr))
+                        except Exception:
+                            charge_size = 0
                     if module_size > 0 and charge_size > 0 and charge_size != module_size:
                         continue
                     ammo_names.append(item.typeName)
@@ -987,12 +1059,12 @@ class _PyfaStaticBackend:
         item = self.get_item(canonical)
         if item is None:
             return False
-        for i in range(1, 5):
+        for i in range(0, 5):
             value = item.getAttribute(f"chargeGroup{i}", None)
             if value is None:
                 continue
             try:
-                if int(value) > 0:
+                if int(float(value)) > 0:
                     return True
             except Exception:
                 continue
@@ -1259,7 +1331,7 @@ def get_common_chargeable_modules(fit_texts: list[str], usage_threshold: float =
             key = module_name.lower()
             is_chargeable = chargeable_cache.get(key)
             if is_chargeable is None:
-                is_chargeable = backend.is_charge_loadable_module(module_name)
+                is_chargeable = bool(backend.list_charge_options_for_module(module_name))
                 chargeable_cache[key] = is_chargeable
             if not is_chargeable:
                 continue
