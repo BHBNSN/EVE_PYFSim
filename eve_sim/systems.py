@@ -653,6 +653,22 @@ class CombatSystem:
                         0.0,
                         float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
                     )
+
+                    if module.charge_capacity > 0 and module.charge_rate > 0.0:
+                        module.charge_remaining = max(0.0, float(module.charge_remaining) - float(module.charge_rate))
+                        if module.charge_remaining <= 0.0:
+                            module.charge_remaining = 0.0
+                            if pending_ammo_reload <= 0.0:
+                                auto_reload_time = max(0.0, float(module.charge_reload_time))
+                                if auto_reload_time > 0.0:
+                                    ship.combat.module_ammo_reload_timers[module.module_id] = max(
+                                        auto_reload_time,
+                                        float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                                    )
+                                    ammo_reload_started_this_tick = True
+                                else:
+                                    module.charge_remaining = float(module.charge_capacity)
+
                     if pending_ammo_reload > 0.0:
                         ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload
                         ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
@@ -764,6 +780,8 @@ class CombatSystem:
                         desired_active = False
                     else:
                         ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
+                        if module.charge_capacity > 0:
+                            module.charge_remaining = float(module.charge_capacity)
 
                 pending_ammo_reload_left = max(
                     0.0,
@@ -780,6 +798,15 @@ class CombatSystem:
                 if active_ammo_reload_left <= 0.0 and pending_ammo_reload_left > 0.0 and current_cycle_left <= 0.0:
                     ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload_left
                     ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                    desired_active = False
+
+                if module.charge_capacity > 0 and module.charge_rate > 0.0 and module.charge_remaining <= 0.0:
+                    if module.module_id not in ship.combat.module_ammo_reload_timers:
+                        auto_reload_time = max(0.0, float(module.charge_reload_time))
+                        if auto_reload_time > 0.0:
+                            ship.combat.module_ammo_reload_timers[module.module_id] = auto_reload_time
+                        else:
+                            module.charge_remaining = float(module.charge_capacity)
                     desired_active = False
 
                 cooldown_left = ship.combat.module_reactivation_timers.get(module.module_id)

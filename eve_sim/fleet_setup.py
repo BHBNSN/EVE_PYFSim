@@ -377,6 +377,42 @@ class RuntimeFromEftFactory:
         module_state = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
         module_id = f"mod{suffix}"
 
+        charge_capacity = 0
+        item_modified_attrs = getattr(fitted_module, "itemModifiedAttributes", None)
+        has_charge_rate_attr = False
+        if item_modified_attrs is not None:
+            try:
+                has_charge_rate_attr = "chargeRate" in item_modified_attrs
+            except Exception:
+                has_charge_rate_attr = False
+        charge_rate = max(0.0, attr("chargeRate", 0.0)) if has_charge_rate_attr else 0.0
+        charge_reload_time = max(0.0, attr("reloadTime", 0.0) / 1000.0)
+        charge_remaining = 0.0
+        loaded_charge = getattr(fitted_module, "charge", None)
+        if loaded_charge is not None:
+            try:
+                charge_capacity = int(float(getattr(fitted_module, "numCharges", 0) or 0))
+            except Exception:
+                charge_capacity = 0
+            if charge_capacity <= 0:
+                try:
+                    module_capacity = float(item.getAttribute("capacity", None) or 0.0)
+                except Exception:
+                    module_capacity = 0.0
+                try:
+                    charge_volume = float(loaded_charge.getAttribute("volume", None) or 0.0)
+                except Exception:
+                    charge_volume = 0.0
+                if module_capacity > 0.0 and charge_volume > 0.0:
+                    charge_capacity = int(module_capacity / charge_volume)
+            charge_remaining = float(max(0, charge_capacity))
+        else:
+            charge_rate = 0.0
+
+        if charge_capacity <= 0:
+            charge_rate = 0.0
+            charge_remaining = 0.0
+
         if has_projected:
             effect = ModuleEffect(
                 f"projected{suffix}",
@@ -413,6 +449,10 @@ class RuntimeFromEftFactory:
             group=str(item.group.name or ""),
             state=module_state,
             effects=[effect],
+            charge_capacity=charge_capacity,
+            charge_rate=charge_rate,
+            charge_remaining=charge_remaining,
+            charge_reload_time=charge_reload_time,
         )
 
     @staticmethod

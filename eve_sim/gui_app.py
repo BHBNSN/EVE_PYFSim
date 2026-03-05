@@ -49,7 +49,6 @@ from .fleet_setup import (
     get_charge_options_for_module,
     get_fit_backend_status,
     get_common_chargeable_modules,
-    get_module_reload_channel,
     get_module_reload_time_sec,
     resolve_module_type_name,
     get_type_display_name,
@@ -1635,6 +1634,80 @@ class ShipStatusDialog(QDialog):
         g = (group_name or "").lower()
         return ("weapon" in g) or ("turret" in g) or ("launcher" in g)
 
+    @staticmethod
+    def _fmt_charge_amount(value: float) -> str:
+        rounded = round(float(value))
+        if abs(float(value) - rounded) < 1e-6:
+            return str(int(rounded))
+        return f"{float(value):.1f}"
+
+    @staticmethod
+    def _fmt_time_pair(remaining: float, total: float) -> str:
+        left = max(0.0, float(remaining))
+        base = max(0.0, float(total))
+        if base <= 0.0:
+            base = left
+        return f"{left:.1f}/{base:.1f}s"
+
+    @staticmethod
+    def _module_cycle_time(module: ModuleRuntime) -> float:
+        return min(
+            (
+                max(0.1, float(effect.cycle_time))
+                for effect in module.effects
+                if str(effect.state_required.value).upper() == "ACTIVE" and float(effect.cycle_time) > 0.0
+            ),
+            default=0.0,
+        )
+
+    @staticmethod
+    def _module_reactivation_delay(module: ModuleRuntime) -> float:
+        return max(
+            (
+                max(0.0, float(getattr(effect, "reactivation_delay", 0.0) or 0.0))
+                for effect in module.effects
+                if str(effect.state_required.value).upper() == "ACTIVE"
+            ),
+            default=0.0,
+        )
+
+    def _format_module_charge_status(self, lang: str, ship, module: ModuleRuntime) -> str:
+        if int(module.charge_capacity) <= 0:
+            return ""
+
+        remaining = max(0.0, float(module.charge_remaining))
+        capacity = max(0, int(module.charge_capacity))
+        return f" | {tr(lang, 'status_charge')}={self._fmt_charge_amount(remaining)}/{capacity}"
+
+    def _format_module_time_status(
+        self,
+        lang: str,
+        ship,
+        module: ModuleRuntime,
+        effective_state: str,
+        cooldown_left: float,
+    ) -> str:
+        cooldown_left = max(0.0, float(cooldown_left))
+        if cooldown_left > 0.0:
+            delay_total = self._module_reactivation_delay(module)
+            return f" | {tr(lang, 'status_reactivation_time')}={self._fmt_time_pair(cooldown_left, delay_total)}"
+
+        reloading_left = max(
+            0.0,
+            float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+        )
+        if reloading_left > 0.0:
+            reload_total = max(0.0, float(module.charge_reload_time))
+            return f" | {tr(lang, 'status_reload_time')}={self._fmt_time_pair(reloading_left, reload_total)}"
+
+        if str(effective_state).upper() == "ACTIVE":
+            cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0))
+            if cycle_left > 0.0:
+                cycle_total = self._module_cycle_time(module)
+                return f" | {tr(lang, 'status_cycle_time')}={self._fmt_time_pair(cycle_left, cycle_total)}"
+
+        return ""
+
     def _stable_profile(self, ship):
         if ship.runtime is None:
             return ship.profile
@@ -1746,10 +1819,12 @@ class ShipStatusDialog(QDialog):
                         effective_state = "ONLINE"
                     cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
                     if cooldown_left > 0.0:
-                        state_label = tr(lang, "state_REACTIVATING_FMT", seconds=max(0.0, cooldown_left))
+                        state_label = tr(lang, "state_REACTIVATING")
                     else:
                         state_label = tr(lang, f"state_{effective_state}")
                     line = f"  - {module.module_id} | {get_type_display_name(module.group, language=lang)} | {tr(lang, 'status_state')}={state_label}"
+                    line += self._format_module_charge_status(lang, ship, module)
+                    line += self._format_module_time_status(lang, ship, module, effective_state, cooldown_left)
                     if has_projected:
                         target_id = projected_by_module.get(module.module_id, tr(lang, "status_target_none"))
                         line += f" | {tr(lang, 'status_target')}={target_id}"
@@ -1777,11 +1852,13 @@ class ShipStatusDialog(QDialog):
                 if runtime_module is not None:
                     cooldown_left = reactivation_by_module.get(runtime_module.module_id, 0.0)
                 if cooldown_left > 0.0:
-                    state_label = tr(lang, "state_REACTIVATING_FMT", seconds=max(0.0, cooldown_left))
+                    state_label = tr(lang, "state_REACTIVATING")
                 else:
                     state_label = tr(lang, f"state_{state_key}")
                 line = f"  - [{idx:02d}] {module_name} | {tr(lang, 'status_state')}={state_label}"
                 if runtime_module is not None:
+                    line += self._format_module_charge_status(lang, ship, runtime_module)
+                    line += self._format_module_time_status(lang, ship, runtime_module, state_key, cooldown_left)
                     has_projected = any(effect.effect_class == EffectClass.PROJECTED for effect in runtime_module.effects)
                     if has_projected:
                         target_id = projected_by_slot.get(idx, tr(lang, "status_target_none"))
@@ -2559,7 +2636,6 @@ class MainWindow(QMainWindow):
                 changed = True
 
         reload_sec = max(0.0, get_module_reload_time_sec(module_name))
-        reload_channel = get_module_reload_channel(module_name)
         updated_ships = 0
         for idx, ship_id in enumerate(list(self.engine.world.ships.keys())):
             ship = self.engine.world.ships.get(ship_id)
@@ -2608,33 +2684,21 @@ class MainWindow(QMainWindow):
                 self.manual_setup[idx].fit_text = new_text
 
             if reload_sec > 0.0:
-                if reload_channel == "launcher":
-                    if ship.combat.missile_ammo_reload_timer > 0.0 or ship.combat.missile_reload_timer > 0.0:
-                        ship.combat.missile_pending_ammo_reload_timer = reload_sec
+                changed_module_ids: list[str] = []
+                if canonical_module_name:
+                    for module_idx, spec in enumerate(parsed.module_specs, start=1):
+                        spec_name = resolve_module_type_name(spec.module_name).strip().lower()
+                        if spec_name == canonical_module_name:
+                            changed_module_ids.append(f"mod-{module_idx}")
+
+                for module_id in changed_module_ids:
+                    cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
+                    active_reload_left = max(0.0, float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0))
+                    if cycle_left > 0.0 or active_reload_left > 0.0:
+                        ship.combat.module_pending_ammo_reload_timers[module_id] = reload_sec
                     else:
-                        ship.combat.missile_ammo_reload_timer = reload_sec
-                        ship.combat.missile_pending_ammo_reload_timer = 0.0
-                elif reload_channel == "turret":
-                    if ship.combat.turret_ammo_reload_timer > 0.0 or ship.combat.turret_reload_timer > 0.0:
-                        ship.combat.turret_pending_ammo_reload_timer = reload_sec
-                    else:
-                        ship.combat.turret_ammo_reload_timer = reload_sec
-                        ship.combat.turret_pending_ammo_reload_timer = 0.0
-                else:
-                    target_prefix = f"{canonical_module_name}-" if canonical_module_name else ""
-                    changed_module_ids = [
-                        module.module_id
-                        for module in runtime.modules
-                        if target_prefix and module.module_id.startswith(target_prefix)
-                    ]
-                    for module_id in changed_module_ids:
-                        cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
-                        active_reload_left = max(0.0, float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0))
-                        if cycle_left > 0.0 or active_reload_left > 0.0:
-                            ship.combat.module_pending_ammo_reload_timers[module_id] = reload_sec
-                        else:
-                            ship.combat.module_ammo_reload_timers[module_id] = reload_sec
-                            ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
+                        ship.combat.module_ammo_reload_timers[module_id] = reload_sec
+                        ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
             updated_ships += 1
 
         self.request_overview_refresh(force=True)

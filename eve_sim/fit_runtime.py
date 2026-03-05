@@ -72,6 +72,10 @@ class ModuleRuntime:
     group: str
     state: ModuleState
     effects: list[ModuleEffect] = field(default_factory=list)
+    charge_capacity: int = 0
+    charge_rate: float = 0.0
+    charge_remaining: float = 0.0
+    charge_reload_time: float = 0.0
 
     def is_active_for(self, required: ModuleState) -> bool:
         rank = {
