@@ -42,6 +42,7 @@ from .agents import CommanderAgent
 from .config import EngineConfig, UiConfig
 from .fleet_setup import (
     ManualShipSetup,
+    ParsedModuleSpec,
     build_world_from_manual_setup,
     EftFitParser,
     RuntimeFromEftFactory,
@@ -52,7 +53,6 @@ from .fleet_setup import (
     get_module_reload_time_sec,
     resolve_module_type_name,
     get_type_display_name,
-    replace_module_charge_in_fit_text,
 )
 from .fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
 from .i18n import tr
@@ -1599,6 +1599,9 @@ class ShipStatusDialog(QDialog):
         ship_id: str,
         language_getter: Callable[[], str],
         fit_text_getter: Callable[[str], str | None],
+        lock_charge_getter: Callable[[str, str], str | None],
+        lock_charge_setter: Callable[[str, str, str], tuple[bool, str]],
+        lock_charge_clearer: Callable[[str, str], tuple[bool, str]],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1606,24 +1609,194 @@ class ShipStatusDialog(QDialog):
         self.ship_id = ship_id
         self._language_getter = language_getter
         self._fit_text_getter = fit_text_getter
+        self._lock_charge_getter = lock_charge_getter
+        self._lock_charge_setter = lock_charge_setter
+        self._lock_charge_clearer = lock_charge_clearer
         self._parser = EftFitParser()
         self._runtime_engine = RuntimeStatEngine()
         self._cached_fit_text: str = ""
         self._cached_module_specs: list = []
+        self._lock_module_specs: dict[str, ParsedModuleSpec] = {}
+        self._lock_ammo_draft_by_module: dict[str, str] = {}
         self._stable_profile_cache = None
         self._stable_profile_cache_key: tuple[str, int] | None = None
         self.setWindowTitle(f"{tr(self._language_getter(), 'ship_status_title')} - {ship_id}")
         self.resize(520, 480)
 
         layout = QVBoxLayout(self)
+        lock_row1 = QHBoxLayout()
+        self.lbl_lock_module = QLabel(self)
+        lock_row1.addWidget(self.lbl_lock_module)
+        self.lock_module_combo = QComboBox(self)
+        self.lock_module_combo.setMinimumWidth(260)
+        lock_row1.addWidget(self.lock_module_combo, 1)
+        layout.addLayout(lock_row1)
+
+        lock_row2 = QHBoxLayout()
+        self.lbl_lock_ammo = QLabel(self)
+        lock_row2.addWidget(self.lbl_lock_ammo)
+        self.lock_ammo_combo = QComboBox(self)
+        self.lock_ammo_combo.setMinimumWidth(220)
+        lock_row2.addWidget(self.lock_ammo_combo, 1)
+        self.btn_lock_apply = QPushButton(self)
+        lock_row2.addWidget(self.btn_lock_apply)
+        self.btn_lock_clear = QPushButton(self)
+        lock_row2.addWidget(self.btn_lock_clear)
+        layout.addLayout(lock_row2)
+
         self.info = QPlainTextEdit(self)
         self.info.setReadOnly(True)
         layout.addWidget(self.info)
+
+        self.lock_module_combo.currentIndexChanged.connect(self._on_lock_module_changed)
+        self.lock_ammo_combo.currentTextChanged.connect(self._on_lock_ammo_changed)
+        self.btn_lock_apply.clicked.connect(self._on_lock_apply_clicked)
+        self.btn_lock_clear.clicked.connect(self._on_lock_clear_clicked)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_status)
         self.timer.start(500)
         self.refresh_status()
+
+    @staticmethod
+    def _module_index_from_id(module_id: str) -> int | None:
+        parts = str(module_id).rsplit("-", 1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            return None
+        idx = int(parts[1])
+        return idx if idx > 0 else None
+
+    def _refresh_lock_controls(self) -> None:
+        lang = self._language_getter()
+        self.lbl_lock_module.setText(tr(lang, "status_lock_module"))
+        self.lbl_lock_ammo.setText(tr(lang, "status_lock_ammo"))
+        self.btn_lock_apply.setText(tr(lang, "status_lock_apply"))
+        self.btn_lock_clear.setText(tr(lang, "status_lock_clear"))
+
+        fit_text = self._fit_text_getter(self.ship_id) or ""
+        module_specs = self._get_module_specs_cached(fit_text)
+        previous_module_id = str(self.lock_module_combo.currentData() or "")
+        previous_ammo_text = self.lock_ammo_combo.currentText().strip()
+        if previous_module_id and previous_ammo_text:
+            self._lock_ammo_draft_by_module[previous_module_id] = previous_ammo_text
+
+        self._lock_module_specs = {}
+        module_rows: list[tuple[str, str]] = []
+        for idx, spec in enumerate(module_specs, start=1):
+            ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
+            if not ammo_options:
+                continue
+            module_id = f"mod-{idx}"
+            module_label = get_type_display_name(spec.module_name, language=lang)
+            if spec.charge_name:
+                charge_label = get_type_display_name(spec.charge_name, language=lang)
+                module_label = f"[{idx:02d}] {module_label} ({charge_label})"
+            else:
+                module_label = f"[{idx:02d}] {module_label}"
+            module_rows.append((module_id, module_label))
+            self._lock_module_specs[module_id] = spec
+
+        active_module_ids = {module_id for module_id, _ in module_rows}
+        self._lock_ammo_draft_by_module = {
+            module_id: ammo_text
+            for module_id, ammo_text in self._lock_ammo_draft_by_module.items()
+            if module_id in active_module_ids and ammo_text
+        }
+
+        self.lock_module_combo.blockSignals(True)
+        self.lock_module_combo.clear()
+        if not module_rows:
+            self.lock_module_combo.addItem(tr(lang, "status_lock_none"), "")
+            self.lock_module_combo.setEnabled(False)
+        else:
+            self.lock_module_combo.setEnabled(True)
+            for module_id, module_label in module_rows:
+                self.lock_module_combo.addItem(module_label, module_id)
+            select_idx = self.lock_module_combo.findData(previous_module_id)
+            if select_idx < 0:
+                select_idx = 0
+            self.lock_module_combo.setCurrentIndex(select_idx)
+        self.lock_module_combo.blockSignals(False)
+        self._on_lock_module_changed()
+
+    def _on_lock_module_changed(self, _index: int = -1) -> None:
+        lang = self._language_getter()
+        module_id = str(self.lock_module_combo.currentData() or "")
+        spec = self._lock_module_specs.get(module_id)
+
+        self.lock_ammo_combo.blockSignals(True)
+        self.lock_ammo_combo.clear()
+        self.lock_ammo_combo.blockSignals(False)
+
+        if spec is None:
+            self.lock_ammo_combo.setEnabled(False)
+            self.btn_lock_apply.setEnabled(False)
+            self.btn_lock_clear.setEnabled(False)
+            return
+
+        ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
+        self.lock_ammo_combo.blockSignals(True)
+        self.lock_ammo_combo.addItems(ammo_options)
+
+        locked_ammo = self._lock_charge_getter(self.ship_id, module_id)
+        selected_ammo = ""
+        if locked_ammo:
+            selected_ammo = get_type_display_name(locked_ammo, language=lang)
+        elif module_id and self._lock_ammo_draft_by_module.get(module_id):
+            selected_ammo = self._lock_ammo_draft_by_module[module_id]
+        elif spec.charge_name:
+            selected_ammo = get_type_display_name(spec.charge_name, language=lang)
+
+        if selected_ammo:
+            if self.lock_ammo_combo.findText(selected_ammo) < 0:
+                self.lock_ammo_combo.addItem(selected_ammo)
+            self.lock_ammo_combo.setCurrentText(selected_ammo)
+        elif ammo_options:
+            self.lock_ammo_combo.setCurrentIndex(0)
+
+        self.lock_ammo_combo.blockSignals(False)
+        has_ammo = self.lock_ammo_combo.count() > 0
+        self.lock_ammo_combo.setEnabled(has_ammo)
+        self.btn_lock_apply.setEnabled(has_ammo)
+        self.btn_lock_clear.setEnabled(bool(locked_ammo))
+        self._on_lock_ammo_changed(self.lock_ammo_combo.currentText())
+
+    def _on_lock_ammo_changed(self, text: str) -> None:
+        module_id = str(self.lock_module_combo.currentData() or "")
+        ammo_text = str(text or "").strip()
+        if not module_id:
+            return
+        if ammo_text:
+            self._lock_ammo_draft_by_module[module_id] = ammo_text
+        else:
+            self._lock_ammo_draft_by_module.pop(module_id, None)
+
+    def _on_lock_apply_clicked(self) -> None:
+        lang = self._language_getter()
+        module_id = str(self.lock_module_combo.currentData() or "")
+        ammo_name = self.lock_ammo_combo.currentText().strip()
+        if not module_id or not ammo_name:
+            return
+        ok, message = self._lock_charge_setter(self.ship_id, module_id, ammo_name)
+        if ok:
+            QMessageBox.information(self, tr(lang, "ammo_title"), message)
+            self._refresh_lock_controls()
+            self.refresh_status()
+            return
+        QMessageBox.warning(self, tr(lang, "ammo_title"), tr(lang, "status_lock_failed", error=message))
+
+    def _on_lock_clear_clicked(self) -> None:
+        lang = self._language_getter()
+        module_id = str(self.lock_module_combo.currentData() or "")
+        if not module_id:
+            return
+        ok, message = self._lock_charge_clearer(self.ship_id, module_id)
+        if ok:
+            QMessageBox.information(self, tr(lang, "ammo_title"), message)
+            self._refresh_lock_controls()
+            self.refresh_status()
+            return
+        QMessageBox.warning(self, tr(lang, "ammo_title"), tr(lang, "status_lock_failed", error=message))
 
     @staticmethod
     def _res_pct(resonance: float) -> float:
@@ -1740,6 +1913,7 @@ class ShipStatusDialog(QDialog):
     def refresh_status(self) -> None:
         lang = self._language_getter()
         self.setWindowTitle(f"{tr(lang, 'ship_status_title')} - {self.ship_id}")
+        self._refresh_lock_controls()
         ship = self.engine.world.ships.get(self.ship_id)
         if ship is None:
             self.info.setPlainText(tr(lang, "ship_missing"))
@@ -2260,6 +2434,7 @@ class MainWindow(QMainWindow):
         self._factory = RuntimeFromEftFactory()
         self._ship_fit_texts: dict[str, str] = {}
         self._charge_module_ammo_selection: dict[str, str] = {}
+        self._ship_locked_module_charges: dict[str, dict[str, str]] = {}
         self._squad_approach_targets: dict[str, str] = {}
         self._squad_guidance_targets: dict[str, Vector2] = {}
         self._undeployed_ship_ids: set[str] = set()
@@ -2350,7 +2525,16 @@ class MainWindow(QMainWindow):
     def show_ship_status(self, ship_id: str) -> None:
         dialog = self._status_dialogs.get(ship_id)
         if dialog is None:
-            dialog = ShipStatusDialog(self.engine, ship_id, self.current_language, self.get_ship_fit_text, self)
+            dialog = ShipStatusDialog(
+                self.engine,
+                ship_id,
+                self.current_language,
+                self.get_ship_fit_text,
+                self._get_ship_locked_module_charge,
+                self._set_ship_module_charge_lock,
+                self._clear_ship_module_charge_lock,
+                self,
+            )
             self._status_dialogs[ship_id] = dialog
             dialog.finished.connect(lambda _r, sid=ship_id: self._status_dialogs.pop(sid, None))
         dialog.show()
@@ -2417,6 +2601,228 @@ class MainWindow(QMainWindow):
 
     def get_ship_fit_text(self, ship_id: str) -> str | None:
         return self._ship_fit_texts.get(ship_id)
+
+    @staticmethod
+    def _module_index_from_id(module_id: str) -> int | None:
+        parts = str(module_id).rsplit("-", 1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            return None
+        idx = int(parts[1])
+        return idx if idx > 0 else None
+
+    def _get_ship_locked_module_charge(self, ship_id: str, module_id: str) -> str | None:
+        return self._ship_locked_module_charges.get(ship_id, {}).get(module_id)
+
+    def _prune_ship_locked_module_charges(self, ship_id: str, runtime_module_ids: set[str]) -> None:
+        locked = self._ship_locked_module_charges.get(ship_id)
+        if not locked:
+            return
+        for module_id in list(locked.keys()):
+            if module_id not in runtime_module_ids:
+                locked.pop(module_id, None)
+        if not locked:
+            self._ship_locked_module_charges.pop(ship_id, None)
+
+    def _sync_manual_setup_fit_text(self, ship_id: str, fit_text: str) -> None:
+        ship_ids = list(self.engine.world.ships.keys())
+        try:
+            idx = ship_ids.index(ship_id)
+        except ValueError:
+            return
+        if 0 <= idx < len(self.manual_setup):
+            self.manual_setup[idx].fit_text = fit_text
+
+    def _rewrite_fit_text_with_lock_rules(
+        self,
+        ship_id: str,
+        fit_text: str,
+        *,
+        target_module_name: str = "",
+        target_ammo_name: str = "",
+        force_module_id: str = "",
+        force_ammo_name: str = "",
+    ) -> str:
+        locked_map = self._ship_locked_module_charges.get(ship_id, {})
+        canonical_target_module = resolve_module_type_name(target_module_name).strip().lower() if target_module_name else ""
+        canonical_target_ammo = resolve_module_type_name(target_ammo_name).strip() if target_ammo_name else ""
+        canonical_force_ammo = resolve_module_type_name(force_ammo_name).strip() if force_ammo_name else ""
+
+        lines = fit_text.splitlines()
+        out: list[str] = []
+        module_idx = 0
+        for line in lines:
+            raw = line.strip()
+            if not raw or raw.startswith("[") or raw.lower().startswith("dna:") or raw.lower().startswith("x-"):
+                out.append(line)
+                continue
+
+            if " x" in raw:
+                out.append(line)
+                continue
+
+            offline_suffix = ""
+            base = raw
+            if base.endswith("/offline"):
+                base = base[:-8].rstrip()
+                offline_suffix = " /offline"
+            if base.endswith("/OFFLINE"):
+                base = base[:-8].rstrip()
+                offline_suffix = " /OFFLINE"
+
+            if not base or base.startswith("[Empty"):
+                out.append(line)
+                continue
+
+            module_idx += 1
+            module_id = f"mod-{module_idx}"
+            module_name = base.split(",", 1)[0].strip()
+            canonical_module_name = resolve_module_type_name(module_name).strip().lower()
+
+            if force_module_id and module_id == force_module_id and canonical_force_ammo:
+                out.append(f"{module_name}, {canonical_force_ammo}{offline_suffix}")
+                continue
+
+            locked_ammo = str(locked_map.get(module_id) or "").strip()
+            if locked_ammo:
+                out.append(f"{module_name}, {locked_ammo}{offline_suffix}")
+                continue
+
+            if canonical_target_module and canonical_target_ammo and canonical_module_name == canonical_target_module:
+                out.append(f"{module_name}, {canonical_target_ammo}{offline_suffix}")
+            else:
+                out.append(line)
+
+        return "\n".join(out)
+
+    def _rebuild_ship_from_fit_text(self, ship_id: str, fit_text: str, lang: str) -> tuple[bool, str, object | None]:
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return False, tr(lang, "ship_missing"), None
+        try:
+            parsed = self._parser.parse(fit_text)
+            runtime_template, fit = self._factory.build(parsed)
+            runtime = deepcopy(runtime_template)
+            profile = self._factory.build_profile(parsed)
+        except Exception as exc:
+            return False, _localize_fit_error(lang, exc), None
+
+        ship.runtime = runtime
+        ship.fit = fit
+        ship.profile = profile
+
+        runtime_module_ids = {m.module_id for m in runtime.modules}
+        for timer_map in (
+            ship.combat.module_cycle_timers,
+            ship.combat.module_reactivation_timers,
+            ship.combat.module_ammo_reload_timers,
+            ship.combat.module_pending_ammo_reload_timers,
+        ):
+            for module_id in list(timer_map.keys()):
+                if module_id not in runtime_module_ids:
+                    timer_map.pop(module_id, None)
+
+        self._prune_ship_locked_module_charges(ship_id, runtime_module_ids)
+        self._ship_fit_texts[ship_id] = fit_text
+        self._sync_manual_setup_fit_text(ship_id, fit_text)
+        return True, "", parsed
+
+    def _changed_module_ids_between_parsed(self, old_parsed, new_parsed) -> list[str]:
+        old_specs = list(getattr(old_parsed, "module_specs", []) or [])
+        new_specs = list(getattr(new_parsed, "module_specs", []) or [])
+        changed: list[str] = []
+        count = min(len(old_specs), len(new_specs))
+        for idx in range(count):
+            old_charge = resolve_module_type_name(str(old_specs[idx].charge_name or "")).strip().lower()
+            new_charge = resolve_module_type_name(str(new_specs[idx].charge_name or "")).strip().lower()
+            if old_charge != new_charge:
+                changed.append(f"mod-{idx + 1}")
+        return changed
+
+    def _set_ship_module_charge_lock(self, ship_id: str, module_id: str, ammo_name: str) -> tuple[bool, str]:
+        lang = self.current_language()
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return False, tr(lang, "ship_missing")
+        if not self._is_ammo_configurable_team(ship.team):
+            return False, tr(lang, "status_lock_team_denied")
+
+        old_text = self.get_ship_fit_text(ship_id) or ""
+        if not old_text.strip():
+            return False, tr(lang, "status_lock_module_missing")
+
+        try:
+            parsed_old = self._parser.parse(old_text)
+        except Exception as exc:
+            return False, _localize_fit_error(lang, exc)
+
+        module_idx = self._module_index_from_id(module_id)
+        if module_idx is None or module_idx > len(parsed_old.module_specs):
+            return False, tr(lang, "status_lock_module_missing")
+
+        spec = parsed_old.module_specs[module_idx - 1]
+        ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
+        if not ammo_options:
+            return False, tr(lang, "status_lock_module_not_chargeable")
+
+        canonical_ammo = resolve_module_type_name(ammo_name).strip()
+        if not canonical_ammo:
+            return False, tr(lang, "status_lock_ammo_invalid")
+        option_keys = {resolve_module_type_name(opt).strip().lower() for opt in ammo_options}
+        if canonical_ammo.strip().lower() not in option_keys:
+            return False, tr(lang, "status_lock_ammo_invalid")
+
+        locked_map = self._ship_locked_module_charges.setdefault(ship_id, {})
+        locked_map[module_id] = canonical_ammo
+        new_text = self._rewrite_fit_text_with_lock_rules(
+            ship_id,
+            old_text,
+            force_module_id=module_id,
+            force_ammo_name=canonical_ammo,
+        )
+
+        ok, message, parsed_new = self._rebuild_ship_from_fit_text(ship_id, new_text, lang)
+        if not ok:
+            locked_map.pop(module_id, None)
+            if not locked_map:
+                self._ship_locked_module_charges.pop(ship_id, None)
+            return False, message
+
+        changed_module_ids = self._changed_module_ids_between_parsed(parsed_old, parsed_new)
+        reload_sec = max(0.0, get_module_reload_time_sec(spec.module_name))
+        if reload_sec > 0.0 and module_id in changed_module_ids:
+            cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
+            active_reload_left = max(0.0, float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0))
+            if cycle_left > 0.0 or active_reload_left > 0.0:
+                ship.combat.module_pending_ammo_reload_timers[module_id] = reload_sec
+            else:
+                ship.combat.module_ammo_reload_timers[module_id] = reload_sec
+                ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
+
+        module_name = get_type_display_name(spec.module_name, language=lang)
+        ammo_display = get_type_display_name(canonical_ammo, language=lang)
+        return True, tr(lang, "status_lock_set_done", module=module_name, ammo=ammo_display)
+
+    def _clear_ship_module_charge_lock(self, ship_id: str, module_id: str) -> tuple[bool, str]:
+        lang = self.current_language()
+        module_label = module_id
+        fit_text = self.get_ship_fit_text(ship_id) or ""
+        try:
+            parsed = self._parser.parse(fit_text) if fit_text else None
+            module_idx = self._module_index_from_id(module_id)
+            if parsed is not None and module_idx is not None and module_idx <= len(parsed.module_specs):
+                module_label = get_type_display_name(parsed.module_specs[module_idx - 1].module_name, language=lang)
+        except Exception:
+            pass
+
+        locked_map = self._ship_locked_module_charges.get(ship_id)
+        if not locked_map or module_id not in locked_map:
+            return True, tr(lang, "status_lock_clear_done", module=module_label)
+
+        locked_map.pop(module_id, None)
+        if not locked_map:
+            self._ship_locked_module_charges.pop(ship_id, None)
+
+        return True, tr(lang, "status_lock_clear_done", module=module_label)
 
     def current_language(self) -> str:
         lang = (self.prefs.language or "zh_CN").strip()
@@ -2624,72 +3030,51 @@ class MainWindow(QMainWindow):
 
         self._charge_module_ammo_selection[module_name] = ammo_name
         self._factory.set_charge_module_ammo_override(module_name, ammo_name)
-        canonical_module_name = resolve_module_type_name(module_name).strip().lower()
-
-        changed = False
-        for row in self.manual_setup:
-            if not self._is_ammo_configurable_team(row.team):
-                continue
-            updated = replace_module_charge_in_fit_text(row.fit_text, module_name, ammo_name)
-            if updated != row.fit_text:
-                row.fit_text = updated
-                changed = True
 
         reload_sec = max(0.0, get_module_reload_time_sec(module_name))
         updated_ships = 0
-        for idx, ship_id in enumerate(list(self.engine.world.ships.keys())):
+        ship_ids = list(self.engine.world.ships.keys())
+        for idx, ship_id in enumerate(ship_ids):
             ship = self.engine.world.ships.get(ship_id)
             if ship is None:
                 continue
             if not self._is_ammo_configurable_team(ship.team):
                 continue
+
             old_text = self._ship_fit_texts.get(ship_id)
-            if old_text is None and idx < len(self.manual_setup) and self._is_ammo_configurable_team(self.manual_setup[idx].team):
+            if old_text is None and idx < len(self.manual_setup):
                 old_text = self.manual_setup[idx].fit_text
             if old_text is None:
                 continue
-            new_text = replace_module_charge_in_fit_text(old_text, module_name, ammo_name)
+
+            old_text = str(old_text)
+            try:
+                parsed_old = self._parser.parse(old_text)
+            except Exception:
+                parsed_old = None
+
+            new_text = self._rewrite_fit_text_with_lock_rules(
+                ship_id,
+                old_text,
+                target_module_name=module_name,
+                target_ammo_name=ammo_name,
+            )
             if new_text == old_text:
                 continue
-            try:
-                parsed = self._parser.parse(new_text)
-                runtime_template, fit = self._factory.build(parsed)
-                runtime = deepcopy(runtime_template)
-                profile = self._factory.build_profile(parsed)
-            except Exception as exc:
+
+            ok, message, parsed_new = self._rebuild_ship_from_fit_text(ship_id, new_text, lang)
+            if not ok:
                 QMessageBox.warning(
                     self,
                     tr(lang, "ammo_title"),
-                    tr(lang, "ammo_rebuild_failed", ship=ship_id, error=_localize_fit_error(lang, exc)),
+                    tr(lang, "ammo_rebuild_failed", ship=ship_id, error=message),
                 )
                 continue
 
-            ship.runtime = runtime
-            ship.fit = fit
-            ship.profile = profile
-
-            runtime_module_ids = {m.module_id for m in runtime.modules}
-            for timer_map in (
-                ship.combat.module_cycle_timers,
-                ship.combat.module_reactivation_timers,
-                ship.combat.module_ammo_reload_timers,
-                ship.combat.module_pending_ammo_reload_timers,
-            ):
-                for module_id in list(timer_map.keys()):
-                    if module_id not in runtime_module_ids:
-                        timer_map.pop(module_id, None)
-
-            self._ship_fit_texts[ship_id] = new_text
-            if idx < len(self.manual_setup) and self._is_ammo_configurable_team(self.manual_setup[idx].team):
-                self.manual_setup[idx].fit_text = new_text
-
             if reload_sec > 0.0:
                 changed_module_ids: list[str] = []
-                if canonical_module_name:
-                    for module_idx, spec in enumerate(parsed.module_specs, start=1):
-                        spec_name = resolve_module_type_name(spec.module_name).strip().lower()
-                        if spec_name == canonical_module_name:
-                            changed_module_ids.append(f"mod-{module_idx}")
+                if parsed_old is not None and parsed_new is not None:
+                    changed_module_ids = self._changed_module_ids_between_parsed(parsed_old, parsed_new)
 
                 for module_id in changed_module_ids:
                     cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
@@ -2703,7 +3088,7 @@ class MainWindow(QMainWindow):
 
         self.request_overview_refresh(force=True)
         self.canvas.update()
-        if not changed and updated_ships <= 0:
+        if updated_ships <= 0:
             QMessageBox.information(self, tr(lang, "ammo_title"), tr(lang, "ammo_no_replace"))
             return
         QMessageBox.information(
