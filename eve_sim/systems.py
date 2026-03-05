@@ -654,9 +654,36 @@ class CombatSystem:
                         and self._module_in_projected_range(ship, ally, module)
                     ]
                     if candidates:
-                        lowest = min(candidates, key=self._hp_ratio)
-                        projected_target_id = lowest.ship_id
-                        desired_active = True
+                        locked_candidates = [ally for ally in candidates if ally.ship_id in ship.combat.lock_targets]
+                        if locked_candidates:
+                            lowest = min(locked_candidates, key=self._hp_ratio)
+                            projected_target_id = lowest.ship_id
+                            desired_active = True
+                        else:
+                            lowest = min(candidates, key=self._hp_ratio)
+                            repair_target_id = lowest.ship_id
+                            projected_target_id = repair_target_id
+                            left = ship.combat.lock_timers.get(repair_target_id)
+                            if left is None:
+                                ship.combat.lock_timers[repair_target_id] = self._cached_lock_time(ship.profile, lowest.profile)
+                                if self.detailed_logging and self.logger is not None:
+                                    self.logger.debug(
+                                        f"remote_lock_start source={ship.ship_id} target={repair_target_id} lock_time={ship.combat.lock_timers[repair_target_id]:.2f}"
+                                    )
+                                desired_active = False
+                            else:
+                                left -= dt
+                                if left <= 0:
+                                    ship.combat.lock_targets.add(repair_target_id)
+                                    ship.combat.lock_timers.pop(repair_target_id, None)
+                                    if self.detailed_logging and self.logger is not None:
+                                        self.logger.debug(
+                                            f"remote_lock_complete source={ship.ship_id} target={repair_target_id}"
+                                        )
+                                    desired_active = True
+                                else:
+                                    ship.combat.lock_timers[repair_target_id] = left
+                                    desired_active = False
 
                 elif self._is_web_module(group_name):
                     if target is not None and self._module_in_projected_range(ship, target, module):
