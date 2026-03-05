@@ -600,6 +600,7 @@ class CombatSystem:
 
             for module in ship.runtime.modules:
                 if module.state == module.state.OFFLINE:
+                    ship.combat.module_reactivation_timers.pop(module.module_id, None)
                     continue
 
                 previous_state = module.state
@@ -615,6 +616,7 @@ class CombatSystem:
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
                     module.state = module.state.ONLINE
                     ship.combat.module_cycle_timers.pop(module.module_id, None)
+                    ship.combat.module_reactivation_timers.pop(module.module_id, None)
                     ship.combat.projected_targets.pop(module.module_id, None)
                     continue
 
@@ -623,13 +625,25 @@ class CombatSystem:
                     (max(0.1, effect.cycle_time) for effect in active_effects if effect.cycle_time > 0),
                     default=0.0,
                 )
+                reactivation_delay = max(
+                    (max(0.0, float(getattr(effect, "reactivation_delay", 0.0) or 0.0)) for effect in active_effects),
+                    default=0.0,
+                )
+                cycle_just_completed = False
 
                 if module.state == module.state.ACTIVE and cycle_time > 0:
                     timer_left = ship.combat.module_cycle_timers.get(module.module_id, cycle_time) - dt
                     if timer_left > 0:
                         ship.combat.module_cycle_timers[module.module_id] = timer_left
                         continue
+                    ship.combat.module_cycle_timers.pop(module.module_id, None)
                     self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
+                    cycle_just_completed = True
+                    if reactivation_delay > 0.0:
+                        ship.combat.module_reactivation_timers[module.module_id] = max(
+                            ship.combat.module_reactivation_timers.get(module.module_id, 0.0),
+                            reactivation_delay,
+                        )
 
                 desired_active = False
                 projected_target_id: str | None = None
@@ -724,6 +738,16 @@ class CombatSystem:
                             desired_active = True
                     else:
                         desired_active = module.state == module.state.ACTIVE
+
+                cooldown_left = ship.combat.module_reactivation_timers.get(module.module_id)
+                if cooldown_left is not None:
+                    if not cycle_just_completed:
+                        cooldown_left -= dt
+                    if cooldown_left > 0.0:
+                        ship.combat.module_reactivation_timers[module.module_id] = cooldown_left
+                        desired_active = False
+                    else:
+                        ship.combat.module_reactivation_timers.pop(module.module_id, None)
 
                 if has_projected and projected_target_id is None:
                     desired_active = False

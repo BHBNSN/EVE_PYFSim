@@ -153,6 +153,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "state_OFFLINE": {"zh_CN": "离线", "en_US": "OFFLINE"},
     "state_OVERHEATED": {"zh_CN": "过热", "en_US": "OVERHEATED"},
     "state_UNMODELED": {"zh_CN": "未建模", "en_US": "UNMODELED"},
+    "state_REACTIVATING_FMT": {"zh_CN": "启用延迟 {seconds:.1f}s", "en_US": "Reactivating in {seconds:.1f}s"},
     "canvas_zoom_pan": {"zh_CN": "缩放: {zoom:.5f}  平移: ({x:.0f}, {y:.0f})", "en_US": "Zoom: {zoom:.5f}  Pan: ({x:.0f}, {y:.0f})"},
     "canvas_help": {"zh_CN": "左键选择己方小队/敌方目标 | 双击空地前往 | 双击舰船持续接近 | 右键菜单诱导部署/集火 | 中键平移 | 滚轮缩放", "en_US": "Left click: select friendly squad/enemy target | Double-click space: move | Double-click ship: continuous approach | Right-click menu: induce deploy/focus | Middle drag: pan | Wheel: zoom"},
     "menu_induce_squad_here": {"zh_CN": "将小队诱导至此", "en_US": "Induce Squad Here"},

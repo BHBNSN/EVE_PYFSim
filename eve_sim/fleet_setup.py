@@ -248,6 +248,7 @@ class RuntimeFromEftFactory:
         cycle_ms = duration_ms if duration_ms > 0 else speed_ms
         cycle_sec = max(0.1, cycle_ms / 1000.0) if cycle_ms > 0 else 5.0
         cap_need = max(0.0, attr("capacitorNeed", 0.0))
+        reactivation_delay_sec = max(0.0, attr("moduleReactivationDelay", 0.0) / 1000.0)
 
         range_m = max(0.0, attr("maxRange", 0.0))
         falloff_m = max(0.0, attr("falloffEffectiveness", 0.0))
@@ -368,6 +369,7 @@ class RuntimeFromEftFactory:
                 falloff_m,
                 cycle_sec,
                 cap_need,
+                reactivation_delay_sec,
                 {},
                 {},
                 projected_mult,
@@ -382,6 +384,7 @@ class RuntimeFromEftFactory:
                 0.0,
                 cycle_sec,
                 cap_need if state_required == ModuleState.ACTIVE else 0.0,
+                reactivation_delay_sec,
                 local_mult,
                 local_add,
                 {},

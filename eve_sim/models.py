@@ -124,6 +124,7 @@ class CombatState:
     projected_targets: dict[str, str] = field(default_factory=dict)
     last_damaged_at: float = -1e9
     module_cycle_timers: dict[str, float] = field(default_factory=dict)
+    module_reactivation_timers: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

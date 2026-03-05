@@ -59,6 +59,7 @@ class ModuleEffect:
     falloff_m: float = 0.0
     cycle_time: float = 5.0
     cap_need: float = 0.0
+    reactivation_delay: float = 0.0
     local_mult: dict[str, float] = field(default_factory=dict)
     local_add: dict[str, float] = field(default_factory=dict)
     projected_mult: dict[str, float] = field(default_factory=dict)
@@ -234,6 +235,7 @@ class RuntimeStatEngine:
                         e.falloff_m,
                         e.cycle_time,
                         e.cap_need,
+                        e.reactivation_delay,
                         tuple(sorted(e.local_mult.items())),
                         tuple(sorted(e.local_add.items())),
                         tuple(sorted(e.projected_mult.items())),

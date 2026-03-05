@@ -1709,12 +1709,18 @@ class ShipStatusDialog(QDialog):
         projected_by_slot: dict[int, str] = {}
         projected_by_module: dict[str, str] = {}
         runtime_module_by_slot: dict[int, ModuleRuntime] = {}
+        reactivation_by_module: dict[str, float] = {}
         if ship.runtime is not None:
             for module in ship.runtime.modules:
                 parts = module.module_id.rsplit("-", 1)
                 if len(parts) == 2 and parts[1].isdigit():
                     runtime_by_slot[int(parts[1])] = module.state.value
                     runtime_module_by_slot[int(parts[1])] = module
+            reactivation_by_module = {
+                str(mid): float(left)
+                for mid, left in ship.combat.module_reactivation_timers.items()
+                if float(left) > 0.0
+            }
             for module_id, target_id in ship.combat.projected_targets.items():
                 projected_by_module[module_id] = target_id
                 parts = module_id.rsplit("-", 1)
@@ -1737,7 +1743,11 @@ class ShipStatusDialog(QDialog):
                     current_target_id = projected_by_module.get(module.module_id) if has_projected else ship.combat.current_target
                     if effective_state == "ACTIVE" and target_required and not current_target_id:
                         effective_state = "ONLINE"
-                    state_label = tr(lang, f"state_{effective_state}")
+                    cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
+                    if cooldown_left > 0.0:
+                        state_label = tr(lang, "state_REACTIVATING_FMT", seconds=max(0.0, cooldown_left))
+                    else:
+                        state_label = tr(lang, f"state_{effective_state}")
                     line = f"  - {module.module_id} | {get_type_display_name(module.group, language=lang)} | {tr(lang, 'status_state')}={state_label}"
                     if has_projected:
                         target_id = projected_by_module.get(module.module_id, tr(lang, "status_target_none"))
@@ -1762,7 +1772,13 @@ class ShipStatusDialog(QDialog):
                     current_target_id = projected_by_slot.get(idx) if has_projected else ship.combat.current_target
                     if state_key == "ACTIVE" and target_required and not current_target_id:
                         state_key = "ONLINE"
-                state_label = tr(lang, f"state_{state_key}")
+                cooldown_left = 0.0
+                if runtime_module is not None:
+                    cooldown_left = reactivation_by_module.get(runtime_module.module_id, 0.0)
+                if cooldown_left > 0.0:
+                    state_label = tr(lang, "state_REACTIVATING_FMT", seconds=max(0.0, cooldown_left))
+                else:
+                    state_label = tr(lang, f"state_{state_key}")
                 line = f"  - [{idx:02d}] {module_name} | {tr(lang, 'status_state')}={state_label}"
                 if runtime_module is not None:
                     has_projected = any(effect.effect_class == EffectClass.PROJECTED for effect in runtime_module.effects)
