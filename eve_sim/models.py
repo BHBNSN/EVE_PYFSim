@@ -139,6 +139,7 @@ class CombatState:
     ecm_last_attempt_success_by_module: dict[str, bool] = field(default_factory=dict)
     ecm_last_attempt_at_by_module: dict[str, float] = field(default_factory=dict)
     last_damaged_at: float = -1e9
+    last_enemy_weapon_damaged_at: float = -1e9
     module_cycle_timers: dict[str, float] = field(default_factory=dict)
     module_reactivation_timers: dict[str, float] = field(default_factory=dict)
 

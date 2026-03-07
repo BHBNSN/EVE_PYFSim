@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 import logging
 import random
@@ -18,6 +18,14 @@ from .world import WorldState
 
 
 DamageTuple = tuple[float, float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleDecisionRule:
+    rule_id: str
+    activation_mode: str
+    target_mode: str
+    cap_threshold: float = 0.0
 
 
 def _scale_damage(dmg: DamageTuple, factor: float) -> DamageTuple:
@@ -535,6 +543,418 @@ class CombatSystem:
         return False
 
     @staticmethod
+    def _module_group_name(module) -> str:
+        return str(getattr(module, "group", "") or "").lower()
+
+    @staticmethod
+    def _module_group_has_any(module, tokens: tuple[str, ...]) -> bool:
+        group_name = CombatSystem._module_group_name(module)
+        return any(token in group_name for token in tokens)
+
+    @staticmethod
+    def _module_group_has_equal(module, tokens: tuple[str, ...]) -> bool:
+        group_name = CombatSystem._module_group_name(module)
+        return any(token == group_name for token in tokens)
+
+    @staticmethod
+    def _module_has_projected_damage(module) -> bool:
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            for key in ("damage_em", "damage_thermal", "damage_kinetic", "damage_explosive"):
+                if float(effect.projected_add.get(key, 0.0) or 0.0) > 0.0:
+                    return True
+        return False
+
+    @staticmethod
+    def _module_has_projected_rep(module) -> bool:
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            if float(effect.projected_add.get("shield_rep", 0.0) or 0.0) > 0.0:
+                return True
+            if float(effect.projected_add.get("armor_rep", 0.0) or 0.0) > 0.0:
+                return True
+        return False
+
+    @staticmethod
+    def _module_is_weapon_module(module) -> bool:
+        if not CombatSystem._module_has_projected(module):
+            return False
+        if not CombatSystem._module_has_projected_damage(module):
+            return False
+        group_name = CombatSystem._module_group_name(module)
+        looks_like_weapon_group = (
+            ("weapon" in group_name)
+            or ("missile launcher" in group_name)
+        )
+        has_ammo_like = int(getattr(module, "charge_capacity", 0) or 0) > 0 and float(getattr(module, "charge_rate", 0.0) or 0.0) > 0.0
+        return looks_like_weapon_group or has_ammo_like
+
+    @staticmethod
+    def _module_is_offensive_ewar_module(module) -> bool:
+        if not CombatSystem._module_has_projected(module):
+            return False
+        if CombatSystem._module_is_weapon_module(module):
+            return False
+        if CombatSystem._module_target_side(module) != "enemy":
+            return False
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "weapon disruptor",
+                "sensor damp",
+                "energy neutral",
+                "nosferatu",
+                "ecm",
+                "warp scrambler",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_target_ewar_module(module) -> bool:
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "target painter",
+                "stasis web",
+                "stasis grappler",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_hardener_module(module) -> bool:
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "shield hardener",
+                "armor hardener",
+                "energized",
+                "armor resistance shift hardener",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_cap_booster_module(module) -> bool:
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "capacitor booster",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_propulsion_module(module) -> bool:
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "propulsion module",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_damage_control_module(module) -> bool:
+        return CombatSystem._module_group_has_equal(
+            module,
+            (
+                "damage control",
+            ),
+        )
+
+    @staticmethod
+    def _cap_ratio(ship) -> float:
+        return max(0.0, float(ship.vital.cap) / max(1.0, float(ship.vital.cap_max)))
+
+    @staticmethod
+    def _prefocus_fire_probability(ship) -> float:
+        level = str(getattr(ship.quality.level, "value", "REGULAR")).upper()
+        if level == "ELITE":
+            base = 0.38
+        elif level == "IRREGULAR":
+            base = 0.10
+        else:
+            base = 0.22
+        configured = float(getattr(ship.quality, "ignore_order_probability", 0.0) or 0.0)
+        return max(0.0, min(1.0, max(base, configured)))
+
+    @staticmethod
+    def _sample_weapon_fire_delay(ship) -> float:
+        base_delay = float(getattr(ship.quality, "reaction_delay", 0.0) or 0.0)
+        if base_delay <= 0.0:
+            level = str(getattr(ship.quality.level, "value", "REGULAR")).upper()
+            if level == "ELITE":
+                base_delay = random.uniform(0.05, 0.30)
+            elif level == "IRREGULAR":
+                base_delay = random.uniform(0.55, 1.60)
+            else:
+                base_delay = random.uniform(0.20, 0.85)
+        jitter = max(0.0, float(getattr(ship.quality, "formation_jitter", 0.0) or 0.0))
+        if jitter > 0.0:
+            base_delay *= 1.0 + random.uniform(0.0, jitter)
+        return max(0.0, base_delay)
+
+    def _sync_weapon_fire_delay(self, ship, previous_target_id: str | None, new_target_id: str | None, now: float) -> None:
+        if not new_target_id:
+            ship.combat.fire_delay_timers.clear()
+            return
+        if previous_target_id == new_target_id:
+            for stale in [target_id for target_id in ship.combat.fire_delay_timers if target_id != new_target_id]:
+                ship.combat.fire_delay_timers.pop(stale, None)
+            return
+        delay = self._sample_weapon_fire_delay(ship)
+        ship.combat.fire_delay_timers[new_target_id] = float(now) + delay
+        for stale in [target_id for target_id in ship.combat.fire_delay_timers if target_id != new_target_id]:
+            ship.combat.fire_delay_timers.pop(stale, None)
+
+    @staticmethod
+    def _weapon_fire_delay_ready(ship, target_id: str | None, now: float) -> bool:
+        if not target_id:
+            return False
+        ready_at = ship.combat.fire_delay_timers.get(target_id)
+        if ready_at is None:
+            return True
+        return float(now) >= float(ready_at)
+
+    def _candidates_in_projected_range(self, source, module, candidates: list) -> list:
+        return [candidate for candidate in candidates if candidate.vital.alive and self._module_in_projected_range(source, candidate, module)]
+
+    @staticmethod
+    def _ship_id_in_pool(ship_id: str, pool: list) -> bool:
+        return any(candidate.ship_id == ship_id and candidate.vital.alive for candidate in pool)
+
+    def _is_lowest_hp_ally_target(self, source, module, allies_pool: list, target_id: str) -> bool:
+        candidates = [
+            ally
+            for ally in self._candidates_in_projected_range(source, module, allies_pool)
+            if ally.ship_id != source.ship_id
+        ]
+        if not candidates:
+            return False
+
+        wounded = [ally for ally in candidates if self._hp_ratio(ally) < 0.999]
+        pool = wounded if wounded else candidates
+        target = next((ally for ally in pool if ally.ship_id == target_id), None)
+        if target is None:
+            return False
+
+        lowest_hp_ratio = min(self._hp_ratio(ally) for ally in pool)
+        return self._hp_ratio(target) <= lowest_hp_ratio + 1e-6
+
+    def _can_reuse_projected_target(
+        self,
+        world: WorldState,
+        source,
+        module,
+        rule: ModuleDecisionRule,
+        target_id: str | None,
+        allies_pool: list,
+        enemies_pool: list,
+    ) -> bool:
+        if not target_id:
+            return False
+
+        target = world.ships.get(target_id)
+        if target is None or not target.vital.alive:
+            return False
+        if not self._module_in_projected_range(source, target, module):
+            return False
+        if not self._can_target_under_ecm(source, target_id, float(world.now)):
+            return False
+
+        if rule.target_mode == "weapon_focus_prefocus":
+            focus_queue = list(world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), []))
+            if not focus_queue:
+                return False
+            allowed_ids: set[str] = {str(focus_queue[0])}
+            if len(focus_queue) > 1:
+                allowed_ids.add(str(focus_queue[1]))
+            return target_id in allowed_ids and self._ship_id_in_pool(target_id, enemies_pool)
+
+        if rule.target_mode == "ally_lowest_hp":
+            if target_id == source.ship_id:
+                return False
+            return self._is_lowest_hp_ally_target(source, module, allies_pool, target_id)
+
+        if rule.target_mode in {"enemy_random", "enemy_nearest"}:
+            return self._ship_id_in_pool(target_id, enemies_pool)
+
+        side = self._module_target_side(module)
+        if side == "ally":
+            if target_id == source.ship_id:
+                return False
+            return self._ship_id_in_pool(target_id, allies_pool)
+        return self._ship_id_in_pool(target_id, enemies_pool)
+
+    def _select_enemy_random_in_range(self, source, module, enemies_pool: list, existing_target_id: str | None) -> str | None:
+        candidates = self._candidates_in_projected_range(source, module, enemies_pool)
+        if not candidates:
+            return None
+        if existing_target_id and any(enemy.ship_id == existing_target_id for enemy in candidates):
+            return existing_target_id
+        return random.choice(candidates).ship_id
+
+    def _select_enemy_nearest_in_range(self, source, module, enemies_pool: list, existing_target_id: str | None) -> str | None:
+        candidates = self._candidates_in_projected_range(source, module, enemies_pool)
+        if not candidates:
+            return None
+        if existing_target_id and any(enemy.ship_id == existing_target_id for enemy in candidates):
+            return existing_target_id
+        return min(candidates, key=lambda enemy: source.nav.position.distance_to(enemy.nav.position)).ship_id
+
+    def _select_ally_lowest_hp_in_range(self, source, module, allies_pool: list, existing_target_id: str | None) -> str | None:
+        candidates = [
+            ally
+            for ally in self._candidates_in_projected_range(source, module, allies_pool)
+            if ally.ship_id != source.ship_id
+        ]
+        if not candidates:
+            return None
+        wounded = [ally for ally in candidates if self._hp_ratio(ally) < 0.999]
+        pool = wounded if wounded else candidates
+        if existing_target_id and any(ally.ship_id == existing_target_id for ally in pool):
+            return existing_target_id
+        return min(pool, key=self._hp_ratio).ship_id
+
+    def _select_weapon_focus_target(self, world: WorldState, source, module, enemies_pool: list, existing_target_id: str | None) -> str | None:
+        focus_queue = list(world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), []))
+        if not focus_queue:
+            return None
+
+        queue_targets: list[str] = []
+        if len(focus_queue) >= 1:
+            queue_targets.append(str(focus_queue[0]))
+        if len(focus_queue) >= 2:
+            queue_targets.append(str(focus_queue[1]))
+        if not queue_targets:
+            return None
+
+        ranged_ids = {
+            enemy.ship_id
+            for enemy in self._candidates_in_projected_range(source, module, enemies_pool)
+        }
+
+        valid_focus_id = queue_targets[0] if queue_targets[0] in ranged_ids else None
+        valid_prefocus_id = None
+        if len(queue_targets) > 1 and queue_targets[1] in ranged_ids:
+            valid_prefocus_id = queue_targets[1]
+
+        valid_ids = {candidate_id for candidate_id in (valid_focus_id, valid_prefocus_id) if candidate_id}
+        if not valid_ids:
+            return None
+        if existing_target_id in valid_ids:
+            return existing_target_id
+
+        if valid_focus_id and valid_prefocus_id:
+            use_prefocus = random.random() < self._prefocus_fire_probability(source)
+            return valid_prefocus_id if use_prefocus else valid_focus_id
+        return valid_focus_id or valid_prefocus_id
+
+    def _module_decision_rule(self, module) -> ModuleDecisionRule:
+        # Central policy router: extend here when adding new active module behaviors.
+        if self._module_is_weapon_module(module):
+            return ModuleDecisionRule(
+                rule_id="weapon_focus_only",
+                activation_mode="weapon_focus_only",
+                target_mode="weapon_focus_prefocus",
+            )
+
+        if self._module_has_projected(module):
+            if self._module_has_projected_rep(module):
+                return ModuleDecisionRule(
+                    rule_id="projected_remote_repair",
+                    activation_mode="always",
+                    target_mode="ally_lowest_hp",
+                )
+            if self._module_is_offensive_ewar_module(module):
+                return ModuleDecisionRule(
+                    rule_id="projected_offensive_ewar",
+                    activation_mode="cap_min",
+                    target_mode="enemy_random",
+                    cap_threshold=0.15,
+                )
+            if self._module_is_target_ewar_module(module):
+                return ModuleDecisionRule(
+                    rule_id="weapon_focus_only",
+                    activation_mode="weapon_focus_only",
+                    target_mode="weapon_focus_prefocus",
+                )
+            side = self._module_target_side(module)
+            if side == "ally":
+                return ModuleDecisionRule(
+                    rule_id="projected_support_generic",
+                    activation_mode="always",
+                    target_mode="ally_lowest_hp",
+                )
+            return ModuleDecisionRule(
+                rule_id="projected_hostile_generic",
+                activation_mode="never",
+                target_mode="none",
+            )
+
+        if self._module_is_propulsion_module(module):
+            return ModuleDecisionRule(
+                rule_id="local_propulsion",
+                activation_mode="propulsion_command",
+                target_mode="none",
+            )
+
+        if self._module_is_damage_control_module(module):
+            return ModuleDecisionRule(
+                rule_id="local_damage_control",
+                activation_mode="recent_enemy_weapon_damage",
+                target_mode="none",
+            )
+
+        if self._module_is_hardener_module(module):
+            return ModuleDecisionRule(
+                rule_id="local_hardener",
+                activation_mode="cap_or_low_hp",
+                target_mode="none",
+                cap_threshold=0.10,
+            )
+
+        if self._module_is_cap_booster_module(module):
+            return ModuleDecisionRule(
+                rule_id="local_cap_booster",
+                activation_mode="cap_max",
+                target_mode="none",
+                cap_threshold=0.85,
+            )
+
+        return ModuleDecisionRule(
+            rule_id="local_active_default",
+            activation_mode="never",
+            target_mode="none",
+        )
+
+    def _should_activate_module(self, world: WorldState, ship, rule: ModuleDecisionRule, target_id: str | None) -> bool:
+        cap_ratio = self._cap_ratio(ship)
+        hp_ratio = self._hp_ratio(ship)
+
+        if rule.activation_mode == "always":
+            return True
+        if rule.activation_mode == "never":
+            return False
+        if cap_ratio < max(0.0, float(rule.cap_threshold)):
+            return False
+        if rule.activation_mode == "propulsion_command":
+            return bool(ship.nav.propulsion_command_active)
+        if rule.activation_mode == "cap_min":
+            return cap_ratio >= max(0.0, float(rule.cap_threshold))
+        if rule.activation_mode == "cap_max":
+            return cap_ratio <= max(0.0, float(rule.cap_threshold))
+        if rule.activation_mode == "cap_or_low_hp":
+            return cap_ratio >= max(0.0, float(rule.cap_threshold)) or hp_ratio < 0.5
+        if rule.activation_mode == "recent_enemy_weapon_damage":
+            last_hit_at = float(getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) or -1e9)
+            return (float(world.now) - last_hit_at) <= 30.0
+        if rule.activation_mode == "weapon_focus_only":
+            if not target_id:
+                return False
+            return self._weapon_fire_delay_ready(ship, target_id, float(world.now))
+        return True
+
+    @staticmethod
     def _module_target_side(module) -> str:
         friendly_score = 0
         hostile_score = 0
@@ -563,58 +983,32 @@ class CombatSystem:
             return "ally"
         return "enemy"
 
-    def _select_projected_target(self, world: WorldState, source, module, allies_pool: list, enemies_pool: list) -> str | None:
-        existing_target_id = source.combat.projected_targets.get(module.module_id)
-        if existing_target_id:
-            existing_target = world.ships.get(existing_target_id)
-            if (
-                existing_target is not None
-                and existing_target.vital.alive
-                and self._module_in_projected_range(source, existing_target, module)
-            ):
-                return existing_target_id
+    def _select_projected_target(
+        self,
+        world: WorldState,
+        source,
+        module,
+        allies_pool: list,
+        enemies_pool: list,
+        rule: ModuleDecisionRule,
+        existing_target_id: str | None,
+    ) -> str | None:
+        # Central target selector: each target_mode maps to a reusable selection helper.
+        if rule.target_mode == "none":
+            return None
+        if rule.target_mode == "weapon_focus_prefocus":
+            return self._select_weapon_focus_target(world, source, module, enemies_pool, existing_target_id)
+        if rule.target_mode == "ally_lowest_hp":
+            return self._select_ally_lowest_hp_in_range(source, module, allies_pool, existing_target_id)
+        if rule.target_mode == "enemy_random":
+            return self._select_enemy_random_in_range(source, module, enemies_pool, existing_target_id)
+        if rule.target_mode == "enemy_nearest":
+            return self._select_enemy_nearest_in_range(source, module, enemies_pool, existing_target_id)
 
         side = self._module_target_side(module)
         if side == "ally":
-            candidates = [
-                ally
-                for ally in allies_pool
-                if ally.ship_id != source.ship_id and self._module_in_projected_range(source, ally, module)
-            ]
-            if not candidates:
-                return None
-            wounded = [ally for ally in candidates if self._hp_ratio(ally) < 0.999]
-            pool = wounded if wounded else candidates
-            locked_pool = [ally for ally in pool if ally.ship_id in source.combat.lock_targets]
-            selected = min(locked_pool or pool, key=self._hp_ratio)
-            return selected.ship_id
-
-        preferred_ids: list[str] = []
-        if source.combat.current_target:
-            preferred_ids.append(source.combat.current_target)
-        focus_queue = world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), [])
-        preferred_ids.extend(focus_queue)
-        if source.combat.last_attack_target:
-            preferred_ids.append(source.combat.last_attack_target)
-
-        seen: set[str] = set()
-        for candidate_id in preferred_ids:
-            if candidate_id in seen:
-                continue
-            seen.add(candidate_id)
-            target = world.ships.get(candidate_id)
-            if target is None or not target.vital.alive or target.team == source.team:
-                continue
-            if self._module_in_projected_range(source, target, module):
-                return target.ship_id
-
-        candidates = [enemy for enemy in enemies_pool if self._module_in_projected_range(source, enemy, module)]
-        if not candidates:
-            return None
-        locked_pool = [enemy for enemy in candidates if enemy.ship_id in source.combat.lock_targets]
-        pool = locked_pool or candidates
-        selected = min(pool, key=lambda enemy: source.nav.position.distance_to(enemy.nav.position))
-        return selected.ship_id
+            return self._select_ally_lowest_hp_in_range(source, module, allies_pool, existing_target_id)
+        return self._select_enemy_nearest_in_range(source, module, enemies_pool, existing_target_id)
 
     @staticmethod
     def _ecm_strength_from_effect(effect) -> dict[str, float]:
@@ -859,24 +1253,49 @@ class CombatSystem:
                             ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
                             ammo_reload_started_this_tick = True
 
+                decision_rule = self._module_decision_rule(module)
                 desired_active = False
                 projected_target_id: str | None = None
                 has_projected = self._module_has_projected(module)
                 cycle_started = False
 
                 if has_projected:
-                    projected_target_id = self._select_projected_target(
+                    if self._can_reuse_projected_target(
                         world,
                         ship,
                         module,
-                        allies_pool=allies_pool,
-                        enemies_pool=enemies_alive,
-                    )
-                    desired_active = projected_target_id is not None
-                else:
-                    desired_active = True
-                    if self._module_prefers_propulsion_command(module):
-                        desired_active = bool(ship.nav.propulsion_command_active)
+                        decision_rule,
+                        previous_projected_target,
+                        allies_pool,
+                        enemies_alive,
+                    ):
+                        projected_target_id = previous_projected_target
+                    else:
+                        projected_target_id = self._select_projected_target(
+                            world,
+                            ship,
+                            module,
+                            allies_pool=allies_pool,
+                            enemies_pool=enemies_alive,
+                            rule=decision_rule,
+                            existing_target_id=None,
+                        )
+                    if decision_rule.target_mode == "weapon_focus_prefocus":
+                        self._sync_weapon_fire_delay(
+                            ship,
+                            previous_target_id=previous_projected_target,
+                            new_target_id=projected_target_id,
+                            now=float(world.now),
+                        )
+
+                desired_active = self._should_activate_module(
+                    world,
+                    ship,
+                    decision_rule,
+                    projected_target_id,
+                )
+                if has_projected and projected_target_id is None:
+                    desired_active = False
 
                 ammo_reload_left = max(
                     0.0,
@@ -1397,6 +1816,7 @@ class CombatSystem:
                     if max_range > 0 and distance > max_range:
                         continue
                     strength = self._projected_strength(effect, distance)
+                    hp_before = target.vital.shield + target.vital.armor + target.vital.structure
                     (
                         shield_repaired,
                         armor_repaired,
@@ -1415,6 +1835,14 @@ class CombatSystem:
                         dt=dt,
                         strength=strength,
                     )
+                    hp_after = target.vital.shield + target.vital.armor + target.vital.structure
+                    applied_damage = max(0.0, hp_before - hp_after)
+                    if (
+                        applied_damage > 0.0
+                        and source.team != target.team
+                        and self._module_is_weapon_module(module)
+                    ):
+                        target.combat.last_enemy_weapon_damaged_at = float(world.now)
                     if (
                         shield_repaired > 0.0
                         or armor_repaired > 0.0
