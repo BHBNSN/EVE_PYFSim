@@ -384,6 +384,21 @@ class CombatSystem:
         inner = 1.0 + (math.sqrt(max(cap / cap_max, 0.0)) - 1.0) * math.exp(-dt / tau)
         return max(0.0, min(cap_max, (inner * inner) * cap_max))
 
+    @staticmethod
+    def _clamp_ship_layer_hp(ship) -> None:
+        ship.vital.shield_max = max(1.0, float(ship.vital.shield_max))
+        ship.vital.armor_max = max(1.0, float(ship.vital.armor_max))
+        ship.vital.structure_max = max(1.0, float(ship.vital.structure_max))
+        ship.vital.shield = max(0.0, min(float(ship.vital.shield), ship.vital.shield_max))
+        ship.vital.armor = max(0.0, min(float(ship.vital.armor), ship.vital.armor_max))
+        ship.vital.structure = max(0.0, min(float(ship.vital.structure), ship.vital.structure_max))
+
+    def _sync_vital_max_with_profile(self, ship, profile: ShipProfile) -> None:
+        ship.vital.shield_max = max(1.0, float(getattr(profile, "shield_hp", ship.vital.shield_max) or ship.vital.shield_max))
+        ship.vital.armor_max = max(1.0, float(getattr(profile, "armor_hp", ship.vital.armor_max) or ship.vital.armor_max))
+        ship.vital.structure_max = max(1.0, float(getattr(profile, "structure_hp", ship.vital.structure_max) or ship.vital.structure_max))
+        self._clamp_ship_layer_hp(ship)
+
     def _cached_lock_time(self, attacker_profile, defender_profile) -> float:
         key = (
             round(float(getattr(attacker_profile, "scan_resolution", 0.0) or 0.0), 4),
@@ -1443,6 +1458,9 @@ class CombatSystem:
         if target is None:
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
+        # Keep layer values bounded to prevent hidden overflow from masking later damage.
+        self._clamp_ship_layer_hp(target)
+
         strength = max(0.0, min(1.0, strength))
         cycle_scale = dt / max(0.1, effect.cycle_time)
 
@@ -1872,6 +1890,7 @@ class CombatSystem:
                 continue
 
             ship_profile = effective_profiles.get(ship.ship_id, ship.profile)
+            self._sync_vital_max_with_profile(ship, ship_profile)
             if (
                 self.detailed_logging
                 and self.logger is not None
