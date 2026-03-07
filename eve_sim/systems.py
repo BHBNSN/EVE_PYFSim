@@ -28,10 +28,6 @@ def _sum_damage(dmg: DamageTuple) -> float:
     return dmg[0] + dmg[1] + dmg[2] + dmg[3]
 
 
-def _fmt_damage(dmg: DamageTuple) -> str:
-    return f"EM={dmg[0]:.3f},TH={dmg[1]:.3f},KI={dmg[2]:.3f},EX={dmg[3]:.3f}"
-
-
 def _layer_effective_damage(dmg: DamageTuple, resonances: DamageTuple) -> float:
     return (
         dmg[0] * resonances[0]
@@ -66,68 +62,6 @@ def _apply_damage_sequence(shield: float, armor: float, structure: float, dmg: D
         remaining = _scale_damage(remaining, 1.0 - consumed_ratio)
 
     return new_vals["shield"], new_vals["armor"], new_vals["structure"]
-
-
-def _apply_damage_sequence_with_trace(
-    shield: float,
-    armor: float,
-    structure: float,
-    dmg: DamageTuple,
-    target_profile,
-) -> tuple[float, float, float, list[dict[str, float | str]]]:
-    remaining = dmg
-    layers = [
-        ("shield", shield, (target_profile.shield_resonance_em, target_profile.shield_resonance_thermal, target_profile.shield_resonance_kinetic, target_profile.shield_resonance_explosive)),
-        ("armor", armor, (target_profile.armor_resonance_em, target_profile.armor_resonance_thermal, target_profile.armor_resonance_kinetic, target_profile.armor_resonance_explosive)),
-        ("structure", structure, (target_profile.structure_resonance_em, target_profile.structure_resonance_thermal, target_profile.structure_resonance_kinetic, target_profile.structure_resonance_explosive)),
-    ]
-    new_vals = {"shield": shield, "armor": armor, "structure": structure}
-    trace: list[dict[str, float | str]] = []
-    for layer_name, layer_hp, layer_res in layers:
-        if layer_hp <= 0:
-            continue
-        eff = _layer_effective_damage(remaining, layer_res)
-        if eff <= 0:
-            continue
-        if eff <= layer_hp:
-            new_vals[layer_name] = layer_hp - eff
-            trace.append({
-                "layer": layer_name,
-                "before": layer_hp,
-                "effective_applied": eff,
-                "after": new_vals[layer_name],
-                "overflow_ratio": 0.0,
-                "res_em": layer_res[0],
-                "res_th": layer_res[1],
-                "res_ki": layer_res[2],
-                "res_ex": layer_res[3],
-                "raw_em": remaining[0],
-                "raw_th": remaining[1],
-                "raw_ki": remaining[2],
-                "raw_ex": remaining[3],
-            })
-            return new_vals["shield"], new_vals["armor"], new_vals["structure"], trace
-
-        consumed_ratio = max(0.0, min(1.0, layer_hp / eff))
-        trace.append({
-            "layer": layer_name,
-            "before": layer_hp,
-            "effective_applied": layer_hp,
-            "after": 0.0,
-            "overflow_ratio": 1.0 - consumed_ratio,
-            "res_em": layer_res[0],
-            "res_th": layer_res[1],
-            "res_ki": layer_res[2],
-            "res_ex": layer_res[3],
-            "raw_em": remaining[0],
-            "raw_th": remaining[1],
-            "raw_ki": remaining[2],
-            "raw_ex": remaining[3],
-        })
-        new_vals[layer_name] = 0.0
-        remaining = _scale_damage(remaining, 1.0 - consumed_ratio)
-
-    return new_vals["shield"], new_vals["armor"], new_vals["structure"], trace
 
 
 class PerceptionSystem:
@@ -365,15 +299,34 @@ class CombatSystem:
         shield_repaired: float,
         armor_repaired: float,
         cap_drained: float,
+        em_damage: float,
+        thermal_damage: float,
+        kinetic_damage: float,
+        explosive_damage: float,
+        total_damage: float,
     ) -> None:
         key = (source_ship_id, module_id, target_ship_id)
         entry = self._projected_cycle_totals.setdefault(
             key,
-            {"shield_repaired": 0.0, "armor_repaired": 0.0, "cap_drained": 0.0},
+            {
+                "shield_repaired": 0.0,
+                "armor_repaired": 0.0,
+                "cap_drained": 0.0,
+                "em": 0.0,
+                "thermal": 0.0,
+                "kinetic": 0.0,
+                "explosive": 0.0,
+                "total_damage": 0.0,
+            },
         )
         entry["shield_repaired"] += max(0.0, float(shield_repaired))
         entry["armor_repaired"] += max(0.0, float(armor_repaired))
         entry["cap_drained"] += max(0.0, float(cap_drained))
+        entry["em"] += max(0.0, float(em_damage))
+        entry["thermal"] += max(0.0, float(thermal_damage))
+        entry["kinetic"] += max(0.0, float(kinetic_damage))
+        entry["explosive"] += max(0.0, float(explosive_damage))
+        entry["total_damage"] += max(0.0, float(total_damage))
 
     def _flush_projected_cycle_total(self, world: WorldState, source_ship_id: str, module, target_ship_id: str | None) -> None:
         if not target_ship_id:
@@ -382,7 +335,12 @@ class CombatSystem:
         totals = self._projected_cycle_totals.pop(key, None)
         if not totals:
             return
-        if totals["shield_repaired"] <= 0.0 and totals["armor_repaired"] <= 0.0 and totals["cap_drained"] <= 0.0:
+        if (
+            totals["shield_repaired"] <= 0.0
+            and totals["armor_repaired"] <= 0.0
+            and totals["cap_drained"] <= 0.0
+            and totals["total_damage"] <= 0.0
+        ):
             return
         source_ship = world.ships.get(source_ship_id)
         target_ship = world.ships.get(target_ship_id)
@@ -400,6 +358,11 @@ class CombatSystem:
                 "shield_repaired": totals["shield_repaired"],
                 "armor_repaired": totals["armor_repaired"],
                 "cap_drained": totals["cap_drained"],
+                "em": totals["em"],
+                "thermal": totals["thermal"],
+                "kinetic": totals["kinetic"],
+                "explosive": totals["explosive"],
+                "total_damage": totals["total_damage"],
             },
         )
 
@@ -471,8 +434,6 @@ class CombatSystem:
                 if left <= 0.0:
                     ship.combat.lock_targets.add(target_id)
                     ship.combat.lock_timers.pop(target_id, None)
-                    if target_id == ship.combat.current_target and target_id != ship.combat.last_attack_target:
-                        ship.combat.fire_delay_timers[target_id] = self._sample_fire_delay(ship)
                     if self.detailed_logging and self.logger is not None:
                         self.logger.debug(f"lock_complete attacker={ship.ship_id} target={target_id}")
                 else:
@@ -483,28 +444,18 @@ class CombatSystem:
                         )
 
     @staticmethod
-    def _sample_fire_delay(ship) -> float:
-        level = ship.quality.level.value
-        r = random.random()
-        if level == "ELITE":
-            if r < 0.70:
-                return random.uniform(0.5, 1.2)
-            if r < 0.95:
-                return random.uniform(1.2, 2.0)
-            return random.uniform(2.0, 3.0)
-        if level == "REGULAR":
-            if r < 0.35:
-                return random.uniform(0.5, 1.2)
-            if r < 0.80:
-                return random.uniform(1.2, 2.2)
-            return random.uniform(2.2, 3.0)
-        if r < 0.15:
-            return random.uniform(0.5, 1.2)
-        if r < 0.55:
-            return random.uniform(1.2, 2.2)
-        return random.uniform(2.2, 3.0)
+    def _projected_max_range(effect) -> float:
+        if effect.falloff_m > 0.0:
+            return max(0.0, effect.range_m) + 3.0 * max(0.0, effect.falloff_m)
+        return max(0.0, effect.range_m)
+
+    def _projected_strength(self, effect, distance: float) -> float:
+        if effect.range_m > 0 or effect.falloff_m > 0:
+            return self.pyfa.turret_range_factor(effect.range_m, effect.falloff_m, distance)
+        return 1.0
 
     def _collect_projected_impacts(self, world: WorldState, dt: float) -> dict[str, list[ProjectedImpact]]:
+        del dt
         impacts: dict[str, list[ProjectedImpact]] = {}
         for source in world.ships.values():
             if not source.vital.alive or source.runtime is None:
@@ -532,14 +483,11 @@ class CombatSystem:
                         continue
 
                     distance = source.nav.position.distance_to(target.nav.position)
-                    max_range = effect.range_m + max(0.0, effect.falloff_m)
+                    max_range = self._projected_max_range(effect)
                     if max_range > 0 and distance > max_range:
                         continue
 
-                    if effect.range_m > 0 or effect.falloff_m > 0:
-                        strength = self.pyfa.turret_range_factor(effect.range_m, effect.falloff_m, distance)
-                    else:
-                        strength = 1.0
+                    strength = self._projected_strength(effect, distance)
                     if strength <= 0:
                         continue
                     if self.detailed_logging and self.logger is not None:
@@ -565,18 +513,108 @@ class CombatSystem:
     def _module_in_projected_range(source, target, module) -> bool:
         distance = source.nav.position.distance_to(target.nav.position)
         has_projected = False
-        is_ecm_module = "ecm" in str(getattr(module, "group", "") or "").lower()
         for effect in module.effects:
             if effect.effect_class != EffectClass.PROJECTED:
                 continue
             has_projected = True
-            if is_ecm_module and effect.falloff_m > 0.0:
-                max_range = effect.range_m + 3.0 * effect.falloff_m
-            else:
-                max_range = effect.range_m + max(0.0, effect.falloff_m)
+            max_range = CombatSystem._projected_max_range(effect)
             if max_range <= 0 or distance <= max_range:
                 return True
         return not has_projected
+
+    @staticmethod
+    def _module_prefers_propulsion_command(module) -> bool:
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.LOCAL:
+                continue
+            if str(effect.state_required.value).upper() != "ACTIVE":
+                continue
+            speed_mult = float(effect.local_mult.get("speed", 1.0) or 1.0)
+            if speed_mult > 1.0:
+                return True
+        return False
+
+    @staticmethod
+    def _module_target_side(module) -> str:
+        friendly_score = 0
+        hostile_score = 0
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            for key, value in effect.projected_add.items():
+                amount = float(value or 0.0)
+                if amount <= 0.0:
+                    continue
+                if key in {"shield_rep", "armor_rep"}:
+                    friendly_score += 2
+                elif key in {"cap_drain", "ecm_gravimetric", "ecm_ladar", "ecm_magnetometric", "ecm_radar"}:
+                    hostile_score += 2
+                elif key.startswith("damage_"):
+                    hostile_score += 3
+                elif key.startswith("weapon_"):
+                    hostile_score += 1
+            for value in effect.projected_mult.values():
+                mult = float(value or 0.0)
+                if mult < 1.0:
+                    hostile_score += 1
+                elif mult > 1.0:
+                    friendly_score += 1
+        if friendly_score > hostile_score:
+            return "ally"
+        return "enemy"
+
+    def _select_projected_target(self, world: WorldState, source, module, allies_pool: list, enemies_pool: list) -> str | None:
+        existing_target_id = source.combat.projected_targets.get(module.module_id)
+        if existing_target_id:
+            existing_target = world.ships.get(existing_target_id)
+            if (
+                existing_target is not None
+                and existing_target.vital.alive
+                and self._module_in_projected_range(source, existing_target, module)
+            ):
+                return existing_target_id
+
+        side = self._module_target_side(module)
+        if side == "ally":
+            candidates = [
+                ally
+                for ally in allies_pool
+                if ally.ship_id != source.ship_id and self._module_in_projected_range(source, ally, module)
+            ]
+            if not candidates:
+                return None
+            wounded = [ally for ally in candidates if self._hp_ratio(ally) < 0.999]
+            pool = wounded if wounded else candidates
+            locked_pool = [ally for ally in pool if ally.ship_id in source.combat.lock_targets]
+            selected = min(locked_pool or pool, key=self._hp_ratio)
+            return selected.ship_id
+
+        preferred_ids: list[str] = []
+        if source.combat.current_target:
+            preferred_ids.append(source.combat.current_target)
+        focus_queue = world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), [])
+        preferred_ids.extend(focus_queue)
+        if source.combat.last_attack_target:
+            preferred_ids.append(source.combat.last_attack_target)
+
+        seen: set[str] = set()
+        for candidate_id in preferred_ids:
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            target = world.ships.get(candidate_id)
+            if target is None or not target.vital.alive or target.team == source.team:
+                continue
+            if self._module_in_projected_range(source, target, module):
+                return target.ship_id
+
+        candidates = [enemy for enemy in enemies_pool if self._module_in_projected_range(source, enemy, module)]
+        if not candidates:
+            return None
+        locked_pool = [enemy for enemy in candidates if enemy.ship_id in source.combat.lock_targets]
+        pool = locked_pool or candidates
+        selected = min(pool, key=lambda enemy: source.nav.position.distance_to(enemy.nav.position))
+        return selected.ship_id
 
     @staticmethod
     def _ecm_strength_from_effect(effect) -> dict[str, float]:
@@ -730,56 +768,6 @@ class CombatSystem:
             },
         )
 
-    @staticmethod
-    def _is_weapon_module(group_name: str) -> bool:
-        return ("weapon" in group_name) or ("turret" in group_name) or ("launcher" in group_name)
-
-    @staticmethod
-    def _is_propulsion_module(group_name: str) -> bool:
-        return (
-            "propulsion" in group_name
-            or "afterburner" in group_name
-            or "microwarpdrive" in group_name
-        )
-
-    @staticmethod
-    def _is_remote_repair_module(group_name: str) -> bool:
-        return (
-            "shield transporter" in group_name
-            or "remote shield booster" in group_name
-            or "remote armor repair" in group_name
-        )
-
-    @staticmethod
-    def _is_web_module(group_name: str) -> bool:
-        return ("stasis web" in group_name) or ("stasis grappler" in group_name)
-
-    @staticmethod
-    def _is_ewar_module(group_name: str) -> bool:
-        return (
-            "sensor dampener" in group_name
-            or "tracking disruptor" in group_name
-            or "weapon disruptor" in group_name
-            or "ecm" in group_name
-            or "target painter" in group_name
-            or "energy neutralizer" in group_name
-        )
-
-    @staticmethod
-    def _is_adc_module(group_name: str) -> bool:
-        return "assault damage control" in group_name
-
-    @staticmethod
-    def _is_resist_module(group_name: str) -> bool:
-        return (
-            "hardener" in group_name
-            or "resistance" in group_name
-            or "energized armor" in group_name
-            or "adaptive invulnerability" in group_name
-            or "multispectrum" in group_name
-            or ("damage control" in group_name)
-        )
-
     def _update_module_states(self, world: WorldState, dt: float) -> None:
         alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
         for candidate in world.ships.values():
@@ -789,12 +777,6 @@ class CombatSystem:
         for ship in world.ships.values():
             if not ship.vital.alive or ship.runtime is None:
                 continue
-
-            target = world.ships.get(ship.combat.current_target) if ship.combat.current_target else None
-            if target is not None and not target.vital.alive:
-                target = None
-            cap_ratio = ship.vital.cap / max(1.0, ship.vital.cap_max)
-            recently_damaged = (world.now - ship.combat.last_damaged_at) <= 60.0
 
             allies_pool = alive_by_team.get(ship.team, [])
             enemies_alive = alive_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, [])
@@ -879,73 +861,22 @@ class CombatSystem:
 
                 desired_active = False
                 projected_target_id: str | None = None
-                group_name = module.group.lower()
                 has_projected = self._module_has_projected(module)
                 cycle_started = False
 
-                if self._is_propulsion_module(group_name):
-                    desired_active = bool(ship.nav.propulsion_command_active)
-
-                elif self._is_weapon_module(group_name):
-                    if target is not None and self._module_in_projected_range(ship, target, module):
-                        desired_active = True
-                        if has_projected:
-                            projected_target_id = target.ship_id
-
-                elif self._is_remote_repair_module(group_name):
-                    candidates = [
-                        ally for ally in allies_pool
-                        if ally.ship_id != ship.ship_id
-                        and self._hp_ratio(ally) < 0.999
-                        and self._module_in_projected_range(ship, ally, module)
-                    ]
-                    if candidates:
-                        locked_candidates = [ally for ally in candidates if ally.ship_id in ship.combat.lock_targets]
-                        lowest = min(locked_candidates or candidates, key=self._hp_ratio)
-                        projected_target_id = lowest.ship_id
-                        desired_active = True
-
-                elif self._is_web_module(group_name):
-                    if target is not None and self._module_in_projected_range(ship, target, module):
-                        projected_target_id = target.ship_id
-                        desired_active = True
-
-                elif self._is_ewar_module(group_name):
-                    if cap_ratio >= 0.20:
-                        ewar_target = None
-                        current_target_id = ship.combat.projected_targets.get(module.module_id)
-                        if current_target_id:
-                            current_target = world.ships.get(current_target_id)
-                            if (
-                                current_target is not None
-                                and current_target.vital.alive
-                                and self._module_in_projected_range(ship, current_target, module)
-                            ):
-                                ewar_target = current_target
-                        candidates = [
-                            enemy for enemy in enemies_alive
-                            if self._module_in_projected_range(ship, enemy, module)
-                        ]
-                        if ewar_target is None and candidates:
-                            ewar_target = random.choice(candidates)
-
-                        if ewar_target is not None:
-                            projected_target_id = ewar_target.ship_id
-                            desired_active = True
-
-                elif self._is_adc_module(group_name):
-                    desired_active = recently_damaged
-
-                elif self._is_resist_module(group_name):
-                    desired_active = (cap_ratio > 0.15) or recently_damaged
-
+                if has_projected:
+                    projected_target_id = self._select_projected_target(
+                        world,
+                        ship,
+                        module,
+                        allies_pool=allies_pool,
+                        enemies_pool=enemies_alive,
+                    )
+                    desired_active = projected_target_id is not None
                 else:
-                    if has_projected:
-                        if target is not None and self._module_in_projected_range(ship, target, module):
-                            projected_target_id = target.ship_id
-                            desired_active = True
-                    else:
-                        desired_active = module.state == module.state.ACTIVE
+                    desired_active = True
+                    if self._module_prefers_propulsion_command(module):
+                        desired_active = bool(ship.nav.propulsion_command_active)
 
                 ammo_reload_left = max(
                     0.0,
@@ -998,11 +929,7 @@ class CombatSystem:
                     else:
                         ship.combat.module_reactivation_timers.pop(module.module_id, None)
 
-                activation_target_id: str | None = None
-                if has_projected:
-                    activation_target_id = projected_target_id
-                elif self._is_weapon_module(group_name):
-                    activation_target_id = ship.combat.current_target
+                activation_target_id: str | None = projected_target_id if has_projected else None
 
                 if desired_active and activation_target_id is not None:
                     activation_target = world.ships.get(activation_target_id)
@@ -1084,33 +1011,122 @@ class CombatSystem:
                         },
                     )
 
-    @staticmethod
-    def _apply_projected_support_effects(source, target, effect, dt: float, strength: float) -> tuple[float, float, float]:
+    def _apply_projected_cycle_effects(
+        self,
+        world: WorldState,
+        source,
+        target,
+        target_profile: ShipProfile,
+        effect,
+        dt: float,
+        strength: float,
+    ) -> tuple[float, float, float, float, float, float, float, float]:
         if target is None:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
         strength = max(0.0, min(1.0, strength))
+        cycle_scale = dt / max(0.1, effect.cycle_time)
+
         shield_repaired = 0.0
         armor_repaired = 0.0
         cap_drained = 0.0
+
         shield_rep = float(effect.projected_add.get("shield_rep", 0.0) or 0.0)
-        armor_rep = float(effect.projected_add.get("armor_rep", 0.0) or 0.0)
-        if shield_rep > 0:
-            amount = shield_rep * strength * (dt / max(0.1, effect.cycle_time))
+        if shield_rep > 0.0:
+            amount = shield_rep * strength * cycle_scale
             before = target.vital.shield
             target.vital.shield = min(target.vital.shield_max, target.vital.shield + amount)
             shield_repaired = max(0.0, target.vital.shield - before)
-        if armor_rep > 0:
-            amount = armor_rep * strength * (dt / max(0.1, effect.cycle_time))
+
+        armor_rep = float(effect.projected_add.get("armor_rep", 0.0) or 0.0)
+        if armor_rep > 0.0:
+            amount = armor_rep * strength * cycle_scale
             before = target.vital.armor
             target.vital.armor = min(target.vital.armor_max, target.vital.armor + amount)
             armor_repaired = max(0.0, target.vital.armor - before)
+
         cap_drain = float(effect.projected_add.get("cap_drain", 0.0) or 0.0)
-        if cap_drain > 0:
-            amount = cap_drain * strength * (dt / max(0.1, effect.cycle_time))
+        if cap_drain > 0.0:
+            amount = cap_drain * strength * cycle_scale
             before_cap = target.vital.cap
             target.vital.cap = max(0.0, target.vital.cap - amount)
             cap_drained = max(0.0, before_cap - target.vital.cap)
-        return shield_repaired, armor_repaired, cap_drained
+
+        base_damage = (
+            max(0.0, float(effect.projected_add.get("damage_em", 0.0) or 0.0)) * cycle_scale,
+            max(0.0, float(effect.projected_add.get("damage_thermal", 0.0) or 0.0)) * cycle_scale,
+            max(0.0, float(effect.projected_add.get("damage_kinetic", 0.0) or 0.0)) * cycle_scale,
+            max(0.0, float(effect.projected_add.get("damage_explosive", 0.0) or 0.0)) * cycle_scale,
+        )
+        if _sum_damage(base_damage) <= 0.0:
+            return shield_repaired, armor_repaired, cap_drained, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        damage_factor = strength
+        if float(effect.projected_add.get("weapon_is_turret", 0.0) or 0.0) > 0.5:
+            relative_velocity = source.nav.velocity - target.nav.velocity
+            radial = (target.nav.position - source.nav.position).normalized()
+            tangential = Vector2(-radial.y, radial.x)
+            transversal = abs(relative_velocity.x * tangential.x + relative_velocity.y * tangential.y)
+            chance = self.pyfa.turret_chance_to_hit(
+                tracking=max(0.0, float(effect.projected_add.get("weapon_tracking", 0.0) or 0.0)),
+                optimal_sig=max(1.0, float(effect.projected_add.get("weapon_optimal_sig", 40_000.0) or 40_000.0)),
+                distance=source.nav.position.distance_to(target.nav.position),
+                optimal=effect.range_m,
+                falloff=effect.falloff_m,
+                transversal_speed=transversal,
+                target_sig=target_profile.sig_radius,
+                attacker_radius=source.nav.radius,
+                target_radius=target.nav.radius,
+            )
+            damage_factor = max(0.0, self.pyfa.turret_damage_multiplier(chance))
+        elif float(effect.projected_add.get("weapon_is_missile", 0.0) or 0.0) > 0.5:
+            relative_speed = (source.nav.velocity - target.nav.velocity).length()
+            explosion_radius = max(0.0, float(effect.projected_add.get("weapon_explosion_radius", 0.0) or 0.0))
+            explosion_velocity = max(0.0, float(effect.projected_add.get("weapon_explosion_velocity", 0.0) or 0.0))
+            drf = max(0.1, float(effect.projected_add.get("weapon_drf", 0.5) or 0.5))
+            if explosion_radius > 0.0:
+                sig_factor = target_profile.sig_radius / max(1.0, explosion_radius)
+                vel_term = (sig_factor * explosion_velocity) / max(1.0, relative_speed)
+                vel_factor = vel_term ** drf
+                application = max(0.0, min(1.0, min(sig_factor, vel_factor, 1.0)))
+            else:
+                application = 1.0
+            damage_factor = max(0.0, min(1.0, application * strength))
+
+        dealt_damage = _scale_damage(base_damage, damage_factor)
+        total_damage = _sum_damage(dealt_damage)
+        if total_damage <= 0.0:
+            return shield_repaired, armor_repaired, cap_drained, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        shield_before = target.vital.shield
+        armor_before = target.vital.armor
+        structure_before = target.vital.structure
+        target.vital.shield, target.vital.armor, target.vital.structure = _apply_damage_sequence(
+            target.vital.shield,
+            target.vital.armor,
+            target.vital.structure,
+            dealt_damage,
+            target_profile,
+        )
+        applied = (shield_before + armor_before + structure_before) - (
+            target.vital.shield + target.vital.armor + target.vital.structure
+        )
+        if applied > 0.0:
+            target.combat.last_damaged_at = world.now
+        if target.vital.structure <= 0:
+            target.vital.alive = False
+            target.nav.velocity = Vector2(0.0, 0.0)
+
+        return (
+            shield_repaired,
+            armor_repaired,
+            cap_drained,
+            dealt_damage[0],
+            dealt_damage[1],
+            dealt_damage[2],
+            dealt_damage[3],
+            total_damage,
+        )
 
     def _effective_profile(self, ship, impacts: dict[str, list[ProjectedImpact]]):
         if ship.runtime is None:
@@ -1142,9 +1158,6 @@ class CombatSystem:
                 "missile_thermal_dps",
                 "missile_kinetic_dps",
                 "missile_explosive_dps",
-                "missile_explosion_radius",
-                "missile_explosion_velocity",
-                "missile_max_range",
                 "missile_damage_reduction_factor",
                 "sensor_strength_gravimetric",
                 "sensor_strength_ladar",
@@ -1238,9 +1251,6 @@ class CombatSystem:
             "missile_thermal_dps",
             "missile_kinetic_dps",
             "missile_explosive_dps",
-            "missile_explosion_radius",
-            "missile_explosion_velocity",
-            "missile_max_range",
             "missile_damage_reduction_factor",
             "sensor_strength_gravimetric",
             "sensor_strength_ladar",
@@ -1266,72 +1276,8 @@ class CombatSystem:
         return effective
 
     @staticmethod
-    def _weapon_activity_ratio(ship) -> tuple[float, float]:
-        if ship.runtime is None:
-            return 1.0, 1.0
-        turret_total = 0
-        turret_active = 0
-        missile_total = 0
-        missile_active = 0
-        for module in ship.runtime.modules:
-            group = (module.group or "").lower()
-            is_launcher = "launcher" in group
-            is_weapon = ("weapon" in group) or ("turret" in group) or is_launcher
-            if not is_weapon:
-                continue
-            if is_launcher:
-                missile_total += 1
-                if module.state == module.state.ACTIVE:
-                    missile_active += 1
-            else:
-                turret_total += 1
-                if module.state == module.state.ACTIVE:
-                    turret_active += 1
-
-        turret_ratio = 1.0 if turret_total <= 0 else (turret_active / turret_total)
-        missile_ratio = 1.0 if missile_total <= 0 else (missile_active / missile_total)
-        return max(0.0, min(1.0, turret_ratio)), max(0.0, min(1.0, missile_ratio))
-
-    @staticmethod
     def _focus_key(team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
-
-    @staticmethod
-    def _turret_damage(ship_profile, chance: float) -> DamageTuple:
-        cycle = max(0.0, ship_profile.turret_cycle)
-        scale = cycle
-        return (
-            ship_profile.turret_em_dps * scale,
-            ship_profile.turret_thermal_dps * scale,
-            ship_profile.turret_kinetic_dps * scale,
-            ship_profile.turret_explosive_dps * scale,
-        )
-
-    @staticmethod
-    def _missile_factor(ship_profile, target_profile, relative_speed: float) -> float:
-        if ship_profile.missile_explosion_radius <= 0:
-            return 1.0
-        sig_factor = target_profile.sig_radius / max(1.0, ship_profile.missile_explosion_radius)
-        vel_term = (sig_factor * ship_profile.missile_explosion_velocity) / max(1.0, relative_speed)
-        drf = max(0.1, ship_profile.missile_damage_reduction_factor)
-        vel_factor = vel_term ** drf
-        return max(0.0, min(1.0, min(sig_factor, vel_factor, 1.0)))
-
-    @staticmethod
-    def _missile_damage(ship_profile, target_profile, distance: float, relative_speed: float) -> DamageTuple:
-        if ship_profile.missile_dps <= 0:
-            return (0.0, 0.0, 0.0, 0.0)
-        if ship_profile.missile_max_range > 0 and distance > ship_profile.missile_max_range:
-            return (0.0, 0.0, 0.0, 0.0)
-        app = CombatSystem._missile_factor(ship_profile, target_profile, relative_speed)
-        cycle = max(0.0, ship_profile.missile_cycle)
-        scale = cycle * app
-        return (
-            ship_profile.missile_em_dps * scale,
-            ship_profile.missile_thermal_dps * scale,
-            ship_profile.missile_kinetic_dps * scale,
-            ship_profile.missile_explosive_dps * scale,
-        )
 
     def _update_squad_prelocks(self, world: WorldState, dt: float, effective_profiles: dict[str, ShipProfile]) -> None:
         squads: dict[str, list] = {}
@@ -1443,18 +1389,38 @@ class CombatSystem:
                 if target is None or not target.vital.alive:
                     continue
                 distance = source.nav.position.distance_to(target.nav.position)
+                target_profile = effective_profiles.get(target.ship_id, target.profile)
                 for effect in module.effects:
                     if effect.effect_class != EffectClass.PROJECTED:
                         continue
-                    max_range = effect.range_m + max(0.0, effect.falloff_m)
+                    max_range = self._projected_max_range(effect)
                     if max_range > 0 and distance > max_range:
                         continue
-                    if effect.range_m > 0 or effect.falloff_m > 0:
-                        strength = self.pyfa.turret_range_factor(effect.range_m, effect.falloff_m, distance)
-                    else:
-                        strength = 1.0
-                    shield_repaired, armor_repaired, cap_drained = self._apply_projected_support_effects(source, target, effect, dt, strength)
-                    if shield_repaired > 0.0 or armor_repaired > 0.0 or cap_drained > 0.0:
+                    strength = self._projected_strength(effect, distance)
+                    (
+                        shield_repaired,
+                        armor_repaired,
+                        cap_drained,
+                        em_damage,
+                        thermal_damage,
+                        kinetic_damage,
+                        explosive_damage,
+                        total_damage,
+                    ) = self._apply_projected_cycle_effects(
+                        world=world,
+                        source=source,
+                        target=target,
+                        target_profile=target_profile,
+                        effect=effect,
+                        dt=dt,
+                        strength=strength,
+                    )
+                    if (
+                        shield_repaired > 0.0
+                        or armor_repaired > 0.0
+                        or cap_drained > 0.0
+                        or total_damage > 0.0
+                    ):
                         self._add_projected_cycle_total(
                             source_ship_id=source.ship_id,
                             module_id=module.module_id,
@@ -1462,6 +1428,11 @@ class CombatSystem:
                             shield_repaired=shield_repaired,
                             armor_repaired=armor_repaired,
                             cap_drained=cap_drained,
+                            em_damage=em_damage,
+                            thermal_damage=thermal_damage,
+                            kinetic_damage=kinetic_damage,
+                            explosive_damage=explosive_damage,
+                            total_damage=total_damage,
                         )
 
         if self.detailed_logging and self.logger is not None:
@@ -1471,10 +1442,6 @@ class CombatSystem:
         for ship in world.ships.values():
             if not ship.vital.alive:
                 continue
-
-            for pending_target in list(ship.combat.fire_delay_timers.keys()):
-                left = float(ship.combat.fire_delay_timers.get(pending_target, 0.0)) - dt
-                ship.combat.fire_delay_timers[pending_target] = max(0.0, left)
 
             ship_profile = effective_profiles.get(ship.ship_id, ship.profile)
             if (
@@ -1504,306 +1471,24 @@ class CombatSystem:
                 dt=dt,
             )
 
-            target_id = ship.combat.current_target
-            if not target_id:
-                continue
-            target = world.ships.get(target_id)
-            if target is None or not target.vital.alive:
+            current_target_id = ship.combat.current_target
+            if current_target_id:
+                current_target = world.ships.get(current_target_id)
+                if (
+                    current_target is None
+                    or not current_target.vital.alive
+                    or current_target.team == ship.team
+                ):
+                    ship.combat.current_target = None
+
+            if not ship.combat.current_target:
                 queue = list(world.squad_focus_queues.get(self._focus_key(ship.team, ship.squad_id), []))
-                fallback_candidates: list[str] = []
-                if ship.combat.last_attack_target:
-                    fallback_candidates.append(ship.combat.last_attack_target)
-                fallback_candidates.extend(queue)
-                chosen_fallback: str | None = None
-                for candidate_id in fallback_candidates:
+                for candidate_id in queue:
                     candidate = world.ships.get(candidate_id)
                     if candidate is None or not candidate.vital.alive or candidate.team == ship.team:
                         continue
-                    chosen_fallback = candidate_id
+                    ship.combat.current_target = candidate_id
                     break
-                if not chosen_fallback:
-                    continue
-                ship.combat.current_target = chosen_fallback
-                target_id = chosen_fallback
-                target = world.ships.get(target_id)
-                if target is None or not target.vital.alive:
-                    continue
-
-            target_profile = effective_profiles.get(target.ship_id, target.profile)
-            turret_active_ratio, missile_active_ratio = self._weapon_activity_ratio(ship)
-
-            if not self._can_target_under_ecm(ship, target_id, float(world.now)):
-                ship.combat.lock_targets.discard(target_id)
-                ship.combat.lock_timers.pop(target_id, None)
-                ship.combat.fire_delay_timers.pop(target_id, None)
-                continue
-
-            distance = ship.nav.position.distance_to(target.nav.position)
-            if distance > ship_profile.max_target_range:
-                if self.detailed_logging and self.logger is not None:
-                    self.logger.debug(
-                        f"skip_out_of_lock_range attacker={ship.ship_id} target={target.ship_id} dist={distance:.1f} max_lock={ship_profile.max_target_range:.1f}"
-                    )
-                continue
-
-            if target_id not in ship.combat.lock_targets:
-                self._ensure_target_lock(
-                    world,
-                    ship,
-                    target_id,
-                    target,
-                    lock_context="weapon_lock",
-                    target_profile=target_profile,
-                )
-                continue
-
-            if target_id != ship.combat.last_attack_target:
-                pending_delay = ship.combat.fire_delay_timers.get(target_id)
-                if pending_delay is None:
-                    ship.combat.fire_delay_timers[target_id] = self._sample_fire_delay(ship)
-                    continue
-                if pending_delay > 0:
-                    continue
-
-            relative_velocity = ship.nav.velocity - target.nav.velocity
-            relative_speed = relative_velocity.length()
-            radial = (target.nav.position - ship.nav.position).normalized()
-            tangential = Vector2(-radial.y, radial.x)
-            transversal = abs(relative_velocity.x * tangential.x + relative_velocity.y * tangential.y)
-            angular_velocity = 0.0 if distance <= 0 else abs(transversal / distance)
-            ctc_distance = ship.nav.radius + distance + target.nav.radius
-            if ctc_distance > 0:
-                angular_velocity = abs(transversal / ctc_distance)
-            if self.detailed_logging and self.logger is not None:
-                self.logger.debug(
-                    f"kinematics attacker={ship.ship_id} target={target.ship_id}"
-                    f" attacker_v=({ship.nav.velocity.x:.2f},{ship.nav.velocity.y:.2f})|{ship.nav.velocity.length():.2f}"
-                    f" target_v=({target.nav.velocity.x:.2f},{target.nav.velocity.y:.2f})|{target.nav.velocity.length():.2f}"
-                    f" rel_v=({relative_velocity.x:.2f},{relative_velocity.y:.2f})|{relative_speed:.2f}"
-                    f" dist={distance:.2f} transv={transversal:.2f} angular={angular_velocity:.6f}"
-                )
-            turret_damage = (0.0, 0.0, 0.0, 0.0)
-            range_factor = 0.0
-            tracking_factor = 0.0
-            expected_mult = 0.0
-            turret_fired = False
-            if ship_profile.turret_dps > 0 and turret_active_ratio > 0:
-                turret_cycle = max(0.0, ship_profile.turret_cycle)
-                cycle_timer = max(0.0, float(ship.combat.turret_reload_timer))
-                ammo_reload_timer = max(0.0, float(ship.combat.turret_ammo_reload_timer))
-                pending_ammo_reload_timer = max(0.0, float(ship.combat.turret_pending_ammo_reload_timer))
-                chance = self.pyfa.turret_chance_to_hit(
-                    tracking=ship_profile.tracking,
-                    optimal_sig=max(1.0, ship_profile.optimal_sig),
-                    distance=distance,
-                    optimal=ship_profile.optimal,
-                    falloff=ship_profile.falloff,
-                    transversal_speed=transversal,
-                    target_sig=target_profile.sig_radius,
-                    attacker_radius=ship.nav.radius,
-                    target_radius=target.nav.radius,
-                )
-                range_factor = self.pyfa.turret_range_factor(ship_profile.optimal, ship_profile.falloff, distance)
-                tracking_factor = 0.0 if range_factor <= 0 else max(0.0, min(1.0, chance / max(1e-9, range_factor)))
-                expected_mult = self.pyfa.turret_damage_multiplier(chance)
-
-                if ammo_reload_timer > 0.0:
-                    ammo_reload_timer = max(0.0, ammo_reload_timer - dt)
-                else:
-                    cycle_in_progress = cycle_timer > 0.0
-                    if not cycle_in_progress and pending_ammo_reload_timer <= 0.0 and turret_cycle > 0.0:
-                        cycle_timer = turret_cycle
-                        cycle_in_progress = cycle_timer > 0.0
-                    if cycle_in_progress:
-                        cycle_timer = max(0.0, cycle_timer - dt)
-
-                    cycle_completed = cycle_in_progress and cycle_timer <= 0.0
-                    if cycle_completed:
-                        turret_fired = True
-                        turret_damage = _scale_damage(self._turret_damage(ship_profile, chance), expected_mult * turret_active_ratio)
-                        if pending_ammo_reload_timer > 0.0:
-                            ammo_reload_timer = pending_ammo_reload_timer
-                            pending_ammo_reload_timer = 0.0
-                            cycle_timer = 0.0
-                        elif turret_cycle > 0.0:
-                            cycle_timer += turret_cycle
-
-                if ammo_reload_timer <= 0.0 and pending_ammo_reload_timer > 0.0 and cycle_timer <= 0.0:
-                    ammo_reload_timer = pending_ammo_reload_timer
-                    pending_ammo_reload_timer = 0.0
-
-                ship.combat.turret_reload_timer = cycle_timer
-                ship.combat.turret_ammo_reload_timer = ammo_reload_timer
-                ship.combat.turret_pending_ammo_reload_timer = pending_ammo_reload_timer
-
-                if self.detailed_logging and self.logger is not None:
-                    tracking_term = 0.0
-                    if ship_profile.tracking > 0 and target_profile.sig_radius > 0:
-                        tracking_term = (angular_velocity * max(1.0, ship_profile.optimal_sig)) / (
-                            ship_profile.tracking * target_profile.sig_radius
-                        )
-                    range_excess = max(0.0, distance - ship_profile.optimal)
-                    range_term = range_excess / max(1e-6, ship_profile.falloff)
-                    self.logger.debug(
-                        f"turret_calc attacker={ship.ship_id} target={target.ship_id} dist={distance:.1f} transv={transversal:.1f} chance={chance:.4f} cycle={ship_profile.turret_cycle:.3f} fired={turret_fired} turret_dmg={_sum_damage(turret_damage):.3f}"
-                    )
-                    self.logger.debug(
-                        f"turret_formula attacker={ship.ship_id} target={target.ship_id} "
-                        f"chance~0.5^((tracking_term^2)+(range_term^2)); "
-                        f"tracking_term={tracking_term:.6f}; range_term={range_term:.6f}; "
-                        f"tracking={ship_profile.tracking:.6f}; optimal={ship_profile.optimal:.1f}; falloff={ship_profile.falloff:.1f}; target_sig={target_profile.sig_radius:.2f}; "
-                        f"range_factor={range_factor:.6f}; tracking_factor={tracking_factor:.6f}; expected_mult={expected_mult:.6f}"
-                    )
-
-            missile_damage = (0.0, 0.0, 0.0, 0.0)
-            missile_fired = False
-            if ship_profile.missile_dps > 0 and missile_active_ratio > 0:
-                missile_cycle = max(0.0, ship_profile.missile_cycle)
-                cycle_timer = max(0.0, float(ship.combat.missile_reload_timer))
-                ammo_reload_timer = max(0.0, float(ship.combat.missile_ammo_reload_timer))
-                pending_ammo_reload_timer = max(0.0, float(ship.combat.missile_pending_ammo_reload_timer))
-
-                if ammo_reload_timer > 0.0:
-                    ammo_reload_timer = max(0.0, ammo_reload_timer - dt)
-                else:
-                    cycle_in_progress = cycle_timer > 0.0
-                    if not cycle_in_progress and pending_ammo_reload_timer <= 0.0 and missile_cycle > 0.0:
-                        cycle_timer = missile_cycle
-                        cycle_in_progress = cycle_timer > 0.0
-                    if cycle_in_progress:
-                        cycle_timer = max(0.0, cycle_timer - dt)
-
-                    cycle_completed = cycle_in_progress and cycle_timer <= 0.0
-                    if cycle_completed:
-                        missile_fired = True
-                        missile_damage = _scale_damage(
-                            self._missile_damage(ship_profile, target_profile, distance, relative_speed),
-                            missile_active_ratio,
-                        )
-                        if pending_ammo_reload_timer > 0.0:
-                            ammo_reload_timer = pending_ammo_reload_timer
-                            pending_ammo_reload_timer = 0.0
-                            cycle_timer = 0.0
-                        elif missile_cycle > 0.0:
-                            cycle_timer += missile_cycle
-
-                if ammo_reload_timer <= 0.0 and pending_ammo_reload_timer > 0.0 and cycle_timer <= 0.0:
-                    ammo_reload_timer = pending_ammo_reload_timer
-                    pending_ammo_reload_timer = 0.0
-
-                ship.combat.missile_reload_timer = cycle_timer
-                ship.combat.missile_ammo_reload_timer = ammo_reload_timer
-                ship.combat.missile_pending_ammo_reload_timer = pending_ammo_reload_timer
-            if self.detailed_logging and self.logger is not None and ship_profile.missile_dps > 0:
-                sig_factor = target_profile.sig_radius / max(1.0, ship_profile.missile_explosion_radius)
-                vel_term = (sig_factor * ship_profile.missile_explosion_velocity) / max(1.0, relative_speed)
-                vel_factor = vel_term ** max(0.1, ship_profile.missile_damage_reduction_factor)
-                app_factor = self._missile_factor(ship_profile, target_profile, relative_speed)
-                self.logger.debug(
-                    f"missile_calc attacker={ship.ship_id} target={target.ship_id} dist={distance:.1f} rel_speed={relative_speed:.1f} cycle={ship_profile.missile_cycle:.3f} fired={missile_fired} missile_dmg={_sum_damage(missile_damage):.3f}"
-                )
-                self.logger.debug(
-                    f"missile_formula attacker={ship.ship_id} target={target.ship_id} "
-                    f"app=min(1,sig_factor,vel_factor); sig_factor={sig_factor:.6f}; vel_term={vel_term:.6f}; vel_factor={vel_factor:.6f}; app={app_factor:.6f}; "
-                    f"explosion_radius={ship_profile.missile_explosion_radius:.2f}; explosion_velocity={ship_profile.missile_explosion_velocity:.2f}; drf={ship_profile.missile_damage_reduction_factor:.3f}"
-                )
-            dmg = (
-                turret_damage[0] + missile_damage[0],
-                turret_damage[1] + missile_damage[1],
-                turret_damage[2] + missile_damage[2],
-                turret_damage[3] + missile_damage[3],
-            )
-            if turret_fired or missile_fired:
-                ship.combat.last_attack_target = target_id
-                ship.combat.fire_delay_timers.pop(target_id, None)
-            total_damage = _sum_damage(dmg)
-            if total_damage <= 0:
-                continue
-
-            self._queue_merged_event(
-                "active_module_cycle_effect",
-                merge_fields={
-                    "team": ship.team.value,
-                    "squad": ship.squad_id,
-                    "ship_type": ship.fit.ship_name,
-                    "module": "weapon",
-                    "weapon_system": ship_profile.weapon_system,
-                    "target_type": target.fit.ship_name,
-                    "turret_fired": turret_fired,
-                    "missile_fired": missile_fired,
-                },
-                sum_fields={
-                    "em": dmg[0],
-                    "thermal": dmg[1],
-                    "kinetic": dmg[2],
-                    "explosive": dmg[3],
-                    "total_damage": total_damage,
-                },
-            )
-
-            if self.detailed_logging and self.logger is not None:
-                best_turret_dph = ship_profile.turret_dps * max(0.0, ship_profile.turret_cycle) * self.pyfa.turret_damage_multiplier(1.0)
-                best_missile_dph = ship_profile.missile_dps * max(0.0, ship_profile.missile_cycle)
-                best_dph = best_turret_dph + best_missile_dph
-                self.logger.debug(
-                    f"dph_reference attacker={ship.ship_id} target={target.ship_id} "
-                    f"best_range_turret={ship_profile.optimal:.1f} best_range_missile={ship_profile.missile_max_range:.1f} "
-                    f"best_dph={best_dph:.4f} (turret={best_turret_dph:.4f}, missile={best_missile_dph:.4f}) "
-                    f"cycle=(turret={ship_profile.turret_cycle:.3f},missile={ship_profile.missile_cycle:.3f})"
-                )
-                self.logger.debug(
-                    f"dph_raw attacker={ship.ship_id} target={target.ship_id} dt={dt:.4f} fired=(turret={turret_fired},missile={missile_fired})"
-                    f" turret=({_fmt_damage(turret_damage)}) missile=({_fmt_damage(missile_damage)}) total=({_fmt_damage(dmg)}) sum={_sum_damage(dmg):.4f}"
-                )
-
-            shield_before = target.vital.shield
-            armor_before = target.vital.armor
-            structure_before = target.vital.structure
-            if self.detailed_logging and self.logger is not None:
-                target.vital.shield, target.vital.armor, target.vital.structure, trace = _apply_damage_sequence_with_trace(
-                    target.vital.shield,
-                    target.vital.armor,
-                    target.vital.structure,
-                    dmg,
-                    target_profile,
-                )
-                self.logger.debug(
-                    f"damage_apply attacker={ship.ship_id} target={target.ship_id} raw={_sum_damage(dmg):.3f}"
-                    f" hp_before=({shield_before:.1f},{armor_before:.1f},{structure_before:.1f})"
-                    f" hp_after=({target.vital.shield:.1f},{target.vital.armor:.1f},{target.vital.structure:.1f})"
-                    f" layers={trace}"
-                )
-                applied = (shield_before + armor_before + structure_before) - (
-                    target.vital.shield + target.vital.armor + target.vital.structure
-                )
-                if applied > 0:
-                    target.combat.last_damaged_at = world.now
-                for item in trace:
-                    self.logger.debug(
-                        f"res_formula attacker={ship.ship_id} target={target.ship_id} layer={item['layer']} "
-                        f"effective=(EM*ResEM + TH*ResTH + KI*ResKI + EX*ResEX) "
-                        f"=({item['raw_em']:.4f}*{item['res_em']:.4f} + {item['raw_th']:.4f}*{item['res_th']:.4f} + "
-                        f"{item['raw_ki']:.4f}*{item['res_ki']:.4f} + {item['raw_ex']:.4f}*{item['res_ex']:.4f}) "
-                        f"=> applied={item['effective_applied']:.4f}, before={item['before']:.4f}, after={item['after']:.4f}, overflow_ratio={item['overflow_ratio']:.4f}"
-                    )
-            else:
-                target.vital.shield, target.vital.armor, target.vital.structure = _apply_damage_sequence(
-                    target.vital.shield,
-                    target.vital.armor,
-                    target.vital.structure,
-                    dmg,
-                    target_profile,
-                )
-                applied = (shield_before + armor_before + structure_before) - (
-                    target.vital.shield + target.vital.armor + target.vital.structure
-                )
-                if applied > 0:
-                    target.combat.last_damaged_at = world.now
-            if target.vital.structure <= 0:
-                target.vital.alive = False
-                target.nav.velocity = Vector2(0.0, 0.0)
-                if self.detailed_logging and self.logger is not None:
-                    self.logger.debug(f"destroyed attacker={ship.ship_id} target={target.ship_id}")
 
         if self.event_logging_enabled:
             self._advance_merge_window(world.now)

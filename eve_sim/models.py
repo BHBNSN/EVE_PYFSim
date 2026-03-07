@@ -125,13 +125,6 @@ class CombatState:
     current_target: str | None = None
     last_attack_target: str | None = None
     lock_timers: dict[str, float] = field(default_factory=dict)
-    reload_timer: float = 0.0
-    turret_reload_timer: float = 0.0
-    missile_reload_timer: float = 0.0
-    turret_ammo_reload_timer: float = 0.0
-    missile_ammo_reload_timer: float = 0.0
-    turret_pending_ammo_reload_timer: float = 0.0
-    missile_pending_ammo_reload_timer: float = 0.0
     module_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
     module_pending_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
     fire_delay_timers: dict[str, float] = field(default_factory=dict)

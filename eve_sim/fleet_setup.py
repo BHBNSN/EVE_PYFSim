@@ -233,6 +233,65 @@ class RuntimeFromEftFactory:
                 continue
         return False
 
+    @staticmethod
+    def _normalize_effect_name(name: str) -> str:
+        return str(name or "").strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+    @staticmethod
+    def _collect_effect_names(effect_holder: Any) -> set[str]:
+        names: set[str] = set()
+        if effect_holder is None:
+            return names
+        effects = getattr(effect_holder, "effects", None)
+        if effects is None:
+            return names
+
+        raw_names: list[str] = []
+        try:
+            if hasattr(effects, "keys"):
+                for key in effects.keys():
+                    if key is not None:
+                        raw_names.append(str(key))
+        except Exception:
+            pass
+
+        effect_values: list[Any] = []
+        try:
+            if hasattr(effects, "values"):
+                effect_values = list(effects.values())
+            else:
+                effect_values = list(effects)
+        except Exception:
+            effect_values = []
+
+        for effect in effect_values:
+            for candidate in (
+                getattr(effect, "name", None),
+                getattr(effect, "effectName", None),
+                getattr(effect, "displayName", None),
+            ):
+                if candidate:
+                    raw_names.append(str(candidate))
+
+        for raw_name in raw_names:
+            normalized = RuntimeFromEftFactory._normalize_effect_name(raw_name)
+            if normalized:
+                names.add(normalized)
+        return names
+
+    @classmethod
+    def _module_effect_names(cls, fitted_module: Any) -> set[str]:
+        names = cls._collect_effect_names(getattr(fitted_module, "item", None))
+        names.update(cls._collect_effect_names(getattr(fitted_module, "charge", None)))
+        return names
+
+    @staticmethod
+    def _effect_name_has_any(effect_names: set[str], tokens: tuple[str, ...]) -> bool:
+        if not effect_names:
+            return False
+        normalized_tokens = tuple(RuntimeFromEftFactory._normalize_effect_name(t) for t in tokens)
+        return any(any(token and token in effect_name for token in normalized_tokens) for effect_name in effect_names)
+
     def _module_effect_pyfa(self, fitted_module, idx: int) -> ModuleRuntime | None:
         item = getattr(fitted_module, "item", None)
         if item is None:
@@ -240,6 +299,8 @@ class RuntimeFromEftFactory:
 
         group_name = (item.group.name or "").lower()
         suffix = f"-{idx}"
+        loaded_charge = getattr(fitted_module, "charge", None)
+        effect_names = self._module_effect_names(fitted_module)
 
         def attr_opt(name: str) -> float | None:
             try:
@@ -277,9 +338,95 @@ class RuntimeFromEftFactory:
         projected_mult: dict[str, float] = {}
         projected_add: dict[str, float] = {}
 
+        has_tracking_attrs = any(
+            abs(attr_opt(name) or 0.0) > 1e-9
+            for name in ("trackingSpeedBonus", "maxRangeBonus", "falloffBonus")
+        )
+        has_guidance_attrs = any(
+            abs(attr_opt(name) or 0.0) > 1e-9
+            for name in ("aoeCloudSizeBonus", "aoeVelocityBonus", "missileVelocityBonus", "explosionDelayBonus")
+        )
+
+        is_web = self._effect_name_has_any(
+            effect_names,
+            (
+                "remoteWebifier",
+                "stasisWebifier",
+                "doomsdayAOEWeb",
+                "stasisGrappler",
+            ),
+        ) or ("stasis web" in group_name) or ("stasis grappler" in group_name)
+
+        is_target_painter = self._effect_name_has_any(
+            effect_names,
+            (
+                "remoteTargetPaint",
+                "targetPainter",
+                "doomsdayAOEPaint",
+            ),
+        ) or ("target painter" in group_name)
+
+        is_sensor_damp = self._effect_name_has_any(
+            effect_names,
+            (
+                "remoteSensorDamp",
+                "sensorDamp",
+                "doomsdayAOEDamp",
+            ),
+        ) or ("sensor dampener" in group_name)
+
+        is_weapon_disrupt = self._effect_name_has_any(
+            effect_names,
+            (
+                "weaponDisrupt",
+                "doomsdayAOETrack",
+            ),
+        ) or ("weapon disruptor" in group_name) or ("structure disruption battery" in group_name)
+
+        is_tracking_disrupt = self._effect_name_has_any(
+            effect_names,
+            (
+                "trackingDisrupt",
+            ),
+        ) or (is_weapon_disrupt and has_tracking_attrs)
+
+        is_guidance_disrupt = self._effect_name_has_any(
+            effect_names,
+            (
+                "guidanceDisrupt",
+            ),
+        ) or (is_weapon_disrupt and has_guidance_attrs)
+
+        is_ecm = self._effect_name_has_any(
+            effect_names,
+            (
+                "remoteECM",
+                "structureModuleEffectECM",
+                "entityECM",
+                "doomsdayAOEECM",
+            ),
+        ) or ("ecm" in group_name)
+
+        handled_projection_attrs: set[str] = set()
+
+        def map_projected_or_local(attr_name: str, key: str, force_projected: bool = False) -> None:
+            value = attr_opt(attr_name)
+            if value is None or abs(value) < 1e-9:
+                return
+            handled_projection_attrs.add(attr_name)
+            if force_projected and range_m > 0:
+                projected_mult[key] = pct_to_mult(value)
+            elif value < 0 and range_m > 0:
+                projected_mult[key] = pct_to_mult(value)
+            else:
+                local_mult[key] = pct_to_mult(value)
+
         speed_factor = attr_opt("speedFactor")
         if speed_factor is not None:
-            if speed_factor < 0 and range_m > 0:
+            if is_web and range_m > 0 and abs(speed_factor) > 1e-9:
+                projected_mult["speed"] = pct_to_mult(speed_factor)
+                handled_projection_attrs.add("speedFactor")
+            elif speed_factor < 0 and range_m > 0:
                 projected_mult["speed"] = pct_to_mult(speed_factor)
             elif speed_factor > 0:
                 local_mult["speed"] = max(local_mult.get("speed", 1.0), pct_to_mult(speed_factor))
@@ -290,10 +437,22 @@ class RuntimeFromEftFactory:
 
         signature_radius_bonus = attr_opt("signatureRadiusBonus")
         if signature_radius_bonus is not None:
-            if signature_radius_bonus > 0 and range_m > 0:
+            if is_target_painter and range_m > 0 and abs(signature_radius_bonus) > 1e-9:
+                projected_mult["sig"] = pct_to_mult(signature_radius_bonus)
+                handled_projection_attrs.add("signatureRadiusBonus")
+            elif signature_radius_bonus > 0 and range_m > 0:
                 projected_mult["sig"] = pct_to_mult(signature_radius_bonus)
             elif signature_radius_bonus != 0:
                 local_mult["sig"] = pct_to_mult(signature_radius_bonus)
+
+        if is_sensor_damp:
+            map_projected_or_local("scanResolutionBonus", "scan", force_projected=True)
+            map_projected_or_local("maxTargetRangeBonus", "range", force_projected=True)
+
+        if is_tracking_disrupt:
+            map_projected_or_local("trackingSpeedBonus", "tracking", force_projected=True)
+            map_projected_or_local("maxRangeBonus", "optimal", force_projected=True)
+            map_projected_or_local("falloffBonus", "falloff", force_projected=True)
 
         for attr_name, key in (
             ("scanResolutionBonus", "scan"),
@@ -302,6 +461,8 @@ class RuntimeFromEftFactory:
             ("maxRangeBonus", "optimal"),
             ("falloffBonus", "falloff"),
         ):
+            if attr_name in handled_projection_attrs:
+                continue
             value = attr_opt(attr_name)
             if value is None or abs(value) < 1e-9:
                 continue
@@ -310,13 +471,31 @@ class RuntimeFromEftFactory:
             else:
                 local_mult[key] = pct_to_mult(value)
 
+        if range_m > 0.0 and (is_guidance_disrupt or has_guidance_attrs):
+            missile_explosion_radius_bonus = attr_opt("aoeCloudSizeBonus")
+            if missile_explosion_radius_bonus is not None and abs(missile_explosion_radius_bonus) > 1e-9:
+                projected_mult["missile_explosion_radius"] = pct_to_mult(missile_explosion_radius_bonus)
+
+            missile_explosion_velocity_bonus = attr_opt("aoeVelocityBonus")
+            if missile_explosion_velocity_bonus is not None and abs(missile_explosion_velocity_bonus) > 1e-9:
+                projected_mult["missile_explosion_velocity"] = pct_to_mult(missile_explosion_velocity_bonus)
+
+            missile_range_mult = 1.0
+            for attr_name in ("missileVelocityBonus", "explosionDelayBonus"):
+                value = attr_opt(attr_name)
+                if value is None or abs(value) < 1e-9:
+                    continue
+                missile_range_mult *= pct_to_mult(value)
+            if abs(missile_range_mult - 1.0) > 1e-9:
+                projected_mult["missile_range"] = max(0.01, missile_range_mult)
+
         ecm_strengths = {
             "ecm_gravimetric": max(0.0, attr("scanGravimetricStrengthBonus", 0.0)),
             "ecm_ladar": max(0.0, attr("scanLadarStrengthBonus", 0.0)),
             "ecm_magnetometric": max(0.0, attr("scanMagnetometricStrengthBonus", 0.0)),
             "ecm_radar": max(0.0, attr("scanRadarStrengthBonus", 0.0)),
         }
-        if range_m > 0.0:
+        if range_m > 0.0 and is_ecm:
             for key, value in ecm_strengths.items():
                 if value > 0.0:
                     projected_add[key] = value
@@ -336,6 +515,46 @@ class RuntimeFromEftFactory:
             if local_rep > 0.0:
                 local_add["rep"] = local_add.get("rep", 0.0) + local_rep
 
+        is_weapon_like = self._is_weapon_like_group(group_name)
+        if is_weapon_like and range_m > 0.0:
+            try:
+                dps_obj = fitted_module.getDps()
+            except Exception:
+                dps_obj = None
+
+            if dps_obj is not None:
+                damage_cycle = max(0.1, cycle_sec)
+                em_dps = max(0.0, float(getattr(dps_obj, "em", 0.0) or 0.0))
+                thermal_dps = max(0.0, float(getattr(dps_obj, "thermal", 0.0) or 0.0))
+                kinetic_dps = max(0.0, float(getattr(dps_obj, "kinetic", 0.0) or 0.0))
+                explosive_dps = max(0.0, float(getattr(dps_obj, "explosive", 0.0) or 0.0))
+                if (em_dps + thermal_dps + kinetic_dps + explosive_dps) > 0.0:
+                    projected_add["damage_em"] = em_dps * damage_cycle
+                    projected_add["damage_thermal"] = thermal_dps * damage_cycle
+                    projected_add["damage_kinetic"] = kinetic_dps * damage_cycle
+                    projected_add["damage_explosive"] = explosive_dps * damage_cycle
+
+                    if "launcher" in group_name:
+                        projected_add["weapon_is_missile"] = 1.0
+                        try:
+                            explosion_radius = max(0.0, float(fitted_module.getModifiedChargeAttr("aoeCloudSize") or 0.0))
+                            explosion_velocity = max(0.0, float(fitted_module.getModifiedChargeAttr("aoeVelocity") or 0.0))
+                            damage_reduction_factor = max(
+                                0.1,
+                                float(fitted_module.getModifiedChargeAttr("damageReductionFactor") or 0.5),
+                            )
+                        except Exception:
+                            explosion_radius = 0.0
+                            explosion_velocity = 0.0
+                            damage_reduction_factor = 0.5
+                        projected_add["weapon_explosion_radius"] = explosion_radius
+                        projected_add["weapon_explosion_velocity"] = explosion_velocity
+                        projected_add["weapon_drf"] = damage_reduction_factor
+                    else:
+                        projected_add["weapon_is_turret"] = 1.0
+                        projected_add["weapon_tracking"] = max(0.0, attr("trackingSpeed", 0.0))
+                        projected_add["weapon_optimal_sig"] = max(1.0, attr("optimalSigRadius", 40_000.0))
+
         cap_capacity_bonus = attr_opt("capacitorCapacityBonus")
         if cap_capacity_bonus is not None and abs(cap_capacity_bonus) > 1e-9:
             local_mult["cap_max"] = pct_to_mult(cap_capacity_bonus)
@@ -344,7 +563,7 @@ class RuntimeFromEftFactory:
         if cap_recharge_mult is not None and cap_recharge_mult > 0 and abs(cap_recharge_mult - 1.0) > 1e-6:
             local_mult["cap_recharge"] = max(0.01, cap_recharge_mult)
 
-        if not self._is_weapon_like_group(group_name):
+        if not is_weapon_like:
             damage_scale = 1.0
             damage_multiplier_bonus = attr_opt("damageMultiplierBonus")
             if damage_multiplier_bonus is not None and abs(damage_multiplier_bonus) > 1e-9:
@@ -388,7 +607,6 @@ class RuntimeFromEftFactory:
         charge_rate = max(0.0, attr("chargeRate", 0.0)) if has_charge_rate_attr else 0.0
         charge_reload_time = max(0.0, attr("reloadTime", 0.0) / 1000.0)
         charge_remaining = 0.0
-        loaded_charge = getattr(fitted_module, "charge", None)
         if loaded_charge is not None:
             try:
                 charge_capacity = int(float(getattr(fitted_module, "numCharges", 0) or 0))
@@ -738,6 +956,7 @@ class RuntimeFromEftFactory:
                         "module_name": spec.module_name,
                         "charge_name": effective_charge_name,
                         "offline": bool(spec.offline),
+                        "effect_names": sorted(self._module_effect_names(fitted_module)),
                     }
                 )
 

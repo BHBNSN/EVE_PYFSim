@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import math
 from typing import Any
 
 from .models import ShipProfile
@@ -109,6 +108,12 @@ class RuntimeStatEngine:
         self._cache: dict[tuple, ShipProfile] = {}
 
     @staticmethod
+    def _stacking_penalty_factor(index: int) -> float:
+        # EVE generic stacking penalty: S(n) = 0.5 ^ (((n-1) / 2.22292081) ^ 2)
+        # Here index=0 is the first strongest modifier (n=1).
+        return 0.5 ** (((float(index)) / 2.22292081) ** 2)
+
+    @staticmethod
     def _stacking_multiplier(values: list[float]) -> float:
         if not values:
             return 1.0
@@ -119,7 +124,7 @@ class RuntimeStatEngine:
         penalty.sort(key=lambda x: -abs(x - 1))
         for group in (bonus, penalty):
             for i, mult in enumerate(group):
-                val *= 1 + (mult - 1) * math.exp(-(i ** 2) / 7.1289)
+                val *= 1 + (mult - 1) * RuntimeStatEngine._stacking_penalty_factor(i)
         return val
 
     def compute_base_profile(self, runtime: FitRuntime) -> ShipProfile:
@@ -186,6 +191,9 @@ class RuntimeStatEngine:
             "falloff": [],
             "scan": [],
             "range": [],
+            "missile_explosion_radius": [],
+            "missile_explosion_velocity": [],
+            "missile_range": [],
             "dps": [],
             "cap_max": [],
             "cap_recharge": [],
@@ -211,6 +219,18 @@ class RuntimeStatEngine:
             scan_resolution=max(1.0, (target.scan_resolution + add["scan"]) * self._stacking_multiplier(mul["scan"])),
             max_target_range=max(1000.0, (target.max_target_range + add["range"]) * self._stacking_multiplier(mul["range"])),
             max_speed=max(1.0, (target.max_speed + add["speed"]) * self._stacking_multiplier(mul["speed"])),
+            missile_explosion_radius=max(
+                0.0,
+                target.missile_explosion_radius * self._stacking_multiplier(mul["missile_explosion_radius"]),
+            ),
+            missile_explosion_velocity=max(
+                0.0,
+                target.missile_explosion_velocity * self._stacking_multiplier(mul["missile_explosion_velocity"]),
+            ),
+            missile_max_range=max(
+                0.0,
+                target.missile_max_range * self._stacking_multiplier(mul["missile_range"]),
+            ),
             max_cap=max(1.0, (target.max_cap + add["cap_max"]) * self._stacking_multiplier(mul["cap_max"])),
             cap_recharge_time=max(
                 1.0,
