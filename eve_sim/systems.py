@@ -213,6 +213,7 @@ class CombatSystem:
         self._merged_event_buckets: dict[tuple, dict[str, Any]] = {}
         self._merge_window_start_time: float | None = None
         self._merge_window_end_time: float | None = None
+        self._last_focus_queue_by_squad: dict[str, tuple[str, ...]] = {}
 
     def attach_logger(self, logger: logging.Logger, detailed_logging: bool, merge_window_sec: float = 1.0) -> None:
         self.logger = logger
@@ -1183,12 +1184,15 @@ class CombatSystem:
             if candidate.vital.alive:
                 alive_by_team[candidate.team].append(candidate)
 
+        changed_focus_keys = self._changed_focus_queues(world)
+
         for ship in world.ships.values():
             if not ship.vital.alive or ship.runtime is None:
                 continue
 
             allies_pool = alive_by_team.get(ship.team, [])
             enemies_alive = alive_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, [])
+            force_target_reselect = self._focus_key(ship.team, ship.squad_id) in changed_focus_keys
 
             for module in ship.runtime.modules:
                 if module.state == module.state.OFFLINE:
@@ -1275,7 +1279,7 @@ class CombatSystem:
                 cycle_started = False
 
                 if has_projected:
-                    if self._can_reuse_projected_target(
+                    if (not force_target_reselect) and self._can_reuse_projected_target(
                         world,
                         ship,
                         module,
@@ -1715,6 +1719,27 @@ class CombatSystem:
     @staticmethod
     def _focus_key(team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
+
+    def _changed_focus_queues(self, world: WorldState) -> set[str]:
+        changed: set[str] = set()
+        active_focus_keys: set[str] = {
+            self._focus_key(ship.team, ship.squad_id)
+            for ship in world.ships.values()
+            if ship.vital.alive
+        }
+        active_focus_keys.update(str(key) for key in world.squad_focus_queues.keys())
+
+        for focus_key in active_focus_keys:
+            current_queue = tuple(str(target_id) for target_id in world.squad_focus_queues.get(focus_key, []))
+            previous_queue = self._last_focus_queue_by_squad.get(focus_key)
+            if previous_queue is not None and previous_queue != current_queue:
+                changed.add(focus_key)
+            self._last_focus_queue_by_squad[focus_key] = current_queue
+
+        for stale_key in [key for key in self._last_focus_queue_by_squad.keys() if key not in active_focus_keys]:
+            self._last_focus_queue_by_squad.pop(stale_key, None)
+
+        return changed
 
     def _update_squad_prelocks(self, world: WorldState, dt: float, effective_profiles: dict[str, ShipProfile]) -> None:
         squads: dict[str, list] = {}
