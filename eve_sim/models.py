@@ -36,6 +36,10 @@ class FitDescriptor:
     signature_radius: float = 120.0
     scan_resolution: float = 300.0
     max_target_range: float = 120_000.0
+    sensor_strength_gravimetric: float = 0.0
+    sensor_strength_ladar: float = 0.0
+    sensor_strength_magnetometric: float = 0.0
+    sensor_strength_radar: float = 0.0
     max_speed: float = 1800.0
     max_cap: float = 4000.0
     cap_recharge_time: float = 450.0
@@ -86,6 +90,10 @@ class ShipProfile:
     missile_explosion_velocity: float = 0.0
     missile_max_range: float = 0.0
     missile_damage_reduction_factor: float = 0.5
+    sensor_strength_gravimetric: float = 0.0
+    sensor_strength_ladar: float = 0.0
+    sensor_strength_magnetometric: float = 0.0
+    sensor_strength_radar: float = 0.0
     shield_resonance_em: float = 1.0
     shield_resonance_thermal: float = 1.0
     shield_resonance_kinetic: float = 1.0
@@ -128,6 +136,15 @@ class CombatState:
     module_pending_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
     fire_delay_timers: dict[str, float] = field(default_factory=dict)
     projected_targets: dict[str, str] = field(default_factory=dict)
+    ecm_jam_sources: dict[str, float] = field(default_factory=dict)
+    ecm_last_attempt_target: str | None = None
+    ecm_last_attempt_module: str | None = None
+    ecm_last_attempt_success: bool | None = None
+    ecm_last_attempt_chance: float = 0.0
+    ecm_last_attempt_at: float = -1e9
+    ecm_last_attempt_target_by_module: dict[str, str] = field(default_factory=dict)
+    ecm_last_attempt_success_by_module: dict[str, bool] = field(default_factory=dict)
+    ecm_last_attempt_at_by_module: dict[str, float] = field(default_factory=dict)
     last_damaged_at: float = -1e9
     module_cycle_timers: dict[str, float] = field(default_factory=dict)
     module_reactivation_timers: dict[str, float] = field(default_factory=dict)

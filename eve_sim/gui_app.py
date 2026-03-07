@@ -1808,6 +1808,10 @@ class ShipStatusDialog(QDialog):
         return ("weapon" in g) or ("turret" in g) or ("launcher" in g)
 
     @staticmethod
+    def _is_ecm_group(group_name: str) -> bool:
+        return "ecm" in (group_name or "").lower()
+
+    @staticmethod
     def _fmt_charge_amount(value: float) -> str:
         rounded = round(float(value))
         if abs(float(value) - rounded) < 1e-6:
@@ -1881,6 +1885,50 @@ class ShipStatusDialog(QDialog):
 
         return ""
 
+    def _format_ecm_incoming_status(self, lang: str, ship, now: float) -> str:
+        active_sources: list[tuple[str, float]] = []
+        for source_id, jam_until in ship.combat.ecm_jam_sources.items():
+            remaining = float(jam_until) - now
+            if remaining > 0.0:
+                active_sources.append((str(source_id), remaining))
+        if not active_sources:
+            return tr(lang, "status_ecm_none")
+        active_sources.sort(key=lambda item: item[1], reverse=True)
+        return ", ".join(f"{source_id}({remaining:.1f}s)" for source_id, remaining in active_sources)
+
+    def _format_ecm_attempt_status(self, lang: str, ship, now: float) -> str:
+        target_id = str(ship.combat.ecm_last_attempt_target or "").strip()
+        if not target_id:
+            return tr(lang, "status_ecm_attempt_none")
+
+        module_id = str(ship.combat.ecm_last_attempt_module or "").strip()
+        success = ship.combat.ecm_last_attempt_success
+        if success is True:
+            result_label = tr(lang, "status_ecm_result_success")
+        elif success is False:
+            result_label = tr(lang, "status_ecm_result_failed")
+        else:
+            result_label = tr(lang, "status_ecm_result_unknown")
+
+        chance = max(0.0, min(1.0, float(ship.combat.ecm_last_attempt_chance or 0.0)))
+        age = max(0.0, now - float(ship.combat.ecm_last_attempt_at or -1e9))
+        head = f"{module_id} -> {target_id}" if module_id else target_id
+        return (
+            f"{head} | {result_label} | {tr(lang, 'status_ecm_chance')}={chance * 100.0:.1f}% | "
+            f"{tr(lang, 'status_ecm_elapsed')}={age:.1f}s"
+        )
+
+    def _format_ecm_cycle_result_for_module(self, lang: str, ship, module_id: str, target_id: str | None) -> str:
+        success = ship.combat.ecm_last_attempt_success_by_module.get(module_id)
+        if success is None:
+            return ""
+        module_target = str(ship.combat.ecm_last_attempt_target_by_module.get(module_id, "") or "").strip()
+        shown_target = str(target_id or "").strip()
+        if shown_target and module_target and shown_target != module_target:
+            return ""
+        result_label = tr(lang, "status_ecm_result_success") if success else tr(lang, "status_ecm_result_failed")
+        return f" | {tr(lang, 'status_ecm_cycle_result')}={result_label}"
+
     def _stable_profile(self, ship):
         if ship.runtime is None:
             return ship.profile
@@ -1946,6 +1994,8 @@ class ShipStatusDialog(QDialog):
         )
         lines.append(f"{tr(lang, 'status_cap')}: {ship.vital.cap:.1f}/{stable_profile.max_cap:.1f}")
         lines.append(f"{tr(lang, 'status_target')}: {ship.combat.current_target or tr(lang, 'status_target_none')}")
+        now = float(self.engine.world.now)
+        lines.append(f"{tr(lang, 'status_ecm_incoming')}: {self._format_ecm_incoming_status(lang, ship, now)}")
         lines.append(
             f"{tr(lang, 'status_res')}: "
             f"S[{self._res_pct(profile.shield_resonance_em):.1f}/{self._res_pct(profile.shield_resonance_thermal):.1f}/{self._res_pct(profile.shield_resonance_kinetic):.1f}/{self._res_pct(profile.shield_resonance_explosive):.1f}] "
@@ -2002,6 +2052,8 @@ class ShipStatusDialog(QDialog):
                     if has_projected:
                         target_id = projected_by_module.get(module.module_id, tr(lang, "status_target_none"))
                         line += f" | {tr(lang, 'status_target')}={target_id}"
+                        if self._is_ecm_group(module.group):
+                            line += self._format_ecm_cycle_result_for_module(lang, ship, module.module_id, target_id)
                     elif self._is_weapon_group(module.group):
                         line += f" | {tr(lang, 'status_target')}={ship.combat.current_target or tr(lang, 'status_target_none')}"
                     lines.append(line)
@@ -2037,6 +2089,8 @@ class ShipStatusDialog(QDialog):
                     if has_projected:
                         target_id = projected_by_slot.get(idx, tr(lang, "status_target_none"))
                         line += f" | {tr(lang, 'status_target')}={target_id}"
+                        if self._is_ecm_group(runtime_module.group):
+                            line += self._format_ecm_cycle_result_for_module(lang, ship, runtime_module.module_id, target_id)
                     elif self._is_weapon_group(runtime_module.group):
                         line += f" | {tr(lang, 'status_target')}={ship.combat.current_target or tr(lang, 'status_target_none')}"
                 lines.append(line)
@@ -4154,6 +4208,73 @@ class MainWindow(QMainWindow):
             else:
                 ship.combat.projected_targets.clear()
 
+            ecm_sources = raw.get("ecm_jam_sources")
+            if isinstance(ecm_sources, dict):
+                parsed_sources: dict[str, float] = {}
+                for source_id, jam_until in ecm_sources.items():
+                    sid = str(source_id)
+                    if not sid:
+                        continue
+                    try:
+                        parsed_sources[sid] = float(jam_until)
+                    except Exception:
+                        continue
+                ship.combat.ecm_jam_sources = parsed_sources
+            else:
+                ship.combat.ecm_jam_sources.clear()
+
+            ecm_attempt_target = str(raw.get("ecm_last_attempt_target", "") or "").strip()
+            ship.combat.ecm_last_attempt_target = ecm_attempt_target or None
+            ecm_attempt_module = str(raw.get("ecm_last_attempt_module", "") or "").strip()
+            ship.combat.ecm_last_attempt_module = ecm_attempt_module or None
+            raw_success = raw.get("ecm_last_attempt_success")
+            ship.combat.ecm_last_attempt_success = raw_success if isinstance(raw_success, bool) else None
+            try:
+                ship.combat.ecm_last_attempt_chance = max(0.0, min(1.0, float(raw.get("ecm_last_attempt_chance", 0.0) or 0.0)))
+            except Exception:
+                ship.combat.ecm_last_attempt_chance = 0.0
+            try:
+                ship.combat.ecm_last_attempt_at = float(raw.get("ecm_last_attempt_at", -1e9) or -1e9)
+            except Exception:
+                ship.combat.ecm_last_attempt_at = -1e9
+
+            ecm_target_by_module = raw.get("ecm_last_attempt_target_by_module")
+            if isinstance(ecm_target_by_module, dict):
+                ship.combat.ecm_last_attempt_target_by_module = {
+                    str(module_id): str(target_id)
+                    for module_id, target_id in ecm_target_by_module.items()
+                    if str(module_id)
+                }
+            else:
+                ship.combat.ecm_last_attempt_target_by_module.clear()
+
+            ecm_success_by_module = raw.get("ecm_last_attempt_success_by_module")
+            if isinstance(ecm_success_by_module, dict):
+                parsed_success: dict[str, bool] = {}
+                for module_id, success in ecm_success_by_module.items():
+                    mid = str(module_id)
+                    if not mid or not isinstance(success, bool):
+                        continue
+                    parsed_success[mid] = success
+                ship.combat.ecm_last_attempt_success_by_module = parsed_success
+            else:
+                ship.combat.ecm_last_attempt_success_by_module.clear()
+
+            ecm_at_by_module = raw.get("ecm_last_attempt_at_by_module")
+            if isinstance(ecm_at_by_module, dict):
+                parsed_at: dict[str, float] = {}
+                for module_id, ts in ecm_at_by_module.items():
+                    mid = str(module_id)
+                    if not mid:
+                        continue
+                    try:
+                        parsed_at[mid] = float(ts)
+                    except Exception:
+                        continue
+                ship.combat.ecm_last_attempt_at_by_module = parsed_at
+            else:
+                ship.combat.ecm_last_attempt_at_by_module.clear()
+
             module_states = raw.get("module_states")
             if isinstance(module_states, dict) and ship.runtime is not None:
                 state_map = {str(mid): str(state) for mid, state in module_states.items()}
@@ -4169,11 +4290,37 @@ class MainWindow(QMainWindow):
         raw_pos = raw.get("position")
         raw_vel = raw.get("velocity")
         raw_projected = raw.get("projected_targets")
+        raw_ecm_sources = raw.get("ecm_jam_sources")
+        raw_ecm_target_by_module = raw.get("ecm_last_attempt_target_by_module")
+        raw_ecm_success_by_module = raw.get("ecm_last_attempt_success_by_module")
+        raw_ecm_at_by_module = raw.get("ecm_last_attempt_at_by_module")
         raw_module_states = raw.get("module_states")
         pos: dict = raw_pos if isinstance(raw_pos, dict) else {}
         vel: dict = raw_vel if isinstance(raw_vel, dict) else {}
         projected: dict = raw_projected if isinstance(raw_projected, dict) else {}
+        ecm_sources: dict = raw_ecm_sources if isinstance(raw_ecm_sources, dict) else {}
+        ecm_target_by_module: dict = raw_ecm_target_by_module if isinstance(raw_ecm_target_by_module, dict) else {}
+        ecm_success_by_module: dict = raw_ecm_success_by_module if isinstance(raw_ecm_success_by_module, dict) else {}
+        ecm_at_by_module: dict = raw_ecm_at_by_module if isinstance(raw_ecm_at_by_module, dict) else {}
         module_states: dict = raw_module_states if isinstance(raw_module_states, dict) else {}
+        ecm_sources_sig: list[tuple[str, float]] = []
+        for source_id, jam_until in ecm_sources.items():
+            sid = str(source_id)
+            if not sid:
+                continue
+            try:
+                ecm_sources_sig.append((sid, round(float(jam_until), 2)))
+            except Exception:
+                continue
+        ecm_at_by_module_sig: list[tuple[str, float]] = []
+        for module_id, ts in ecm_at_by_module.items():
+            mid = str(module_id)
+            if not mid:
+                continue
+            try:
+                ecm_at_by_module_sig.append((mid, round(float(ts), 2)))
+            except Exception:
+                continue
         return (
             str(raw.get("team", "")),
             str(raw.get("squad_id", "")),
@@ -4194,6 +4341,15 @@ class MainWindow(QMainWindow):
             round(float(raw.get("cap_max", 0.0)), 1),
             str(raw.get("target", "") or ""),
             tuple(sorted((str(k), str(v)) for k, v in projected.items())),
+            tuple(sorted(ecm_sources_sig)),
+            str(raw.get("ecm_last_attempt_target", "") or ""),
+            str(raw.get("ecm_last_attempt_module", "") or ""),
+            raw.get("ecm_last_attempt_success", None),
+            round(float(raw.get("ecm_last_attempt_chance", 0.0) or 0.0), 3),
+            round(float(raw.get("ecm_last_attempt_at", -1e9) or -1e9), 2),
+            tuple(sorted((str(k), str(v)) for k, v in ecm_target_by_module.items())),
+            tuple(sorted((str(k), bool(v)) for k, v in ecm_success_by_module.items() if isinstance(v, bool))),
+            tuple(sorted(ecm_at_by_module_sig)),
             tuple(sorted((str(k), str(v)) for k, v in module_states.items())),
         )
 

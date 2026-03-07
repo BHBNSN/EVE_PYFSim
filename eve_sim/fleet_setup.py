@@ -310,16 +310,16 @@ class RuntimeFromEftFactory:
             else:
                 local_mult[key] = pct_to_mult(value)
 
-        jam_strength = max(
-            attr("scanGravimetricStrengthBonus", 0.0),
-            attr("scanLadarStrengthBonus", 0.0),
-            attr("scanMagnetometricStrengthBonus", 0.0),
-            attr("scanRadarStrengthBonus", 0.0),
-        )
-        if jam_strength > 0.0 and range_m > 0.0:
-            suppression = max(0.0, min(0.95, jam_strength / (jam_strength + 10.0)))
-            projected_mult.setdefault("scan", max(0.05, 1.0 - suppression))
-            projected_mult.setdefault("range", max(0.05, 1.0 - suppression))
+        ecm_strengths = {
+            "ecm_gravimetric": max(0.0, attr("scanGravimetricStrengthBonus", 0.0)),
+            "ecm_ladar": max(0.0, attr("scanLadarStrengthBonus", 0.0)),
+            "ecm_magnetometric": max(0.0, attr("scanMagnetometricStrengthBonus", 0.0)),
+            "ecm_radar": max(0.0, attr("scanRadarStrengthBonus", 0.0)),
+        }
+        if range_m > 0.0:
+            for key, value in ecm_strengths.items():
+                if value > 0.0:
+                    projected_add[key] = value
 
         if range_m > 0.0:
             shield_rep = abs(attr("shieldBonus", 0.0))
@@ -680,6 +680,10 @@ class RuntimeFromEftFactory:
             "sig_radius": float(ship.getModifiedItemAttr("signatureRadius") or 0.0),
             "scan_resolution": float(ship.getModifiedItemAttr("scanResolution") or 0.0),
             "max_target_range": float(ship.getModifiedItemAttr("maxTargetRange") or 0.0),
+            "sensor_strength_gravimetric": float(ship.getModifiedItemAttr("scanGravimetricStrength") or 0.0),
+            "sensor_strength_ladar": float(ship.getModifiedItemAttr("scanLadarStrength") or 0.0),
+            "sensor_strength_magnetometric": float(ship.getModifiedItemAttr("scanMagnetometricStrength") or 0.0),
+            "sensor_strength_radar": float(ship.getModifiedItemAttr("scanRadarStrength") or 0.0),
             "max_cap": float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0),
             "cap_recharge_time": float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0,
             "shield_hp": float(ship.getModifiedItemAttr("shieldCapacity") or 0.0),
@@ -750,6 +754,10 @@ class RuntimeFromEftFactory:
             sig_radius=max(1.0, float(pyfa_final.get("sig_radius", 0.0) or 0.0)),
             scan_resolution=max(1.0, float(pyfa_final.get("scan_resolution", 0.0) or 0.0)),
             max_target_range=max(1000.0, float(pyfa_final.get("max_target_range", 0.0) or 0.0)),
+            sensor_strength_gravimetric=max(0.0, float(pyfa_final.get("sensor_strength_gravimetric", 0.0) or 0.0)),
+            sensor_strength_ladar=max(0.0, float(pyfa_final.get("sensor_strength_ladar", 0.0) or 0.0)),
+            sensor_strength_magnetometric=max(0.0, float(pyfa_final.get("sensor_strength_magnetometric", 0.0) or 0.0)),
+            sensor_strength_radar=max(0.0, float(pyfa_final.get("sensor_strength_radar", 0.0) or 0.0)),
             max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
             max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
             cap_recharge_time=max(1.0, float(pyfa_final.get("cap_recharge_time", 0.0) or 0.0)),
@@ -845,6 +853,10 @@ class RuntimeFromEftFactory:
             signature_radius=profile.sig_radius,
             scan_resolution=profile.scan_resolution,
             max_target_range=profile.max_target_range,
+            sensor_strength_gravimetric=profile.sensor_strength_gravimetric,
+            sensor_strength_ladar=profile.sensor_strength_ladar,
+            sensor_strength_magnetometric=profile.sensor_strength_magnetometric,
+            sensor_strength_radar=profile.sensor_strength_radar,
             max_speed=profile.max_speed,
             max_cap=profile.max_cap,
             cap_recharge_time=profile.cap_recharge_time,
@@ -1298,6 +1310,10 @@ def recompute_profile_from_pyfa_runtime(runtime: FitRuntime) -> ShipProfile | No
             sig_radius=max(1.0, float(ship.getModifiedItemAttr("signatureRadius") or 0.0)),
             scan_resolution=max(1.0, float(ship.getModifiedItemAttr("scanResolution") or 0.0)),
             max_target_range=max(1000.0, float(ship.getModifiedItemAttr("maxTargetRange") or 0.0)),
+            sensor_strength_gravimetric=max(0.0, float(ship.getModifiedItemAttr("scanGravimetricStrength") or 0.0)),
+            sensor_strength_ladar=max(0.0, float(ship.getModifiedItemAttr("scanLadarStrength") or 0.0)),
+            sensor_strength_magnetometric=max(0.0, float(ship.getModifiedItemAttr("scanMagnetometricStrength") or 0.0)),
+            sensor_strength_radar=max(0.0, float(ship.getModifiedItemAttr("scanRadarStrength") or 0.0)),
             max_speed=max(1.0, float(ship.getModifiedItemAttr("maxVelocity") or 0.0)),
             max_cap=max(1.0, float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0)),
             cap_recharge_time=max(1.0, float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0),

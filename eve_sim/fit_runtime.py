@@ -221,6 +221,10 @@ class RuntimeStatEngine:
             structure_hp=target.structure_hp,
             rep_amount=target.rep_amount,
             rep_cycle=target.rep_cycle,
+            sensor_strength_gravimetric=target.sensor_strength_gravimetric,
+            sensor_strength_ladar=target.sensor_strength_ladar,
+            sensor_strength_magnetometric=target.sensor_strength_magnetometric,
+            sensor_strength_radar=target.sensor_strength_radar,
         )
 
     @staticmethod

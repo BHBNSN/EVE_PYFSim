@@ -76,6 +76,10 @@ class PyfaBridge:
             structure_hp=fit.structure_hp,
             rep_amount=fit.rep_amount,
             rep_cycle=fit.rep_cycle,
+            sensor_strength_gravimetric=fit.sensor_strength_gravimetric,
+            sensor_strength_ladar=fit.sensor_strength_ladar,
+            sensor_strength_magnetometric=fit.sensor_strength_magnetometric,
+            sensor_strength_radar=fit.sensor_strength_radar,
         )
         self._profile_cache[fit.fit_key] = profile
         return profile

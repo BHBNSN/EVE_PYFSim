@@ -76,6 +76,15 @@ class SimulationEngine:
                 "cap_max": ship.vital.cap_max,
                 "target": ship.combat.current_target,
                 "projected_targets": {k: v for k, v in ship.combat.projected_targets.items()},
+                "ecm_jam_sources": {k: float(v) for k, v in ship.combat.ecm_jam_sources.items()},
+                "ecm_last_attempt_target": ship.combat.ecm_last_attempt_target,
+                "ecm_last_attempt_module": ship.combat.ecm_last_attempt_module,
+                "ecm_last_attempt_success": ship.combat.ecm_last_attempt_success,
+                "ecm_last_attempt_chance": float(ship.combat.ecm_last_attempt_chance),
+                "ecm_last_attempt_at": float(ship.combat.ecm_last_attempt_at),
+                "ecm_last_attempt_target_by_module": {k: str(v) for k, v in ship.combat.ecm_last_attempt_target_by_module.items()},
+                "ecm_last_attempt_success_by_module": {k: bool(v) for k, v in ship.combat.ecm_last_attempt_success_by_module.items()},
+                "ecm_last_attempt_at_by_module": {k: float(v) for k, v in ship.combat.ecm_last_attempt_at_by_module.items()},
                 "module_states": module_states,
             }
         return {

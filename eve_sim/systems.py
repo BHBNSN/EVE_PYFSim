@@ -425,6 +425,63 @@ class CombatSystem:
         self._lock_time_cache[key] = value
         return value
 
+    def _ensure_target_lock(
+        self,
+        world: WorldState,
+        ship,
+        target_id: str | None,
+        target,
+        *,
+        lock_context: str,
+        target_profile: ShipProfile | None = None,
+    ) -> bool:
+        if not target_id or target is None or not target.vital.alive:
+            if target_id:
+                ship.combat.lock_targets.discard(target_id)
+                ship.combat.lock_timers.pop(target_id, None)
+            return False
+        now = float(world.now)
+        if not self._can_target_under_ecm(ship, target_id, now):
+            ship.combat.lock_targets.discard(target_id)
+            ship.combat.lock_timers.pop(target_id, None)
+            return False
+        if target_id in ship.combat.lock_targets:
+            return True
+        if target_id not in ship.combat.lock_timers:
+            profile_for_lock = target_profile if target_profile is not None else target.profile
+            ship.combat.lock_timers[target_id] = self._cached_lock_time(ship.profile, profile_for_lock)
+            if self.detailed_logging and self.logger is not None:
+                self.logger.debug(
+                    f"{lock_context}_start source={ship.ship_id} target={target_id} lock_time={ship.combat.lock_timers[target_id]:.2f}"
+                )
+        return False
+
+    def _advance_target_locks(self, world: WorldState, dt: float) -> None:
+        now = float(world.now)
+        for ship in world.ships.values():
+            if not ship.vital.alive:
+                continue
+            for target_id, left in list(ship.combat.lock_timers.items()):
+                target = world.ships.get(target_id)
+                if target is None or not target.vital.alive or not self._can_target_under_ecm(ship, target_id, now):
+                    ship.combat.lock_timers.pop(target_id, None)
+                    ship.combat.lock_targets.discard(target_id)
+                    continue
+                left -= dt
+                if left <= 0.0:
+                    ship.combat.lock_targets.add(target_id)
+                    ship.combat.lock_timers.pop(target_id, None)
+                    if target_id == ship.combat.current_target and target_id != ship.combat.last_attack_target:
+                        ship.combat.fire_delay_timers[target_id] = self._sample_fire_delay(ship)
+                    if self.detailed_logging and self.logger is not None:
+                        self.logger.debug(f"lock_complete attacker={ship.ship_id} target={target_id}")
+                else:
+                    ship.combat.lock_timers[target_id] = left
+                    if self.detailed_logging and self.logger is not None:
+                        self.logger.debug(
+                            f"lock_progress attacker={ship.ship_id} target={target_id} remaining={left:.2f}"
+                        )
+
     @staticmethod
     def _sample_fire_delay(ship) -> float:
         level = ship.quality.level.value
@@ -465,26 +522,14 @@ class CombatSystem:
                     if target is None or not target.vital.alive:
                         continue
 
-                    if target_id not in source.combat.lock_targets:
-                        if target_id == source.combat.current_target:
-                            continue
-                        left = source.combat.lock_timers.get(target_id)
-                        if left is None:
-                            source.combat.lock_timers[target_id] = self._cached_lock_time(source.profile, target.profile)
-                            if self.detailed_logging and self.logger is not None:
-                                self.logger.debug(
-                                    f"projected_lock_start source={source.ship_id} target={target_id} lock_time={source.combat.lock_timers[target_id]:.2f}"
-                                )
-                            continue
-                        left -= dt
-                        if left <= 0:
-                            source.combat.lock_targets.add(target_id)
-                            source.combat.lock_timers.pop(target_id, None)
-                            if self.detailed_logging and self.logger is not None:
-                                self.logger.debug(f"projected_lock_complete source={source.ship_id} target={target_id}")
-                        else:
-                            source.combat.lock_timers[target_id] = left
-                            continue
+                    if not self._ensure_target_lock(
+                        world,
+                        source,
+                        target_id,
+                        target,
+                        lock_context="projected_lock",
+                    ):
+                        continue
 
                     distance = source.nav.position.distance_to(target.nav.position)
                     max_range = effect.range_m + max(0.0, effect.falloff_m)
@@ -520,14 +565,170 @@ class CombatSystem:
     def _module_in_projected_range(source, target, module) -> bool:
         distance = source.nav.position.distance_to(target.nav.position)
         has_projected = False
+        is_ecm_module = "ecm" in str(getattr(module, "group", "") or "").lower()
         for effect in module.effects:
             if effect.effect_class != EffectClass.PROJECTED:
                 continue
             has_projected = True
-            max_range = effect.range_m + max(0.0, effect.falloff_m)
+            if is_ecm_module and effect.falloff_m > 0.0:
+                max_range = effect.range_m + 3.0 * effect.falloff_m
+            else:
+                max_range = effect.range_m + max(0.0, effect.falloff_m)
             if max_range <= 0 or distance <= max_range:
                 return True
         return not has_projected
+
+    @staticmethod
+    def _ecm_strength_from_effect(effect) -> dict[str, float]:
+        return {
+            "gravimetric": max(0.0, float(effect.projected_add.get("ecm_gravimetric", 0.0) or 0.0)),
+            "ladar": max(0.0, float(effect.projected_add.get("ecm_ladar", 0.0) or 0.0)),
+            "magnetometric": max(0.0, float(effect.projected_add.get("ecm_magnetometric", 0.0) or 0.0)),
+            "radar": max(0.0, float(effect.projected_add.get("ecm_radar", 0.0) or 0.0)),
+        }
+
+    @staticmethod
+    def _target_sensor_type_and_strength(profile: ShipProfile) -> tuple[str, float, bool]:
+        strengths = {
+            "gravimetric": max(0.0, float(getattr(profile, "sensor_strength_gravimetric", 0.0) or 0.0)),
+            "ladar": max(0.0, float(getattr(profile, "sensor_strength_ladar", 0.0) or 0.0)),
+            "magnetometric": max(0.0, float(getattr(profile, "sensor_strength_magnetometric", 0.0) or 0.0)),
+            "radar": max(0.0, float(getattr(profile, "sensor_strength_radar", 0.0) or 0.0)),
+        }
+        sensor_type, sensor_strength = max(strengths.items(), key=lambda item: item[1])
+        has_known_sensor_type = sensor_strength > 0.0
+        if sensor_strength <= 0.0:
+            sensor_strength = 1.0
+        return sensor_type, sensor_strength, has_known_sensor_type
+
+    @staticmethod
+    def _ecm_duration_seconds(module_group: str) -> float:
+        group = (module_group or "").lower()
+        if "drone" in group:
+            return 5.0
+        return 20.0
+
+    @staticmethod
+    def _prune_ecm_sources(ship, now: float) -> set[str]:
+        active_sources: set[str] = set()
+        for source_id, jam_until in list(ship.combat.ecm_jam_sources.items()):
+            if float(jam_until) > now:
+                active_sources.add(str(source_id))
+                continue
+            ship.combat.ecm_jam_sources.pop(source_id, None)
+        return active_sources
+
+    def _can_target_under_ecm(self, ship, target_id: str | None, now: float) -> bool:
+        if not target_id:
+            return False
+        active_sources = self._prune_ecm_sources(ship, now)
+        if not active_sources:
+            return True
+        return str(target_id) in active_sources
+
+    def _enforce_ecm_restrictions(self, ship, now: float) -> None:
+        active_sources = self._prune_ecm_sources(ship, now)
+        if not active_sources:
+            return
+        ship.combat.lock_targets.intersection_update(active_sources)
+        for target_id in list(ship.combat.lock_timers.keys()):
+            if target_id not in active_sources:
+                ship.combat.lock_timers.pop(target_id, None)
+        for target_id in list(ship.combat.fire_delay_timers.keys()):
+            if target_id not in active_sources:
+                ship.combat.fire_delay_timers.pop(target_id, None)
+        for module_id, target_id in list(ship.combat.projected_targets.items()):
+            if target_id not in active_sources:
+                ship.combat.projected_targets.pop(module_id, None)
+        if ship.combat.current_target and ship.combat.current_target not in active_sources:
+            ship.combat.current_target = None
+
+    def _update_ecm_restrictions(self, world: WorldState) -> None:
+        now = float(world.now)
+        for ship in world.ships.values():
+            if not ship.vital.alive:
+                ship.combat.ecm_jam_sources.clear()
+                continue
+            self._enforce_ecm_restrictions(ship, now)
+
+    def _resolve_ecm_cycle(self, world: WorldState, source, module, target_id: str) -> None:
+        target = world.ships.get(target_id)
+        if target is None or not target.vital.alive:
+            return
+        if target_id not in source.combat.lock_targets:
+            return
+        now = float(world.now)
+        distance = source.nav.position.distance_to(target.nav.position)
+        target_sensor_type, target_sensor_strength, has_known_sensor_type = self._target_sensor_type_and_strength(target.profile)
+        if target_sensor_strength <= 0.0:
+            return
+
+        jammed = False
+        ecm_attempted = False
+        jam_chance = 0.0
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            strengths = self._ecm_strength_from_effect(effect)
+            module_jam_strength = strengths.get(target_sensor_type, 0.0)
+            if module_jam_strength <= 0.0 and not has_known_sensor_type:
+                module_jam_strength = max(strengths.values(), default=0.0)
+            if module_jam_strength <= 0.0:
+                continue
+            ecm_attempted = True
+
+            if effect.falloff_m > 0.0:
+                max_range = effect.range_m + 3.0 * effect.falloff_m
+            else:
+                max_range = effect.range_m
+            if max_range > 0 and distance > max_range:
+                continue
+
+            if effect.range_m > 0.0 or effect.falloff_m > 0.0:
+                range_factor = self.pyfa.turret_range_factor(effect.range_m, effect.falloff_m, distance)
+            else:
+                range_factor = 1.0
+
+            effective_strength = module_jam_strength * max(0.0, min(1.0, range_factor))
+            chance = max(0.0, min(1.0, effective_strength / max(1e-9, target_sensor_strength)))
+            jam_chance = max(jam_chance, chance)
+            if random.random() < chance:
+                jammed = True
+                break
+
+        if not ecm_attempted:
+            return
+
+        source.combat.ecm_last_attempt_target = target_id
+        source.combat.ecm_last_attempt_module = module.module_id
+        source.combat.ecm_last_attempt_success = jammed
+        source.combat.ecm_last_attempt_chance = max(0.0, min(1.0, float(jam_chance)))
+        source.combat.ecm_last_attempt_at = now
+        source.combat.ecm_last_attempt_target_by_module[module.module_id] = target_id
+        source.combat.ecm_last_attempt_success_by_module[module.module_id] = bool(jammed)
+        source.combat.ecm_last_attempt_at_by_module[module.module_id] = now
+
+        if not jammed:
+            return
+
+        jam_until = now + self._ecm_duration_seconds(module.group)
+        target.combat.ecm_jam_sources[source.ship_id] = max(
+            float(target.combat.ecm_jam_sources.get(source.ship_id, 0.0) or 0.0),
+            jam_until,
+        )
+        self._enforce_ecm_restrictions(target, now)
+        self._queue_merged_event(
+            "ecm_jam_applied",
+            merge_fields={
+                "source": source.ship_id,
+                "target": target.ship_id,
+                "module": module.module_id,
+                "sensor_type": target_sensor_type,
+            },
+            sum_fields={
+                "chance": jam_chance,
+            },
+        )
 
     @staticmethod
     def _is_weapon_module(group_name: str) -> bool:
@@ -637,42 +838,44 @@ class CombatSystem:
                 ammo_reload_started_this_tick = False
 
                 if module.state == module.state.ACTIVE and cycle_time > 0:
-                    timer_left = ship.combat.module_cycle_timers.get(module.module_id, cycle_time) - dt
-                    if timer_left > 0:
-                        ship.combat.module_cycle_timers[module.module_id] = timer_left
-                        continue
-                    ship.combat.module_cycle_timers.pop(module.module_id, None)
-                    self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
-                    cycle_just_completed = True
-                    if reactivation_delay > 0.0:
-                        ship.combat.module_reactivation_timers[module.module_id] = max(
-                            ship.combat.module_reactivation_timers.get(module.module_id, 0.0),
-                            reactivation_delay,
+                    active_timer = ship.combat.module_cycle_timers.get(module.module_id)
+                    if active_timer is not None:
+                        timer_left = active_timer - dt
+                        if timer_left > 0:
+                            ship.combat.module_cycle_timers[module.module_id] = timer_left
+                            continue
+                        ship.combat.module_cycle_timers.pop(module.module_id, None)
+                        self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
+                        cycle_just_completed = True
+                        if reactivation_delay > 0.0:
+                            ship.combat.module_reactivation_timers[module.module_id] = max(
+                                ship.combat.module_reactivation_timers.get(module.module_id, 0.0),
+                                reactivation_delay,
+                            )
+                        pending_ammo_reload = max(
+                            0.0,
+                            float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
                         )
-                    pending_ammo_reload = max(
-                        0.0,
-                        float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
-                    )
 
-                    if module.charge_capacity > 0 and module.charge_rate > 0.0:
-                        module.charge_remaining = max(0.0, float(module.charge_remaining) - float(module.charge_rate))
-                        if module.charge_remaining <= 0.0:
-                            module.charge_remaining = 0.0
-                            if pending_ammo_reload <= 0.0:
-                                auto_reload_time = max(0.0, float(module.charge_reload_time))
-                                if auto_reload_time > 0.0:
-                                    ship.combat.module_ammo_reload_timers[module.module_id] = max(
-                                        auto_reload_time,
-                                        float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
-                                    )
-                                    ammo_reload_started_this_tick = True
-                                else:
-                                    module.charge_remaining = float(module.charge_capacity)
+                        if module.charge_capacity > 0 and module.charge_rate > 0.0:
+                            module.charge_remaining = max(0.0, float(module.charge_remaining) - float(module.charge_rate))
+                            if module.charge_remaining <= 0.0:
+                                module.charge_remaining = 0.0
+                                if pending_ammo_reload <= 0.0:
+                                    auto_reload_time = max(0.0, float(module.charge_reload_time))
+                                    if auto_reload_time > 0.0:
+                                        ship.combat.module_ammo_reload_timers[module.module_id] = max(
+                                            auto_reload_time,
+                                            float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                                        )
+                                        ammo_reload_started_this_tick = True
+                                    else:
+                                        module.charge_remaining = float(module.charge_capacity)
 
-                    if pending_ammo_reload > 0.0:
-                        ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload
-                        ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
-                        ammo_reload_started_this_tick = True
+                        if pending_ammo_reload > 0.0:
+                            ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload
+                            ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                            ammo_reload_started_this_tick = True
 
                 desired_active = False
                 projected_target_id: str | None = None
@@ -698,35 +901,9 @@ class CombatSystem:
                     ]
                     if candidates:
                         locked_candidates = [ally for ally in candidates if ally.ship_id in ship.combat.lock_targets]
-                        if locked_candidates:
-                            lowest = min(locked_candidates, key=self._hp_ratio)
-                            projected_target_id = lowest.ship_id
-                            desired_active = True
-                        else:
-                            lowest = min(candidates, key=self._hp_ratio)
-                            repair_target_id = lowest.ship_id
-                            projected_target_id = repair_target_id
-                            left = ship.combat.lock_timers.get(repair_target_id)
-                            if left is None:
-                                ship.combat.lock_timers[repair_target_id] = self._cached_lock_time(ship.profile, lowest.profile)
-                                if self.detailed_logging and self.logger is not None:
-                                    self.logger.debug(
-                                        f"remote_lock_start source={ship.ship_id} target={repair_target_id} lock_time={ship.combat.lock_timers[repair_target_id]:.2f}"
-                                    )
-                                desired_active = False
-                            else:
-                                left -= dt
-                                if left <= 0:
-                                    ship.combat.lock_targets.add(repair_target_id)
-                                    ship.combat.lock_timers.pop(repair_target_id, None)
-                                    if self.detailed_logging and self.logger is not None:
-                                        self.logger.debug(
-                                            f"remote_lock_complete source={ship.ship_id} target={repair_target_id}"
-                                        )
-                                    desired_active = True
-                                else:
-                                    ship.combat.lock_timers[repair_target_id] = left
-                                    desired_active = False
+                        lowest = min(locked_candidates or candidates, key=self._hp_ratio)
+                        projected_target_id = lowest.ship_id
+                        desired_active = True
 
                 elif self._is_web_module(group_name):
                     if target is not None and self._module_in_projected_range(ship, target, module):
@@ -735,6 +912,7 @@ class CombatSystem:
 
                 elif self._is_ewar_module(group_name):
                     if cap_ratio >= 0.20:
+                        ewar_target = None
                         current_target_id = ship.combat.projected_targets.get(module.module_id)
                         if current_target_id:
                             current_target = world.ships.get(current_target_id)
@@ -743,15 +921,16 @@ class CombatSystem:
                                 and current_target.vital.alive
                                 and self._module_in_projected_range(ship, current_target, module)
                             ):
-                                projected_target_id = current_target_id
-                                desired_active = True
+                                ewar_target = current_target
                         candidates = [
                             enemy for enemy in enemies_alive
                             if self._module_in_projected_range(ship, enemy, module)
                         ]
-                        if not desired_active and candidates:
-                            chosen = random.choice(candidates)
-                            projected_target_id = chosen.ship_id
+                        if ewar_target is None and candidates:
+                            ewar_target = random.choice(candidates)
+
+                        if ewar_target is not None:
+                            projected_target_id = ewar_target.ship_id
                             desired_active = True
 
                 elif self._is_adc_module(group_name):
@@ -819,15 +998,33 @@ class CombatSystem:
                     else:
                         ship.combat.module_reactivation_timers.pop(module.module_id, None)
 
+                activation_target_id: str | None = None
+                if has_projected:
+                    activation_target_id = projected_target_id
+                elif self._is_weapon_module(group_name):
+                    activation_target_id = ship.combat.current_target
+
+                if desired_active and activation_target_id is not None:
+                    activation_target = world.ships.get(activation_target_id)
+                    if not self._ensure_target_lock(
+                        world,
+                        ship,
+                        activation_target_id,
+                        activation_target,
+                        lock_context="module_lock",
+                    ):
+                        desired_active = False
+
                 if has_projected and projected_target_id is None:
                     desired_active = False
 
                 if desired_active:
-                    if cycle_cost > 0 and cycle_time > 0:
+                    if cycle_time > 0:
                         if cycle_cost > max(0.0, ship.vital.cap):
                             desired_active = False
                         else:
-                            ship.vital.cap = max(0.0, ship.vital.cap - cycle_cost)
+                            if cycle_cost > 0:
+                                ship.vital.cap = max(0.0, ship.vital.cap - cycle_cost)
                             ship.combat.module_cycle_timers[module.module_id] = cycle_time
                             cycle_started = True
                     else:
@@ -840,6 +1037,10 @@ class CombatSystem:
                     ship.combat.projected_targets[module.module_id] = projected_target_id
                 elif module.module_id in ship.combat.projected_targets:
                     ship.combat.projected_targets.pop(module.module_id, None)
+
+                # ECM is resolved once at cycle start so first activation round shows immediate result.
+                if cycle_started and projected_target_id is not None:
+                    self._resolve_ecm_cycle(world, ship, module, projected_target_id)
 
                 if previous_projected_target and (
                     module.state != module.state.ACTIVE or previous_projected_target != projected_target_id
@@ -945,6 +1146,10 @@ class CombatSystem:
                 "missile_explosion_velocity",
                 "missile_max_range",
                 "missile_damage_reduction_factor",
+                "sensor_strength_gravimetric",
+                "sensor_strength_ladar",
+                "sensor_strength_magnetometric",
+                "sensor_strength_radar",
                 "shield_hp",
                 "armor_hp",
                 "structure_hp",
@@ -989,6 +1194,10 @@ class CombatSystem:
             "missile_explosion_velocity",
             "missile_max_range",
             "missile_damage_reduction_factor",
+            "sensor_strength_gravimetric",
+            "sensor_strength_ladar",
+            "sensor_strength_magnetometric",
+            "sensor_strength_radar",
             "shield_hp",
             "armor_hp",
             "structure_hp",
@@ -1033,6 +1242,10 @@ class CombatSystem:
             "missile_explosion_velocity",
             "missile_max_range",
             "missile_damage_reduction_factor",
+            "sensor_strength_gravimetric",
+            "sensor_strength_ladar",
+            "sensor_strength_magnetometric",
+            "sensor_strength_radar",
             "shield_hp",
             "armor_hp",
             "structure_hp",
@@ -1198,6 +1411,8 @@ class CombatSystem:
             self._merged_event_buckets.clear()
             self._merge_window_start_time = None
             self._merge_window_end_time = None
+        self._update_ecm_restrictions(world)
+        self._advance_target_locks(world, dt)
         self._update_module_states(world, dt)
         projected = self._collect_projected_impacts(world, dt)
 
@@ -1317,6 +1532,12 @@ class CombatSystem:
             target_profile = effective_profiles.get(target.ship_id, target.profile)
             turret_active_ratio, missile_active_ratio = self._weapon_activity_ratio(ship)
 
+            if not self._can_target_under_ecm(ship, target_id, float(world.now)):
+                ship.combat.lock_targets.discard(target_id)
+                ship.combat.lock_timers.pop(target_id, None)
+                ship.combat.fire_delay_timers.pop(target_id, None)
+                continue
+
             distance = ship.nav.position.distance_to(target.nav.position)
             if distance > ship_profile.max_target_range:
                 if self.detailed_logging and self.logger is not None:
@@ -1326,28 +1547,14 @@ class CombatSystem:
                 continue
 
             if target_id not in ship.combat.lock_targets:
-                left = ship.combat.lock_timers.get(target_id)
-                if left is None:
-                    ship.combat.lock_timers[target_id] = self._cached_lock_time(ship_profile, target_profile)
-                    if self.detailed_logging and self.logger is not None:
-                        self.logger.debug(
-                            f"lock_start attacker={ship.ship_id} target={target.ship_id} lock_time={ship.combat.lock_timers[target_id]:.2f}"
-                        )
-                else:
-                    left -= dt
-                    if left <= 0:
-                        ship.combat.lock_targets.add(target_id)
-                        ship.combat.lock_timers.pop(target_id, None)
-                        if target_id != ship.combat.last_attack_target:
-                            ship.combat.fire_delay_timers[target_id] = self._sample_fire_delay(ship)
-                        if self.detailed_logging and self.logger is not None:
-                            self.logger.debug(f"lock_complete attacker={ship.ship_id} target={target.ship_id}")
-                    else:
-                        ship.combat.lock_timers[target_id] = left
-                        if self.detailed_logging and self.logger is not None:
-                            self.logger.debug(
-                                f"lock_progress attacker={ship.ship_id} target={target.ship_id} remaining={left:.2f}"
-                            )
+                self._ensure_target_lock(
+                    world,
+                    ship,
+                    target_id,
+                    target,
+                    lock_context="weapon_lock",
+                    target_profile=target_profile,
+                )
                 continue
 
             if target_id != ship.combat.last_attack_target:
