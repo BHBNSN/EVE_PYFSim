@@ -316,7 +316,19 @@ class CommanderAgent(BaseAgent):
         if intent.focus_target:
             focus_key = self._focus_key(self.team, intent.squad_id)
             queue = list(world.squad_focus_queues.get(focus_key, []))
-            queue = [intent.focus_target] + [tid for tid in queue if tid != intent.focus_target]
+            previous_focus = queue[0] if queue else None
+            if previous_focus and previous_focus != intent.focus_target:
+                # On focus switch, drop previous primary focus instead of demoting it to prefocus slot.
+                queue = [
+                    intent.focus_target,
+                    *[
+                        tid
+                        for tid in queue
+                        if tid != intent.focus_target and tid != previous_focus
+                    ],
+                ]
+            else:
+                queue = [intent.focus_target] + [tid for tid in queue if tid != intent.focus_target]
             world.squad_focus_queues[focus_key] = queue
             self._issue_attack(members, intent.focus_target, world.now)
 
