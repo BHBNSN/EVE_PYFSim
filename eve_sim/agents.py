@@ -133,6 +133,10 @@ class CommanderAgent(BaseAgent):
         return f"{team.value}:{squad_id}"
 
     @staticmethod
+    def _intent_key(team: Team, squad_id: str) -> str:
+        return f"{team.value}:{squad_id}"
+
+    @staticmethod
     def _alive_members(world: WorldState, squad_id: str, team: Team) -> list[ShipEntity]:
         members = [
             s
@@ -229,11 +233,13 @@ class CommanderAgent(BaseAgent):
 
     def think(self, world: WorldState) -> None:
         for squad in list(self.squad_ids):
-            intent = world.intents.get(squad)
+            intent_key = self._intent_key(self.team, squad)
+            intent = world.intents.pop(intent_key, None)
+            if intent is None:
+                intent = world.intents.pop(squad, None)
             if intent is None:
                 continue
             self._dispatch_intent(world, intent)
-            world.intents.pop(squad, None)
         for squad in list(self.squad_ids):
             self._update_squad_focus_state(world, squad)
 
@@ -346,7 +352,9 @@ class CommanderAgent(BaseAgent):
                         )
                     )
             if intent.propulsion_active is not None:
-                world.squad_propulsion_commands[intent.squad_id] = bool(intent.propulsion_active)
+                prop_key = self._focus_key(self.team, intent.squad_id)
+                world.squad_propulsion_commands[prop_key] = bool(intent.propulsion_active)
+                world.squad_propulsion_commands.pop(intent.squad_id, None)
                 ship.order_queue = [o for o in ship.order_queue if o.kind != "PROPULSION"]
                 ship.order_queue.append(
                     Order(

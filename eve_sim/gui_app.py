@@ -2639,7 +2639,20 @@ class MainWindow(QMainWindow):
     def _is_ship_visible(self, ship_id: str) -> bool:
         return ship_id not in self._undeployed_ship_ids
 
+    @staticmethod
+    def _parse_team_squad_key(scoped_key: str, default_team: Team) -> tuple[Team, str]:
+        text = str(scoped_key or "")
+        if ":" in text:
+            head, tail = text.split(":", 1)
+            if tail and head in (Team.BLUE.value, Team.RED.value):
+                return Team(head), tail
+        return default_team, text
+
     def _guidance_target_for_squad(self, squad_id: str) -> Vector2 | None:
+        scoped_key = self._focus_key(self.controlled_team, squad_id)
+        target = self._squad_guidance_targets.get(scoped_key)
+        if target is not None:
+            return target
         return self._squad_guidance_targets.get(squad_id)
 
     def _inducible_controlled_squad_ids(self) -> list[str]:
@@ -2972,7 +2985,30 @@ class MainWindow(QMainWindow):
         return side
 
     def _get_squad_propulsion_state(self, squad_id: str) -> bool:
+        return self._get_team_propulsion_state(self.controlled_team, squad_id)
+
+    def _get_team_propulsion_state(self, team: Team, squad_id: str) -> bool:
+        key = self._focus_key(team, squad_id)
+        if key in self.engine.world.squad_propulsion_commands:
+            return bool(self.engine.world.squad_propulsion_commands.get(key, False))
         return bool(self.engine.world.squad_propulsion_commands.get(squad_id, False))
+
+    def _set_team_propulsion_state(self, team: Team, squad_id: str, active: bool) -> None:
+        key = self._focus_key(team, squad_id)
+        self.engine.world.squad_propulsion_commands[key] = bool(active)
+        self.engine.world.squad_propulsion_commands.pop(squad_id, None)
+
+    def _get_team_intent(self, team: Team, squad_id: str) -> FleetIntent | None:
+        key = self._focus_key(team, squad_id)
+        intent = self.engine.world.intents.get(key)
+        if intent is not None:
+            return intent
+        return self.engine.world.intents.get(squad_id)
+
+    def _set_team_intent(self, team: Team, squad_id: str, intent: FleetIntent) -> None:
+        key = self._focus_key(team, squad_id)
+        self.engine.world.intents[key] = intent
+        self.engine.world.intents.pop(squad_id, None)
 
     def on_language_changed(self, _index: int) -> None:
         lang = str(self.lang_combo.currentData() or "zh_CN")
@@ -3017,16 +3053,30 @@ class MainWindow(QMainWindow):
 
     def toggle_selected_squad_propulsion(self) -> None:
         squad = self.ui_state.selected_squad
-        old = self.engine.world.intents.get(squad)
         new_state = not self._get_squad_propulsion_state(squad)
-        self.engine.world.squad_propulsion_commands[squad] = new_state
-        self.engine.world.intents[squad] = FleetIntent(
+        self._log_user_action("toggle_propulsion", squad=squad, enabled=new_state)
+
+        if self.network_mode == "client" and self.lan_client is not None:
+            self.lan_client.send_command({"kind": CMD_SQUAD_PROPULSION, "squad_id": squad, "active": new_state})
+            old = self._get_team_intent(self.controlled_team, squad)
+            self._set_team_propulsion_state(self.controlled_team, squad, new_state)
+            self._set_team_intent(self.controlled_team, squad, FleetIntent(
+                squad_id=squad,
+                target_position=old.target_position if old else None,
+                focus_target=old.focus_target if old else None,
+                propulsion_active=new_state,
+            ))
+            self._refresh_propulsion_button_text()
+            return
+
+        old = self._get_team_intent(self.controlled_team, squad)
+        self._set_team_propulsion_state(self.controlled_team, squad, new_state)
+        self._set_team_intent(self.controlled_team, squad, FleetIntent(
             squad_id=squad,
             target_position=old.target_position if old else None,
             focus_target=old.focus_target if old else None,
             propulsion_active=new_state,
-        )
-        self._log_user_action("toggle_propulsion", squad=squad, enabled=new_state)
+        ))
         self._refresh_propulsion_button_text()
 
     def _refresh_common_charge_modules(self) -> None:
@@ -3377,15 +3427,19 @@ class MainWindow(QMainWindow):
             ship.combat.fire_delay_timers.clear()
             self._undeployed_ship_ids.discard(ship.ship_id)
         for squad in affected_squads:
+            scoped_key = self._focus_key(team, squad)
+            self._squad_approach_targets.pop(scoped_key, None)
+            self._squad_guidance_targets.pop(scoped_key, None)
+            # Backward compatibility for stale unscoped cache keys.
             self._squad_approach_targets.pop(squad, None)
             self._squad_guidance_targets.pop(squad, None)
-            old = self.engine.world.intents.get(squad)
-            self.engine.world.intents[squad] = FleetIntent(
+            old = self._get_team_intent(team, squad)
+            self._set_team_intent(team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=None,
                 focus_target=old.focus_target if old else None,
                 propulsion_active=old.propulsion_active if old else None,
-            )
+            ))
         if affected_squads:
             self._sync_blue_squads()
 
@@ -3425,34 +3479,36 @@ class MainWindow(QMainWindow):
 
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_APPROACH, "squad_id": squad, "target_id": target})
-            self._squad_approach_targets[squad] = target
+            scoped_key = self._focus_key(self.controlled_team, squad)
+            self._squad_approach_targets[scoped_key] = target
             target_ship = self.engine.world.ships.get(target)
             if target_ship is not None and target_ship.vital.alive:
-                self._squad_guidance_targets[squad] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
-                old = self.engine.world.intents.get(squad)
-                prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-                self.engine.world.intents[squad] = FleetIntent(
+                self._squad_guidance_targets[scoped_key] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
+                old = self._get_team_intent(self.controlled_team, squad)
+                prop_state = self._get_team_propulsion_state(self.controlled_team, squad)
+                self._set_team_intent(self.controlled_team, squad, FleetIntent(
                     squad_id=squad,
                     target_position=Vector2(target_ship.nav.position.x, target_ship.nav.position.y),
                     focus_target=old.focus_target if old else None,
                     propulsion_active=prop_state,
-                )
+                ))
             return
 
         def apply() -> None:
             target_ship = self.engine.world.ships.get(target)
             if target_ship is None or not target_ship.vital.alive:
                 return
-            self._squad_approach_targets[squad] = target
-            self._squad_guidance_targets[squad] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            scoped_key = self._focus_key(self.controlled_team, squad)
+            self._squad_approach_targets[scoped_key] = target
+            self._squad_guidance_targets[scoped_key] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
+            old = self._get_team_intent(self.controlled_team, squad)
+            prop_state = self._get_team_propulsion_state(self.controlled_team, squad)
+            self._set_team_intent(self.controlled_team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=Vector2(target_ship.nav.position.x, target_ship.nav.position.y),
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
-            )
+            ))
 
         self._enqueue_tick_op(apply)
 
@@ -3460,20 +3516,22 @@ class MainWindow(QMainWindow):
         if not self._squad_approach_targets:
             return
         stale: list[str] = []
-        for squad, target_id in self._squad_approach_targets.items():
+        for scoped_key, target_id in list(self._squad_approach_targets.items()):
+            team, squad = self._parse_team_squad_key(scoped_key, self.controlled_team)
             target_ship = self.engine.world.ships.get(target_id)
             if target_ship is None or not target_ship.vital.alive:
-                stale.append(squad)
+                stale.append(scoped_key)
                 continue
-            self._squad_guidance_targets[squad] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            scoped_write_key = self._focus_key(team, squad)
+            self._squad_guidance_targets[scoped_write_key] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
+            old = self._get_team_intent(team, squad)
+            prop_state = self._get_team_propulsion_state(team, squad)
+            self._set_team_intent(team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=Vector2(target_ship.nav.position.x, target_ship.nav.position.y),
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
-            )
+            ))
         for squad in stale:
             self._squad_approach_targets.pop(squad, None)
             self._squad_guidance_targets.pop(squad, None)
@@ -3482,21 +3540,23 @@ class MainWindow(QMainWindow):
         self._log_user_action("squad_move", squad=squad_id, x=target.x, y=target.y)
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command({"kind": CMD_SQUAD_MOVE, "squad_id": squad_id, "x": target.x, "y": target.y})
-            self._squad_approach_targets.pop(squad_id, None)
-            self._squad_guidance_targets[squad_id] = Vector2(target.x, target.y)
-            old = self.engine.world.intents.get(squad_id)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad_id, False)
-            self.engine.world.intents[squad_id] = FleetIntent(
+            scoped_key = self._focus_key(self.controlled_team, squad_id)
+            self._squad_approach_targets.pop(scoped_key, None)
+            self._squad_guidance_targets[scoped_key] = Vector2(target.x, target.y)
+            old = self._get_team_intent(self.controlled_team, squad_id)
+            prop_state = self._get_team_propulsion_state(self.controlled_team, squad_id)
+            self._set_team_intent(self.controlled_team, squad_id, FleetIntent(
                 squad_id=squad_id,
                 target_position=target,
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
-            )
+            ))
             return
 
         def apply() -> None:
-            self._squad_approach_targets.pop(squad_id, None)
-            self._squad_guidance_targets[squad_id] = Vector2(target.x, target.y)
+            scoped_key = self._focus_key(self.controlled_team, squad_id)
+            self._squad_approach_targets.pop(scoped_key, None)
+            self._squad_guidance_targets[scoped_key] = Vector2(target.x, target.y)
             members = [
                 s
                 for s in self.engine.world.ships.values()
@@ -3505,14 +3565,14 @@ class MainWindow(QMainWindow):
             for ship in members:
                 ship.order_queue = [o for o in ship.order_queue if o.kind != "MOVE"]
 
-            old = self.engine.world.intents.get(squad_id)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad_id, False)
-            self.engine.world.intents[squad_id] = FleetIntent(
+            old = self._get_team_intent(self.controlled_team, squad_id)
+            prop_state = self._get_team_propulsion_state(self.controlled_team, squad_id)
+            self._set_team_intent(self.controlled_team, squad_id, FleetIntent(
                 squad_id=squad_id,
                 target_position=target,
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
-            )
+            ))
 
         self._enqueue_tick_op(apply)
 
@@ -3533,14 +3593,14 @@ class MainWindow(QMainWindow):
             return
 
         def apply() -> None:
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            old = self._get_team_intent(self.controlled_team, squad)
+            prop_state = self._get_team_propulsion_state(self.controlled_team, squad)
+            self._set_team_intent(self.controlled_team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=old.target_position if old else None,
                 focus_target=target_id,
                 propulsion_active=prop_state,
-            )
+            ))
 
         self._enqueue_tick_op(apply)
         self.ui_state.selected_enemy_target = target_id
@@ -3650,14 +3710,14 @@ class MainWindow(QMainWindow):
             self.engine.world.squad_focus_queues.pop(focus_key, None)
             self.engine.world.squad_prelocked_targets.pop(focus_key, None)
             self.engine.world.squad_prelock_timers.pop(focus_key, None)
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            old = self._get_team_intent(self.controlled_team, squad)
+            prop_state = self._get_team_propulsion_state(self.controlled_team, squad)
+            self._set_team_intent(self.controlled_team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=old.target_position if old else None,
                 focus_target=None,
                 propulsion_active=prop_state,
-            )
+            ))
             for ship in self.engine.world.ships.values():
                 if ship.team != self.controlled_team or ship.squad_id != squad:
                     continue
@@ -3864,53 +3924,55 @@ class MainWindow(QMainWindow):
                 target = Vector2(float(cmd.get("x", 0.0)), float(cmd.get("y", 0.0)))
             except Exception:
                 return
-            self._squad_approach_targets.pop(squad, None)
-            self._squad_guidance_targets[squad] = Vector2(target.x, target.y)
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            scoped_key = self._focus_key(team, squad)
+            self._squad_approach_targets.pop(scoped_key, None)
+            self._squad_guidance_targets[scoped_key] = Vector2(target.x, target.y)
+            old = self._get_team_intent(team, squad)
+            prop_state = self._get_team_propulsion_state(team, squad)
+            self._set_team_intent(team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=target,
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
-            )
+            ))
         elif kind == CMD_SQUAD_APPROACH:
             target_id = str(cmd.get("target_id", "")).strip()
             target_ship = self.engine.world.ships.get(target_id)
             if not target_id or target_ship is None or not target_ship.vital.alive:
                 return
-            self._squad_approach_targets[squad] = target_id
-            self._squad_guidance_targets[squad] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            scoped_key = self._focus_key(team, squad)
+            self._squad_approach_targets[scoped_key] = target_id
+            self._squad_guidance_targets[scoped_key] = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
+            old = self._get_team_intent(team, squad)
+            prop_state = self._get_team_propulsion_state(team, squad)
+            self._set_team_intent(team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=Vector2(target_ship.nav.position.x, target_ship.nav.position.y),
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
-            )
+            ))
         elif kind == CMD_SQUAD_ATTACK:
             target_id = str(cmd.get("target_id", "")).strip()
             if not target_id:
                 return
-            old = self.engine.world.intents.get(squad)
-            prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-            self.engine.world.intents[squad] = FleetIntent(
+            old = self._get_team_intent(team, squad)
+            prop_state = self._get_team_propulsion_state(team, squad)
+            self._set_team_intent(team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=old.target_position if old else None,
                 focus_target=target_id,
                 propulsion_active=prop_state,
-            )
+            ))
         elif kind == CMD_SQUAD_PROPULSION:
-            old = self.engine.world.intents.get(squad)
+            old = self._get_team_intent(team, squad)
             new_state = bool(cmd.get("active", False))
-            self.engine.world.squad_propulsion_commands[squad] = new_state
-            self.engine.world.intents[squad] = FleetIntent(
+            self._set_team_propulsion_state(team, squad, new_state)
+            self._set_team_intent(team, squad, FleetIntent(
                 squad_id=squad,
                 target_position=old.target_position if old else None,
                 focus_target=old.focus_target if old else None,
                 propulsion_active=new_state,
-            )
+            ))
         elif kind in SQUAD_FOCUS_COMMANDS:
             focus_key = self._focus_key(team, squad)
             target_id = str(cmd.get("target_id", "")).strip()
@@ -3938,14 +4000,14 @@ class MainWindow(QMainWindow):
                 self.engine.world.squad_focus_queues.pop(focus_key, None)
                 self.engine.world.squad_prelocked_targets.pop(focus_key, None)
                 self.engine.world.squad_prelock_timers.pop(focus_key, None)
-                old = self.engine.world.intents.get(squad)
-                prop_state = self.engine.world.squad_propulsion_commands.get(squad, False)
-                self.engine.world.intents[squad] = FleetIntent(
+                old = self._get_team_intent(team, squad)
+                prop_state = self._get_team_propulsion_state(team, squad)
+                self._set_team_intent(team, squad, FleetIntent(
                     squad_id=squad,
                     target_position=old.target_position if old else None,
                     focus_target=None,
                     propulsion_active=prop_state,
-                )
+                ))
                 for ship in self.engine.world.ships.values():
                     if ship.team != team or ship.squad_id != squad:
                         continue
