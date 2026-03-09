@@ -131,3 +131,5 @@ gitversion
 eve_sim/__pycache__/*.pyc
 logs/
 Pyfa-master/
+tests/
+tools/
