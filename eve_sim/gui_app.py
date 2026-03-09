@@ -151,6 +151,17 @@ class SetupRow:
     is_leader: bool = False
 
 
+@dataclass(slots=True)
+class AreaCycleOverlay:
+    ship_id: str
+    module_id: str
+    center: Vector2
+    radius_m: float
+    fill_color: QColor
+    border_color: QColor
+    expires_at: float
+
+
 class FleetSetupTableModel(QAbstractTableModel):
     HEADER_KEYS = [
         "setup_col_team",
@@ -1812,6 +1823,22 @@ class ShipStatusDialog(QDialog):
         return "ecm" in (group_name or "").lower()
 
     @staticmethod
+    def _is_area_effect_group(group_name: str) -> bool:
+        group = (group_name or "").strip().lower()
+        return group in {"command burst", "smart bomb", "structure area denial module", "burst jammer"}
+
+    @staticmethod
+    def _module_has_projected_effects(module: ModuleRuntime) -> bool:
+        return any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects)
+
+    def _module_requires_target(self, module: ModuleRuntime) -> bool:
+        if self._is_weapon_group(module.group):
+            return True
+        if self._is_area_effect_group(module.group):
+            return False
+        return self._module_has_projected_effects(module)
+
+    @staticmethod
     def _fmt_charge_amount(value: float) -> str:
         rounded = round(float(value))
         if abs(float(value) - rounded) < 1e-6:
@@ -2036,9 +2063,15 @@ class ShipStatusDialog(QDialog):
             else:
                 for module in ship.runtime.modules:
                     effective_state = module.state.value
-                    has_projected = any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects)
-                    target_required = has_projected or self._is_weapon_group(module.group)
-                    current_target_id = projected_by_module.get(module.module_id) if has_projected else ship.combat.current_target
+                    has_projected = self._module_has_projected_effects(module)
+                    is_area_effect = self._is_area_effect_group(module.group)
+                    target_required = self._module_requires_target(module)
+                    if self._is_weapon_group(module.group):
+                        current_target_id = ship.combat.current_target
+                    elif has_projected and not is_area_effect:
+                        current_target_id = projected_by_module.get(module.module_id)
+                    else:
+                        current_target_id = None
                     if effective_state == "ACTIVE" and target_required and not current_target_id:
                         effective_state = "ONLINE"
                     cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
@@ -2049,7 +2082,7 @@ class ShipStatusDialog(QDialog):
                     line = f"  - {module.module_id} | {get_type_display_name(module.group, language=lang)} | {tr(lang, 'status_state')}={state_label}"
                     line += self._format_module_charge_status(lang, ship, module)
                     line += self._format_module_time_status(lang, ship, module, effective_state, cooldown_left)
-                    if has_projected:
+                    if has_projected and not is_area_effect:
                         target_id = projected_by_module.get(module.module_id, tr(lang, "status_target_none"))
                         line += f" | {tr(lang, 'status_target')}={target_id}"
                         if self._is_ecm_group(module.group):
@@ -2069,9 +2102,15 @@ class ShipStatusDialog(QDialog):
                     state_key = runtime_by_slot.get(idx, "UNMODELED")
                 runtime_module = runtime_module_by_slot.get(idx)
                 if runtime_module is not None:
-                    has_projected = any(effect.effect_class == EffectClass.PROJECTED for effect in runtime_module.effects)
-                    target_required = has_projected or self._is_weapon_group(runtime_module.group)
-                    current_target_id = projected_by_slot.get(idx) if has_projected else ship.combat.current_target
+                    has_projected = self._module_has_projected_effects(runtime_module)
+                    is_area_effect = self._is_area_effect_group(runtime_module.group)
+                    target_required = self._module_requires_target(runtime_module)
+                    if self._is_weapon_group(runtime_module.group):
+                        current_target_id = ship.combat.current_target
+                    elif has_projected and not is_area_effect:
+                        current_target_id = projected_by_slot.get(idx)
+                    else:
+                        current_target_id = None
                     if state_key == "ACTIVE" and target_required and not current_target_id:
                         state_key = "ONLINE"
                 cooldown_left = 0.0
@@ -2085,8 +2124,8 @@ class ShipStatusDialog(QDialog):
                 if runtime_module is not None:
                     line += self._format_module_charge_status(lang, ship, runtime_module)
                     line += self._format_module_time_status(lang, ship, runtime_module, state_key, cooldown_left)
-                    has_projected = any(effect.effect_class == EffectClass.PROJECTED for effect in runtime_module.effects)
-                    if has_projected:
+                    has_projected = self._module_has_projected_effects(runtime_module)
+                    if has_projected and not self._is_area_effect_group(runtime_module.group):
                         target_id = projected_by_slot.get(idx, tr(lang, "status_target_none"))
                         line += f" | {tr(lang, 'status_target')}={target_id}"
                         if self._is_ecm_group(runtime_module.group):
@@ -2151,6 +2190,7 @@ class BattleCanvas(QWidget):
         self._bg_cache = None
         self._bg_cache_w = 0
         self._bg_cache_h = 0
+        self._area_cycle_overlays: dict[tuple[str, str], AreaCycleOverlay] = {}
 
     @staticmethod
     def _focus_key(team: Team, squad_id: str) -> str:
@@ -2333,6 +2373,74 @@ class BattleCanvas(QWidget):
             leader_ship = members[0] if members else None
         return leader_ship
 
+    @staticmethod
+    def _module_area_style(module: ModuleRuntime) -> tuple[QColor, QColor] | None:
+        group = str(getattr(module, "group", "") or "").strip().lower()
+        if group == "command burst":
+            return QColor(88, 214, 141, 13), QColor(88, 214, 141, 13)
+        if group in {"smart bomb", "structure area denial module"}:
+            return QColor(255, 145, 77, 13), QColor(255, 165, 96, 13)
+        if group == "burst jammer":
+            return QColor(102, 204, 255, 13), QColor(122, 214, 255, 13)
+        return None
+
+    @staticmethod
+    def _module_area_radius(module: ModuleRuntime) -> float:
+        radius_m = 0.0
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            radius_m = max(radius_m, max(0.0, float(effect.range_m or 0.0)))
+        return radius_m
+
+    def _sync_area_cycle_overlays(self) -> None:
+        now = float(self.engine.world.now)
+        cycle_restart_margin = 0.2
+        for key, overlay in list(self._area_cycle_overlays.items()):
+            ship = self.engine.world.ships.get(overlay.ship_id)
+            if ship is None or ship.runtime is None or not ship.vital.alive or not self.ship_visible_getter(overlay.ship_id):
+                self._area_cycle_overlays.pop(key, None)
+                continue
+            module = next((m for m in ship.runtime.modules if m.module_id == overlay.module_id), None)
+            if module is None or module.state != ModuleState.ACTIVE:
+                self._area_cycle_overlays.pop(key, None)
+                continue
+            cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(overlay.module_id, 0.0) or 0.0))
+            if cycle_left <= 0.0 or now >= overlay.expires_at:
+                self._area_cycle_overlays.pop(key, None)
+
+        for ship in self.engine.world.ships.values():
+            if not ship.vital.alive or ship.runtime is None or not self.ship_visible_getter(ship.ship_id):
+                continue
+            for module in ship.runtime.modules:
+                style = self._module_area_style(module)
+                if style is None:
+                    continue
+                cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0))
+                if module.state != ModuleState.ACTIVE or cycle_left <= 0.0:
+                    continue
+                radius_m = self._module_area_radius(module)
+                if radius_m <= 0.0:
+                    continue
+                key = (ship.ship_id, module.module_id)
+                overlay = self._area_cycle_overlays.get(key)
+                remaining = max(0.0, overlay.expires_at - now) if overlay is not None else 0.0
+                if overlay is not None and cycle_left <= remaining + cycle_restart_margin:
+                    continue
+                self._area_cycle_overlays[key] = AreaCycleOverlay(
+                    ship_id=ship.ship_id,
+                    module_id=module.module_id,
+                    center=Vector2(ship.nav.position.x, ship.nav.position.y),
+                    radius_m=radius_m,
+                    fill_color=style[0],
+                    border_color=style[1],
+                    expires_at=now + cycle_left,
+                )
+
+    def _iter_active_area_overlays(self) -> list[AreaCycleOverlay]:
+        self._sync_area_cycle_overlays()
+        return list(self._area_cycle_overlays.values())
+
     def paintEvent(self, event) -> None:
         del event
         painter = QPainter(self)
@@ -2348,6 +2456,16 @@ class BattleCanvas(QWidget):
             r = max(3, int(beacon.radius * self.zoom))
             painter.setPen(QPen(QColor(255, 182, 74), 2))
             painter.drawEllipse(x - r, y - r, r * 2, r * 2)
+
+        for overlay in self._iter_active_area_overlays():
+            x, y = self._to_screen(overlay.center)
+            radius_px = max(1, int(overlay.radius_m * self.zoom))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(overlay.fill_color)
+            painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(overlay.border_color, 1))
+            painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
 
         leader_ship = self._selected_squad_leader_ship()
         if leader_ship is not None:
@@ -4270,6 +4388,21 @@ class MainWindow(QMainWindow):
             else:
                 ship.combat.projected_targets.clear()
 
+            module_cycle_timers = raw.get("module_cycle_timers")
+            if isinstance(module_cycle_timers, dict):
+                parsed_cycle_timers: dict[str, float] = {}
+                for module_id, timer_left in module_cycle_timers.items():
+                    mid = str(module_id)
+                    if not mid:
+                        continue
+                    try:
+                        parsed_cycle_timers[mid] = max(0.0, float(timer_left))
+                    except Exception:
+                        continue
+                ship.combat.module_cycle_timers = parsed_cycle_timers
+            else:
+                ship.combat.module_cycle_timers.clear()
+
             ecm_sources = raw.get("ecm_jam_sources")
             if isinstance(ecm_sources, dict):
                 parsed_sources: dict[str, float] = {}
@@ -4352,6 +4485,7 @@ class MainWindow(QMainWindow):
         raw_pos = raw.get("position")
         raw_vel = raw.get("velocity")
         raw_projected = raw.get("projected_targets")
+        raw_cycle_timers = raw.get("module_cycle_timers")
         raw_ecm_sources = raw.get("ecm_jam_sources")
         raw_ecm_target_by_module = raw.get("ecm_last_attempt_target_by_module")
         raw_ecm_success_by_module = raw.get("ecm_last_attempt_success_by_module")
@@ -4360,11 +4494,21 @@ class MainWindow(QMainWindow):
         pos: dict = raw_pos if isinstance(raw_pos, dict) else {}
         vel: dict = raw_vel if isinstance(raw_vel, dict) else {}
         projected: dict = raw_projected if isinstance(raw_projected, dict) else {}
+        cycle_timers: dict = raw_cycle_timers if isinstance(raw_cycle_timers, dict) else {}
         ecm_sources: dict = raw_ecm_sources if isinstance(raw_ecm_sources, dict) else {}
         ecm_target_by_module: dict = raw_ecm_target_by_module if isinstance(raw_ecm_target_by_module, dict) else {}
         ecm_success_by_module: dict = raw_ecm_success_by_module if isinstance(raw_ecm_success_by_module, dict) else {}
         ecm_at_by_module: dict = raw_ecm_at_by_module if isinstance(raw_ecm_at_by_module, dict) else {}
         module_states: dict = raw_module_states if isinstance(raw_module_states, dict) else {}
+        cycle_timers_sig: list[tuple[str, float]] = []
+        for module_id, timer_left in cycle_timers.items():
+            mid = str(module_id)
+            if not mid:
+                continue
+            try:
+                cycle_timers_sig.append((mid, round(float(timer_left), 2)))
+            except Exception:
+                continue
         ecm_sources_sig: list[tuple[str, float]] = []
         for source_id, jam_until in ecm_sources.items():
             sid = str(source_id)
@@ -4403,6 +4547,7 @@ class MainWindow(QMainWindow):
             round(float(raw.get("cap_max", 0.0)), 1),
             str(raw.get("target", "") or ""),
             tuple(sorted((str(k), str(v)) for k, v in projected.items())),
+            tuple(sorted(cycle_timers_sig)),
             tuple(sorted(ecm_sources_sig)),
             str(raw.get("ecm_last_attempt_target", "") or ""),
             str(raw.get("ecm_last_attempt_module", "") or ""),

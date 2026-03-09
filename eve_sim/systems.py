@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .fleet_setup import recompute_profile_from_pyfa_runtime
+from .fleet_setup import get_runtime_resolve_cache_key, resolve_runtime_from_pyfa_runtime
 from .fit_runtime import EffectClass, ProjectedImpact, RuntimeStatEngine
 from .math2d import Vector2
 from .models import ShipProfile, Team
@@ -490,6 +490,7 @@ class CombatSystem:
                         continue
                     if not module.is_active_for(effect.state_required):
                         continue
+
                     target_id = source.combat.projected_targets.get(module.module_id)
                     if not target_id:
                         continue
@@ -678,6 +679,42 @@ class CombatSystem:
         )
 
     @staticmethod
+    def _module_is_command_burst_module(module) -> bool:
+        return CombatSystem._module_group_has_equal(
+            module,
+            (
+                "command burst",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_smart_bomb_module(module) -> bool:
+        return CombatSystem._module_group_has_equal(
+            module,
+            (
+                "smart bomb",
+                "structure area denial module",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_burst_jammer_module(module) -> bool:
+        return CombatSystem._module_group_has_equal(
+            module,
+            (
+                "burst jammer",
+            ),
+        )
+
+    @staticmethod
+    def _module_is_area_effect_module(module) -> bool:
+        return (
+            CombatSystem._module_is_command_burst_module(module)
+            or CombatSystem._module_is_smart_bomb_module(module)
+            or CombatSystem._module_is_burst_jammer_module(module)
+        )
+
+    @staticmethod
     def _cap_ratio(ship) -> float:
         return max(0.0, float(ship.vital.cap) / max(1.0, float(ship.vital.cap_max)))
 
@@ -733,6 +770,114 @@ class CombatSystem:
 
     def _candidates_in_projected_range(self, source, module, candidates: list) -> list:
         return [candidate for candidate in candidates if candidate.vital.alive and self._module_in_projected_range(source, candidate, module)]
+
+    def _iter_area_targets_in_range(self, world: WorldState, source, module, effect) -> list:
+        targets: list = []
+        include_self = self._module_is_command_burst_module(module)
+        same_team_only = self._module_is_command_burst_module(module)
+        max_range = self._projected_max_range(effect)
+
+        for candidate in world.ships.values():
+            if not candidate.vital.alive:
+                continue
+            if candidate.ship_id == source.ship_id and not include_self:
+                continue
+            if same_team_only and candidate.team != source.team:
+                continue
+            distance = source.nav.position.distance_to(candidate.nav.position)
+            if max_range > 0.0 and distance > max_range:
+                continue
+            targets.append(candidate)
+
+        return targets
+
+    def _command_booster_snapshot_for_target(self, source, target) -> dict[str, Any] | None:
+        if source.runtime is None or target.team != source.team or not target.vital.alive:
+            return None
+        blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
+        if not isinstance(blueprint, dict):
+            return None
+
+        state_by_module_id: dict[str, str] = {}
+        has_active_in_range = False
+        for module in source.runtime.modules:
+            if not self._module_is_command_burst_module(module):
+                continue
+            state_value = str(module.state.value or "ONLINE").upper()
+            if state_value == "ACTIVE" and self._module_in_projected_range(source, target, module):
+                state_by_module_id[module.module_id] = "ACTIVE"
+                has_active_in_range = True
+            elif state_value == "OVERHEATED" and self._module_in_projected_range(source, target, module):
+                state_by_module_id[module.module_id] = "OVERHEATED"
+                has_active_in_range = True
+            else:
+                state_by_module_id[module.module_id] = "ONLINE" if state_value in {"ACTIVE", "OVERHEATED"} else state_value
+
+        if not has_active_in_range:
+            return None
+
+        return {
+            "fit_key": str(source.runtime.fit_key or ""),
+            "blueprint": blueprint,
+            "state_by_module_id": state_by_module_id,
+        }
+
+    def _collect_command_booster_snapshots(self, world: WorldState) -> dict[str, list[dict[str, Any]]]:
+        snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
+        friendly_sources = [
+            ship
+            for ship in world.ships.values()
+            if ship.vital.alive and ship.runtime is not None and any(self._module_is_command_burst_module(module) for module in ship.runtime.modules)
+        ]
+        if not friendly_sources:
+            return snapshots_by_ship
+
+        for target in world.ships.values():
+            if not target.vital.alive or target.runtime is None:
+                continue
+            target_snapshots: list[dict[str, Any]] = []
+            for source in friendly_sources:
+                snapshot = self._command_booster_snapshot_for_target(source, target)
+                if snapshot is not None:
+                    target_snapshots.append(snapshot)
+            if target_snapshots:
+                snapshots_by_ship[target.ship_id] = target_snapshots
+
+        return snapshots_by_ship
+
+    def _refresh_effective_runtimes_from_pyfa(self, world: WorldState, command_boosters_by_ship: dict[str, list[dict[str, Any]]]) -> None:
+        for ship in world.ships.values():
+            if not ship.vital.alive or ship.runtime is None:
+                continue
+
+            booster_snapshots = command_boosters_by_ship.get(ship.ship_id)
+            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots)
+            cached_signature = ship.runtime.diagnostics.get("pyfa_resolve_signature")
+            cached_base_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
+            if cache_key is not None and cached_signature == cache_key and isinstance(cached_base_profile, ShipProfile):
+                ship.profile = replace(cached_base_profile)
+                continue
+
+            resolved = resolve_runtime_from_pyfa_runtime(ship.runtime, booster_snapshots)
+            if resolved is None:
+                if isinstance(cached_base_profile, ShipProfile):
+                    ship.profile = replace(cached_base_profile)
+                continue
+            resolved_runtime, resolved_profile = resolved
+            if cache_key is not None:
+                resolved_runtime.diagnostics["pyfa_resolve_signature"] = cache_key
+            resolved_runtime.diagnostics["pyfa_base_profile"] = replace(resolved_profile)
+            ship.runtime = resolved_runtime
+            ship.profile = resolved_profile
+
+    def _module_has_area_enemies_in_range(self, world: WorldState, source, module) -> bool:
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            for candidate in self._iter_area_targets_in_range(world, source, module, effect):
+                if candidate.team != source.team:
+                    return True
+        return False
 
     @staticmethod
     def _ship_id_in_pool(ship_id: str, pool: list) -> bool:
@@ -867,6 +1012,29 @@ class CombatSystem:
 
     def _module_decision_rule(self, module) -> ModuleDecisionRule:
         # Central policy router: extend here when adding new active module behaviors.
+        if self._module_is_command_burst_module(module):
+            return ModuleDecisionRule(
+                rule_id="area_command_burst",
+                activation_mode="always",
+                target_mode="none",
+            )
+
+        if self._module_is_smart_bomb_module(module):
+            return ModuleDecisionRule(
+                rule_id="area_smart_bomb",
+                activation_mode="enemy_in_area",
+                target_mode="none",
+                cap_threshold=0.15,
+            )
+
+        if self._module_is_burst_jammer_module(module):
+            return ModuleDecisionRule(
+                rule_id="area_burst_jammer",
+                activation_mode="enemy_in_area",
+                target_mode="none",
+                cap_threshold=0.15,
+            )
+
         if self._module_is_weapon_module(module):
             return ModuleDecisionRule(
                 rule_id="weapon_focus_only",
@@ -943,7 +1111,7 @@ class CombatSystem:
             target_mode="none",
         )
 
-    def _should_activate_module(self, world: WorldState, ship, rule: ModuleDecisionRule, target_id: str | None) -> bool:
+    def _should_activate_module(self, world: WorldState, ship, module, rule: ModuleDecisionRule, target_id: str | None) -> bool:
         cap_ratio = self._cap_ratio(ship)
         hp_ratio = self._hp_ratio(ship)
 
@@ -964,6 +1132,8 @@ class CombatSystem:
         if rule.activation_mode == "recent_enemy_weapon_damage":
             last_hit_at = float(getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) or -1e9)
             return (float(world.now) - last_hit_at) <= 30.0
+        if rule.activation_mode == "enemy_in_area":
+            return self._module_has_area_enemies_in_range(world, ship, module)
         if rule.activation_mode == "weapon_focus_only":
             if not target_id:
                 return False
@@ -1052,6 +1222,8 @@ class CombatSystem:
     @staticmethod
     def _ecm_duration_seconds(module_group: str) -> float:
         group = (module_group or "").lower()
+        if "burst jammer" in group:
+            return 5.0
         if "drone" in group:
             return 5.0
         return 20.0
@@ -1177,6 +1349,71 @@ class CombatSystem:
                 "chance": jam_chance,
             },
         )
+
+    def _resolve_area_ecm_cycle(self, world: WorldState, source, module) -> None:
+        now = float(world.now)
+
+        for effect in module.effects:
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            strengths = self._ecm_strength_from_effect(effect)
+            if max(strengths.values(), default=0.0) <= 0.0:
+                continue
+
+            for target in self._iter_area_targets_in_range(world, source, module, effect):
+                if target.ship_id == source.ship_id:
+                    continue
+
+                distance = source.nav.position.distance_to(target.nav.position)
+                target_sensor_type, target_sensor_strength, has_known_sensor_type = self._target_sensor_type_and_strength(target.profile)
+                if target_sensor_strength <= 0.0:
+                    continue
+
+                module_jam_strength = strengths.get(target_sensor_type, 0.0)
+                if module_jam_strength <= 0.0 and not has_known_sensor_type:
+                    module_jam_strength = max(strengths.values(), default=0.0)
+                if module_jam_strength <= 0.0:
+                    continue
+
+                if effect.range_m > 0.0 or effect.falloff_m > 0.0:
+                    range_factor = self.pyfa.turret_range_factor(effect.range_m, effect.falloff_m, distance)
+                else:
+                    range_factor = 1.0
+
+                effective_strength = module_jam_strength * max(0.0, min(1.0, range_factor))
+                jam_chance = max(0.0, min(1.0, effective_strength / max(1e-9, target_sensor_strength)))
+                jammed = random.random() < jam_chance
+
+                source.combat.ecm_last_attempt_target = target.ship_id
+                source.combat.ecm_last_attempt_module = module.module_id
+                source.combat.ecm_last_attempt_success = jammed
+                source.combat.ecm_last_attempt_chance = jam_chance
+                source.combat.ecm_last_attempt_at = now
+                source.combat.ecm_last_attempt_target_by_module[module.module_id] = target.ship_id
+                source.combat.ecm_last_attempt_success_by_module[module.module_id] = bool(jammed)
+                source.combat.ecm_last_attempt_at_by_module[module.module_id] = now
+
+                if not jammed:
+                    continue
+
+                jam_until = now + self._ecm_duration_seconds(module.group)
+                target.combat.ecm_jam_sources[source.ship_id] = max(
+                    float(target.combat.ecm_jam_sources.get(source.ship_id, 0.0) or 0.0),
+                    jam_until,
+                )
+                self._enforce_ecm_restrictions(target, now)
+                self._queue_merged_event(
+                    "ecm_jam_applied",
+                    merge_fields={
+                        "source": source.ship_id,
+                        "target": target.ship_id,
+                        "module": module.module_id,
+                        "sensor_type": target_sensor_type,
+                    },
+                    sum_fields={
+                        "chance": jam_chance,
+                    },
+                )
 
     def _update_module_states(self, world: WorldState, dt: float) -> None:
         alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
@@ -1310,10 +1547,11 @@ class CombatSystem:
                 desired_active = self._should_activate_module(
                     world,
                     ship,
+                    module,
                     decision_rule,
                     projected_target_id,
                 )
-                if has_projected and projected_target_id is None:
+                if has_projected and projected_target_id is None and not self._module_is_area_effect_module(module):
                     desired_active = False
 
                 ammo_reload_left = max(
@@ -1367,7 +1605,11 @@ class CombatSystem:
                     else:
                         ship.combat.module_reactivation_timers.pop(module.module_id, None)
 
-                activation_target_id: str | None = projected_target_id if has_projected else None
+                activation_target_id: str | None = (
+                    projected_target_id
+                    if has_projected and not self._module_is_area_effect_module(module)
+                    else None
+                )
 
                 if desired_active and activation_target_id is not None:
                     activation_target = world.ships.get(activation_target_id)
@@ -1380,7 +1622,7 @@ class CombatSystem:
                     ):
                         desired_active = False
 
-                if has_projected and projected_target_id is None:
+                if has_projected and projected_target_id is None and not self._module_is_area_effect_module(module):
                     desired_active = False
 
                 if desired_active:
@@ -1404,8 +1646,11 @@ class CombatSystem:
                     ship.combat.projected_targets.pop(module.module_id, None)
 
                 # ECM is resolved once at cycle start so first activation round shows immediate result.
-                if cycle_started and projected_target_id is not None:
-                    self._resolve_ecm_cycle(world, ship, module, projected_target_id)
+                if cycle_started:
+                    if self._module_is_burst_jammer_module(module):
+                        self._resolve_area_ecm_cycle(world, ship, module)
+                    elif projected_target_id is not None:
+                        self._resolve_ecm_cycle(world, ship, module, projected_target_id)
 
                 if previous_projected_target and (
                     module.state != module.state.ACTIVE or previous_projected_target != projected_target_id
@@ -1573,102 +1818,7 @@ class CombatSystem:
         if ship.runtime is None:
             return ship.profile
 
-        pyfa_runtime_profile = recompute_profile_from_pyfa_runtime(ship.runtime)
-        if pyfa_runtime_profile is not None:
-            base = replace(pyfa_runtime_profile)
-            applied = impacts.get(ship.ship_id)
-            if not applied:
-                return base
-            effective = self.runtime.apply_projected_effects(base, applied)
-            for attr in (
-                "weapon_system",
-                "optimal_sig",
-                "turret_dps",
-                "missile_dps",
-                "turret_cycle",
-                "missile_cycle",
-                "damage_em",
-                "damage_thermal",
-                "damage_kinetic",
-                "damage_explosive",
-                "turret_em_dps",
-                "turret_thermal_dps",
-                "turret_kinetic_dps",
-                "turret_explosive_dps",
-                "missile_em_dps",
-                "missile_thermal_dps",
-                "missile_kinetic_dps",
-                "missile_explosive_dps",
-                "missile_damage_reduction_factor",
-                "sensor_strength_gravimetric",
-                "sensor_strength_ladar",
-                "sensor_strength_magnetometric",
-                "sensor_strength_radar",
-                "shield_hp",
-                "armor_hp",
-                "structure_hp",
-                "shield_resonance_em",
-                "shield_resonance_thermal",
-                "shield_resonance_kinetic",
-                "shield_resonance_explosive",
-                "armor_resonance_em",
-                "armor_resonance_thermal",
-                "armor_resonance_kinetic",
-                "armor_resonance_explosive",
-                "structure_resonance_em",
-                "structure_resonance_thermal",
-                "structure_resonance_kinetic",
-                "structure_resonance_explosive",
-            ):
-                setattr(effective, attr, getattr(base, attr, getattr(effective, attr, 0.0)))
-            return effective
-
-        preserved = ship.profile
-        base = replace(self.runtime.compute_base_profile(ship.runtime))
-        for attr in (
-            "weapon_system",
-            "optimal_sig",
-            "turret_dps",
-            "missile_dps",
-            "turret_cycle",
-            "missile_cycle",
-            "damage_em",
-            "damage_thermal",
-            "damage_kinetic",
-            "damage_explosive",
-            "turret_em_dps",
-            "turret_thermal_dps",
-            "turret_kinetic_dps",
-            "turret_explosive_dps",
-            "missile_em_dps",
-            "missile_thermal_dps",
-            "missile_kinetic_dps",
-            "missile_explosive_dps",
-            "missile_explosion_radius",
-            "missile_explosion_velocity",
-            "missile_max_range",
-            "missile_damage_reduction_factor",
-            "sensor_strength_gravimetric",
-            "sensor_strength_ladar",
-            "sensor_strength_magnetometric",
-            "sensor_strength_radar",
-            "shield_hp",
-            "armor_hp",
-            "structure_hp",
-            "shield_resonance_em",
-            "shield_resonance_thermal",
-            "shield_resonance_kinetic",
-            "shield_resonance_explosive",
-            "armor_resonance_em",
-            "armor_resonance_thermal",
-            "armor_resonance_kinetic",
-            "armor_resonance_explosive",
-            "structure_resonance_em",
-            "structure_resonance_thermal",
-            "structure_resonance_kinetic",
-            "structure_resonance_explosive",
-        ):
-            setattr(base, attr, getattr(preserved, attr, getattr(base, attr, 0.0)))
+        base = replace(ship.profile)
         applied = impacts.get(ship.ship_id)
         if not applied:
             return base
@@ -1693,25 +1843,6 @@ class CombatSystem:
             "missile_kinetic_dps",
             "missile_explosive_dps",
             "missile_damage_reduction_factor",
-            "sensor_strength_gravimetric",
-            "sensor_strength_ladar",
-            "sensor_strength_magnetometric",
-            "sensor_strength_radar",
-            "shield_hp",
-            "armor_hp",
-            "structure_hp",
-            "shield_resonance_em",
-            "shield_resonance_thermal",
-            "shield_resonance_kinetic",
-            "shield_resonance_explosive",
-            "armor_resonance_em",
-            "armor_resonance_thermal",
-            "armor_resonance_kinetic",
-            "armor_resonance_explosive",
-            "structure_resonance_em",
-            "structure_resonance_thermal",
-            "structure_resonance_kinetic",
-            "structure_resonance_explosive",
         ):
             setattr(effective, attr, getattr(base, attr, getattr(effective, attr, 0.0)))
         return effective
@@ -1822,6 +1953,8 @@ class CombatSystem:
         self._update_ecm_restrictions(world)
         self._advance_target_locks(world, dt)
         self._update_module_states(world, dt)
+        command_boosters = self._collect_command_booster_snapshots(world)
+        self._refresh_effective_runtimes_from_pyfa(world, command_boosters)
         projected = self._collect_projected_impacts(world, dt)
 
         effective_profiles: dict[str, ShipProfile] = {}
@@ -1844,67 +1977,84 @@ class CombatSystem:
             for module in source.runtime.modules:
                 if module.state != module.state.ACTIVE:
                     continue
-                tgt_id = source.combat.projected_targets.get(module.module_id)
-                if not tgt_id:
+                if self._module_is_command_burst_module(module) or self._module_is_burst_jammer_module(module):
                     continue
-                target = world.ships.get(tgt_id)
-                if target is None or not target.vital.alive:
-                    continue
-                distance = source.nav.position.distance_to(target.nav.position)
-                target_profile = effective_profiles.get(target.ship_id, target.profile)
+
                 for effect in module.effects:
                     if effect.effect_class != EffectClass.PROJECTED:
                         continue
-                    max_range = self._projected_max_range(effect)
-                    if max_range > 0 and distance > max_range:
-                        continue
-                    strength = self._projected_strength(effect, distance)
-                    hp_before = target.vital.shield + target.vital.armor + target.vital.structure
-                    (
-                        shield_repaired,
-                        armor_repaired,
-                        cap_drained,
-                        em_damage,
-                        thermal_damage,
-                        kinetic_damage,
-                        explosive_damage,
-                        total_damage,
-                    ) = self._apply_projected_cycle_effects(
-                        world=world,
-                        source=source,
-                        target=target,
-                        target_profile=target_profile,
-                        effect=effect,
-                        dt=dt,
-                        strength=strength,
-                    )
-                    hp_after = target.vital.shield + target.vital.armor + target.vital.structure
-                    applied_damage = max(0.0, hp_before - hp_after)
-                    if (
-                        applied_damage > 0.0
-                        and source.team != target.team
-                        and self._module_is_weapon_module(module)
-                    ):
-                        target.combat.last_enemy_weapon_damaged_at = float(world.now)
-                    if (
-                        shield_repaired > 0.0
-                        or armor_repaired > 0.0
-                        or cap_drained > 0.0
-                        or total_damage > 0.0
-                    ):
-                        self._add_projected_cycle_total(
-                            source_ship_id=source.ship_id,
-                            module_id=module.module_id,
-                            target_ship_id=target.ship_id,
-                            shield_repaired=shield_repaired,
-                            armor_repaired=armor_repaired,
-                            cap_drained=cap_drained,
-                            em_damage=em_damage,
-                            thermal_damage=thermal_damage,
-                            kinetic_damage=kinetic_damage,
-                            explosive_damage=explosive_damage,
-                            total_damage=total_damage,
+
+                    targets: list[tuple[Any, float]] = []
+                    if self._module_is_smart_bomb_module(module):
+                        for target in self._iter_area_targets_in_range(world, source, module, effect):
+                            distance = source.nav.position.distance_to(target.nav.position)
+                            strength = self._projected_strength(effect, distance)
+                            if strength > 0.0:
+                                targets.append((target, strength))
+                    else:
+                        tgt_id = source.combat.projected_targets.get(module.module_id)
+                        if not tgt_id:
+                            continue
+                        target = world.ships.get(tgt_id)
+                        if target is None or not target.vital.alive:
+                            continue
+                        distance = source.nav.position.distance_to(target.nav.position)
+                        max_range = self._projected_max_range(effect)
+                        if max_range > 0 and distance > max_range:
+                            continue
+                        strength = self._projected_strength(effect, distance)
+                        if strength <= 0.0:
+                            continue
+                        targets.append((target, strength))
+
+                    for target, strength in targets:
+                        target_profile = effective_profiles.get(target.ship_id) or target.profile
+                        hp_before = target.vital.shield + target.vital.armor + target.vital.structure
+                        (
+                            shield_repaired,
+                            armor_repaired,
+                            cap_drained,
+                            em_damage,
+                            thermal_damage,
+                            kinetic_damage,
+                            explosive_damage,
+                            total_damage,
+                        ) = self._apply_projected_cycle_effects(
+                            world=world,
+                            source=source,
+                            target=target,
+                            target_profile=target_profile,
+                            effect=effect,
+                            dt=dt,
+                            strength=strength,
                         )
+                        hp_after = target.vital.shield + target.vital.armor + target.vital.structure
+                        applied_damage = max(0.0, hp_before - hp_after)
+                        if (
+                            applied_damage > 0.0
+                            and source.team != target.team
+                            and self._module_is_weapon_module(module)
+                        ):
+                            target.combat.last_enemy_weapon_damaged_at = float(world.now)
+                        if (
+                            shield_repaired > 0.0
+                            or armor_repaired > 0.0
+                            or cap_drained > 0.0
+                            or total_damage > 0.0
+                        ):
+                            self._add_projected_cycle_total(
+                                source_ship_id=source.ship_id,
+                                module_id=module.module_id,
+                                target_ship_id=target.ship_id,
+                                shield_repaired=shield_repaired,
+                                armor_repaired=armor_repaired,
+                                cap_drained=cap_drained,
+                                em_damage=em_damage,
+                                thermal_damage=thermal_damage,
+                                kinetic_damage=kinetic_damage,
+                                explosive_damage=explosive_damage,
+                                total_damage=total_damage,
+                            )
 
         if self.detailed_logging and self.logger is not None:
             total_impacts = sum(len(v) for v in projected.values())

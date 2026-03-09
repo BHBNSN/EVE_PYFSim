@@ -76,6 +76,7 @@ class SimulationEngine:
                 "cap_max": ship.vital.cap_max,
                 "target": ship.combat.current_target,
                 "projected_targets": {k: v for k, v in ship.combat.projected_targets.items()},
+                "module_cycle_timers": {k: float(v) for k, v in ship.combat.module_cycle_timers.items()},
                 "ecm_jam_sources": {k: float(v) for k, v in ship.combat.ecm_jam_sources.items()},
                 "ecm_last_attempt_target": ship.combat.ecm_last_attempt_target,
                 "ecm_last_attempt_module": ship.combat.ecm_last_attempt_module,

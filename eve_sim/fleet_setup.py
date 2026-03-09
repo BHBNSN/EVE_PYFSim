@@ -321,6 +321,31 @@ class RuntimeFromEftFactory:
         def pct_to_mult(value: float) -> float:
             return max(0.01, 1.0 + value / 100.0)
 
+        def charge_attr_opt(name: str) -> float | None:
+            try:
+                value = fitted_module.getModifiedChargeAttr(name)
+            except Exception:
+                value = None
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        def first_attr(*names: str) -> float:
+            for attr_name in names:
+                value = attr_opt(attr_name)
+                if value is None:
+                    continue
+                if abs(value) > 1e-9:
+                    return float(value)
+            return 0.0
+
+        def merge_mult(store: dict[str, float], key: str, mult: float) -> None:
+            prev = float(store.get(key, 1.0) or 1.0)
+            store[key] = max(0.01, prev * mult)
+
         duration_ms = attr("duration", 0.0)
         speed_ms = attr("speed", 0.0)
         cycle_ms = duration_ms if duration_ms > 0 else speed_ms
@@ -328,7 +353,21 @@ class RuntimeFromEftFactory:
         cap_need = max(0.0, attr("capacitorNeed", 0.0))
         reactivation_delay_sec = max(0.0, attr("moduleReactivationDelay", 0.0) / 1000.0)
 
-        range_m = max(0.0, attr("maxRange", 0.0))
+        range_m = max(
+            0.0,
+            first_attr(
+                "maxRange",
+                "shieldTransferRange",
+                "powerTransferRange",
+                "energyDestabilizationRange",
+                "empFieldRange",
+                "ecmBurstRange",
+                "warpScrambleRange",
+                "cargoScanRange",
+                "shipScanRange",
+                "surveyScanRange",
+            ),
+        )
         falloff_m = max(0.0, attr("falloffEffectiveness", 0.0))
         if falloff_m <= 0.0:
             falloff_m = max(0.0, attr("falloff", 0.0))
@@ -405,7 +444,10 @@ class RuntimeFromEftFactory:
                 "entityECM",
                 "doomsdayAOEECM",
             ),
-        ) or ("ecm" in group_name)
+        ) or ("ecm" in group_name) or ("burst jammer" in group_name)
+
+        is_command_burst = "command burst" in group_name
+        is_smart_bomb = ("smart bomb" in group_name) or ("structure area denial module" in group_name)
 
         handled_projection_attrs: set[str] = set()
 
@@ -515,6 +557,24 @@ class RuntimeFromEftFactory:
             if local_rep > 0.0:
                 local_add["rep"] = local_add.get("rep", 0.0) + local_rep
 
+        if is_smart_bomb and range_m > 0.0:
+            try:
+                dps_obj = fitted_module.getDps()
+            except Exception:
+                dps_obj = None
+
+            if dps_obj is not None:
+                damage_cycle = max(0.1, cycle_sec)
+                em_dps = max(0.0, float(getattr(dps_obj, "em", 0.0) or 0.0))
+                thermal_dps = max(0.0, float(getattr(dps_obj, "thermal", 0.0) or 0.0))
+                kinetic_dps = max(0.0, float(getattr(dps_obj, "kinetic", 0.0) or 0.0))
+                explosive_dps = max(0.0, float(getattr(dps_obj, "explosive", 0.0) or 0.0))
+                if (em_dps + thermal_dps + kinetic_dps + explosive_dps) > 0.0:
+                    projected_add["damage_em"] = em_dps * damage_cycle
+                    projected_add["damage_thermal"] = thermal_dps * damage_cycle
+                    projected_add["damage_kinetic"] = kinetic_dps * damage_cycle
+                    projected_add["damage_explosive"] = explosive_dps * damage_cycle
+
         is_weapon_like = self._is_weapon_like_group(group_name)
         if is_weapon_like and range_m > 0.0:
             try:
@@ -587,7 +647,7 @@ class RuntimeFromEftFactory:
             if abs(damage_scale - 1.0) > 1e-6:
                 local_mult["dps"] = max(0.01, damage_scale)
 
-        has_projected = bool(projected_mult or projected_add)
+        has_projected = bool(projected_mult or projected_add) or (is_command_burst and range_m > 0.0)
         is_active_module = (cap_need > 0.0) or (cycle_ms > 0.0) or has_projected
         if self._is_weapon_like_group(group_name) and cycle_ms > 0.0:
             is_active_module = True
@@ -811,7 +871,11 @@ class RuntimeFromEftFactory:
             "optimal_sig": weighted_optimal_sig / max(1e-6, turret_dps) if turret_dps > 0 else 40_000.0,
         }
 
-    def _build_pyfa_fit(self, parsed: ParsedEftFit) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
+    def _build_pyfa_fit(
+        self,
+        parsed: ParsedEftFit,
+        state_by_module_id: dict[str, str] | None = None,
+    ) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
         if not self._pyfa.fit_engine_ready:
             raise ValueError("pyfa Fit计算链不可用")
 
@@ -820,12 +884,15 @@ class RuntimeFromEftFactory:
         module_cls = self._pyfa._module_cls
         character_cls = self._pyfa._character_cls
         active_state = self._pyfa._fitting_module_state_active
+        online_state = self._pyfa._fitting_module_state_online
         offline_state = self._pyfa._fitting_module_state_offline
+        overheated_state = self._pyfa._fitting_module_state_overheated
         assert fit_cls is not None
         assert ship_cls is not None
         assert module_cls is not None
         assert character_cls is not None
         assert active_state is not None
+        assert online_state is not None
         assert offline_state is not None
 
         ship_name = self._pyfa.resolve_type_name(parsed.ship_name)
@@ -837,14 +904,23 @@ class RuntimeFromEftFactory:
         fit.character = character_cls.getAll5()
         fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]] = []
 
-        for spec in parsed.module_specs:
+        for idx, spec in enumerate(parsed.module_specs, start=1):
             module_name = self._pyfa.resolve_type_name(spec.module_name)
             module_item = self._pyfa.get_item(module_name)
             if module_item is None:
                 raise ValueError(f"pyfa中未找到模块：{spec.module_name}")
             module = module_cls(module_item)
             module.owner = fit
-            module.state = offline_state if spec.offline else active_state
+            module_id = f"mod-{idx}"
+            runtime_state = str((state_by_module_id or {}).get(module_id, "ACTIVE") or "ACTIVE").upper()
+            if spec.offline or runtime_state == "OFFLINE":
+                module.state = offline_state
+            elif runtime_state == "OVERHEATED":
+                module.state = overheated_state if overheated_state is not None else active_state
+            elif runtime_state == "ONLINE":
+                module.state = online_state
+            else:
+                module.state = active_state
 
             group_name = (module_item.group.name or "").lower()
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
@@ -921,16 +997,21 @@ class RuntimeFromEftFactory:
             "structure_resonance_explosive": float(ship.getModifiedItemAttr("explosiveDamageResonance") or 1.0),
         }
 
-    def build(self, parsed: ParsedEftFit) -> tuple[FitRuntime, FitDescriptor]:
-        if not self._pyfa.available:
-            raise ValueError("pyfa 静态数据库不可用，无法进行严格数值解析")
+    @staticmethod
+    def _module_state_text(value: str) -> ModuleState:
+        state_name = str(value or "ONLINE").upper()
+        if state_name in ModuleState.__members__:
+            return ModuleState[state_name]
+        return ModuleState.ONLINE
 
-        cached_runtime = self._runtime_cache.get(parsed.fit_key)
-        cached_fit = self._fit_cache.get(parsed.fit_key)
-        if cached_runtime is not None and cached_fit is not None:
-            return cached_runtime, cached_fit
-
-        fit_ctx, fitted_modules = self._build_pyfa_fit(parsed)
+    def _build_runtime_artifacts_from_pyfa_fit(
+        self,
+        parsed: ParsedEftFit,
+        fit_ctx: Any,
+        fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]],
+        state_by_module_id: dict[str, str] | None = None,
+        command_booster_snapshots: list[dict[str, Any]] | None = None,
+    ) -> tuple[FitRuntime, FitDescriptor, ShipProfile]:
         pyfa_final = self._compute_pyfa_final_stats(fit_ctx)
 
         ship_item = getattr(getattr(fit_ctx, "ship", None), "item", None)
@@ -949,6 +1030,8 @@ class RuntimeFromEftFactory:
             if module is not None:
                 if spec.offline:
                     module.state = ModuleState.OFFLINE
+                elif state_by_module_id is not None:
+                    module.state = self._module_state_text(state_by_module_id.get(module.module_id, module.state.value))
                 modules.append(module)
                 pyfa_blueprint_modules.append(
                     {
@@ -1056,6 +1139,7 @@ class RuntimeFromEftFactory:
             "fit_name": parsed.fit_name,
             "modules": pyfa_blueprint_modules,
         }
+        runtime.diagnostics["pyfa_command_boosters"] = deepcopy(command_booster_snapshots or [])
         runtime.diagnostics["motion_params"] = {
             "mass": float(pyfa_final.get("mass", 0.0) or 0.0),
             "agility": float(pyfa_final.get("agility", 0.0) or 0.0),
@@ -1085,6 +1169,19 @@ class RuntimeFromEftFactory:
             rep_amount=profile.rep_amount,
             rep_cycle=profile.rep_cycle,
         )
+        return runtime, fit, profile
+
+    def build(self, parsed: ParsedEftFit) -> tuple[FitRuntime, FitDescriptor]:
+        if not self._pyfa.available:
+            raise ValueError("pyfa 静态数据库不可用，无法进行严格数值解析")
+
+        cached_runtime = self._runtime_cache.get(parsed.fit_key)
+        cached_fit = self._fit_cache.get(parsed.fit_key)
+        if cached_runtime is not None and cached_fit is not None:
+            return cached_runtime, cached_fit
+
+        fit_ctx, fitted_modules = self._build_pyfa_fit(parsed)
+        runtime, fit, profile = self._build_runtime_artifacts_from_pyfa_fit(parsed, fit_ctx, fitted_modules)
         self._runtime_cache[parsed.fit_key] = runtime
         self._fit_cache[parsed.fit_key] = fit
         self._profile_cache[parsed.fit_key] = profile
@@ -1419,6 +1516,7 @@ class _PyfaStaticBackend:
 
 _STATIC_BACKEND: _PyfaStaticBackend | None = None
 _PYFA_RUNTIME_PROFILE_CACHE: dict[tuple[Any, ...], ShipProfile] = {}
+_PYFA_RUNTIME_RESOLVED_CACHE: dict[tuple[Any, ...], tuple[FitRuntime, ShipProfile]] = {}
 
 
 def _get_static_backend() -> _PyfaStaticBackend:
@@ -1432,158 +1530,207 @@ def get_fit_backend_status() -> str:
     return RuntimeFromEftFactory().backend_status
 
 
-def recompute_profile_from_pyfa_runtime(runtime: FitRuntime) -> ShipProfile | None:
-    backend = _get_static_backend()
-    if not backend.fit_engine_ready:
+def _runtime_blueprint_signature(blueprint: dict[str, Any]) -> tuple[Any, ...]:
+    ship_name = str(blueprint.get("ship_name", "") or "").strip()
+    modules = blueprint.get("modules")
+    if not ship_name or not isinstance(modules, list):
+        return tuple()
+    return tuple(
+        [
+            ship_name,
+            tuple(
+                sorted(
+                    (
+                        str(raw.get("module_id", "") or ""),
+                        str(raw.get("module_name", "") or ""),
+                        str(raw.get("charge_name", "") or ""),
+                        bool(raw.get("offline", False)),
+                    )
+                    for raw in modules
+                    if isinstance(raw, dict)
+                )
+            )
+        ]
+    )
+
+
+def _runtime_module_state_map(runtime: FitRuntime) -> dict[str, str]:
+    return {str(module.module_id): str(module.state.value) for module in runtime.modules}
+
+
+def _parsed_fit_from_runtime_blueprint(runtime: FitRuntime) -> ParsedEftFit | None:
+    blueprint = runtime.diagnostics.get("pyfa_blueprint")
+    if not isinstance(blueprint, dict):
         return None
+    ship_name = str(blueprint.get("ship_name", "") or "").strip()
+    fit_name = str(blueprint.get("fit_name", runtime.fit_key) or runtime.fit_key).strip()
+    raw_modules = blueprint.get("modules")
+    if not ship_name or not isinstance(raw_modules, list):
+        return None
+
+    module_specs: list[ParsedModuleSpec] = []
+    module_names: list[str] = []
+    for raw in raw_modules:
+        if not isinstance(raw, dict):
+            continue
+        module_name = str(raw.get("module_name", "") or "").strip()
+        if not module_name:
+            continue
+        charge_name = str(raw.get("charge_name", "") or "").strip() or None
+        offline = bool(raw.get("offline", False))
+        module_specs.append(ParsedModuleSpec(module_name=module_name, charge_name=charge_name, offline=offline))
+        module_names.append(module_name)
+
+    return ParsedEftFit(
+        ship_name=ship_name,
+        fit_name=fit_name,
+        module_names=module_names,
+        module_specs=module_specs,
+        cargo_item_names=[],
+        fit_key=runtime.fit_key,
+    )
+
+
+def _command_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    blueprint_raw = snapshot.get("blueprint")
+    blueprint: dict[str, Any] = blueprint_raw if isinstance(blueprint_raw, dict) else {}
+    state_raw = snapshot.get("state_by_module_id")
+    state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
+    return (
+        _runtime_blueprint_signature(blueprint),
+        tuple(sorted((str(module_id), str(state)) for module_id, state in state_by_module_id.items())),
+    )
+
+
+def _normalized_command_booster_snapshots(
+    runtime: FitRuntime,
+    command_booster_snapshots: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    snapshots = command_booster_snapshots
+    if snapshots is None:
+        raw_snapshots = runtime.diagnostics.get("pyfa_command_boosters")
+        snapshots = [snap for snap in raw_snapshots if isinstance(snap, dict)] if isinstance(raw_snapshots, list) else []
+    return [snap for snap in snapshots if isinstance(snap, dict)]
+
+
+def get_runtime_resolve_cache_key(
+    runtime: FitRuntime,
+    command_booster_snapshots: list[dict[str, Any]] | None = None,
+) -> tuple[Any, ...] | None:
     blueprint = runtime.diagnostics.get("pyfa_blueprint")
     if not isinstance(blueprint, dict):
         return None
 
-    ship_name = str(blueprint.get("ship_name", "") or "").strip()
-    fit_name = str(blueprint.get("fit_name", "") or "").strip()
-    module_specs = blueprint.get("modules")
-    if not ship_name or not isinstance(module_specs, list):
+    blueprint_signature = _runtime_blueprint_signature(blueprint)
+    if not blueprint_signature:
         return None
 
-    signature = tuple(sorted((m.module_id, m.state.value) for m in runtime.modules))
-    blueprint_signature = tuple(
-        sorted(
-            (
-                str(raw.get("module_id", "") or ""),
-                str(raw.get("module_name", "") or ""),
-                str(raw.get("charge_name", "") or ""),
-                bool(raw.get("offline", False)),
-            )
-            for raw in module_specs
-            if isinstance(raw, dict)
-        )
+    snapshots = _normalized_command_booster_snapshots(runtime, command_booster_snapshots)
+    state_by_module_id = _runtime_module_state_map(runtime)
+    return (
+        blueprint_signature,
+        tuple(sorted((module_id, state) for module_id, state in state_by_module_id.items())),
+        tuple(sorted(_command_snapshot_signature(snapshot) for snapshot in snapshots)),
     )
-    cache_key = (runtime.fit_key, blueprint_signature, signature)
-    cached = _PYFA_RUNTIME_PROFILE_CACHE.get(cache_key)
+
+
+def _copy_dynamic_runtime_state(source: FitRuntime, target: FitRuntime) -> None:
+    source_by_id = {module.module_id: module for module in source.modules}
+    for module in target.modules:
+        src = source_by_id.get(module.module_id)
+        if src is None:
+            continue
+        module.state = src.state
+        if module.charge_capacity > 0:
+            module.charge_remaining = max(0.0, min(float(src.charge_remaining), float(module.charge_capacity)))
+
+
+def _attach_command_fit(target_fit: Any, booster_fit: Any) -> None:
+    command_fit_mod = importlib.import_module("eos.db.saveddata.fit")
+    command_fit_cls = getattr(command_fit_mod, "CommandFit")
+    command_link = command_fit_cls(booster_fit.ID, booster_fit, active=True)
+    command_link.boostedID = target_fit.ID
+    command_link.boosted_fit = target_fit
+    booster_fit.boostedOnto[target_fit.ID] = command_link
+    target_fit.boostedOf[booster_fit.ID] = command_link
+
+
+def resolve_runtime_from_pyfa_runtime(
+    runtime: FitRuntime,
+    command_booster_snapshots: list[dict[str, Any]] | None = None,
+) -> tuple[FitRuntime, ShipProfile] | None:
+    backend = _get_static_backend()
+    if not backend.fit_engine_ready:
+        return None
+    parsed = _parsed_fit_from_runtime_blueprint(runtime)
+    blueprint = runtime.diagnostics.get("pyfa_blueprint")
+    if parsed is None or not isinstance(blueprint, dict):
+        return None
+
+    snapshots = _normalized_command_booster_snapshots(runtime, command_booster_snapshots)
+    state_by_module_id = _runtime_module_state_map(runtime)
+    cache_key = get_runtime_resolve_cache_key(runtime, snapshots)
+    if cache_key is None:
+        return None
+    cached = _PYFA_RUNTIME_RESOLVED_CACHE.get(cache_key)
     if cached is not None:
-        return replace(cached)
-
-    fit_cls = cast(Any, backend._fit_cls)
-    ship_cls = cast(Any, backend._ship_cls)
-    module_cls = cast(Any, backend._module_cls)
-    character_cls = cast(Any, backend._character_cls)
-    state_active = cast(Any, backend._fitting_module_state_active)
-    state_online = cast(Any, backend._fitting_module_state_online)
-    state_offline = cast(Any, backend._fitting_module_state_offline)
-    state_overheated = cast(Any, backend._fitting_module_state_overheated)
-    if any(x is None for x in (fit_cls, ship_cls, module_cls, character_cls, state_active, state_online, state_offline)):
-        return None
-
-    state_by_module_id = {m.module_id: m.state.value for m in runtime.modules}
-    resolved_ship = backend.resolve_type_name(ship_name)
-    ship_item = backend.get_item(resolved_ship)
-    if ship_item is None:
-        return None
+        resolved_runtime = deepcopy(cached[0])
+        resolved_runtime.fit_key = runtime.fit_key
+        resolved_runtime.diagnostics["pyfa_blueprint"] = deepcopy(blueprint)
+        resolved_runtime.diagnostics["pyfa_command_boosters"] = deepcopy(snapshots)
+        _copy_dynamic_runtime_state(runtime, resolved_runtime)
+        return resolved_runtime, replace(cached[1])
 
     try:
-        fit = fit_cls(ship=ship_cls(ship_item), name=fit_name or runtime.fit_key)
-        fit.character = character_cls.getAll5()
-        for raw in module_specs:
-            if not isinstance(raw, dict):
+        factory = RuntimeFromEftFactory()
+        target_fit, target_fitted_modules = factory._build_pyfa_fit(parsed, state_by_module_id=state_by_module_id)
+        target_fit.ID = 1
+
+        next_fit_id = 2
+        for snapshot in snapshots:
+            booster_blueprint = snapshot.get("blueprint") if isinstance(snapshot.get("blueprint"), dict) else None
+            if booster_blueprint is None:
                 continue
-            module_name = str(raw.get("module_name", "") or "").strip()
-            if not module_name:
+            booster_runtime = FitRuntime(fit_key=str(snapshot.get("fit_key", "") or f"command-{next_fit_id}"), hull=runtime.hull, skills=runtime.skills)
+            booster_runtime.diagnostics["pyfa_blueprint"] = booster_blueprint
+            booster_parsed = _parsed_fit_from_runtime_blueprint(booster_runtime)
+            if booster_parsed is None:
                 continue
-            module_item = backend.get_item(backend.resolve_type_name(module_name))
-            if module_item is None:
+            booster_state_raw = snapshot.get("state_by_module_id")
+            booster_state_map: dict[str, Any] = booster_state_raw if isinstance(booster_state_raw, dict) else {}
+            if not any(str(state).upper() in {"ACTIVE", "OVERHEATED"} for state in booster_state_map.values()):
                 continue
-            module = module_cls(module_item)
-            module.owner = fit
+            booster_fit, _ = factory._build_pyfa_fit(booster_parsed, state_by_module_id={str(k): str(v) for k, v in booster_state_map.items()})
+            booster_fit.ID = next_fit_id
+            next_fit_id += 1
+            _attach_command_fit(target_fit, booster_fit)
 
-            module_id = str(raw.get("module_id", "") or "")
-            original_offline = bool(raw.get("offline", False))
-            runtime_state = str(state_by_module_id.get(module_id, "ONLINE") or "ONLINE").upper()
-            if original_offline or runtime_state == "OFFLINE":
-                module.state = state_offline
-            elif runtime_state == "ACTIVE":
-                module.state = state_active
-            elif runtime_state == "OVERHEATED":
-                module.state = state_overheated if state_overheated is not None else state_active
-            else:
-                module.state = state_online
-
-            charge_name = raw.get("charge_name")
-            if charge_name:
-                charge_item = backend.get_item(backend.resolve_type_name(str(charge_name)))
-                if charge_item is not None:
-                    module.charge = charge_item
-            fit.modules.append(module)
-
-        fit.calculateModifiedAttributes()
-        ship = fit.ship
-        weapon_stats = RuntimeFromEftFactory._collect_pyfa_weapon_stats(cast(list[Any], fit.modules), ship, require_volley=False)
-
-        profile = ShipProfile(
-            dps=float(fit.getTotalDps().total),
-            volley=float(fit.getTotalVolley().total),
-            optimal=weapon_stats["optimal"],
-            falloff=weapon_stats["falloff"],
-            tracking=weapon_stats["tracking"],
-            optimal_sig=max(1.0, weapon_stats.get("optimal_sig", 40_000.0)),
-            sig_radius=max(1.0, float(ship.getModifiedItemAttr("signatureRadius") or 0.0)),
-            scan_resolution=max(1.0, float(ship.getModifiedItemAttr("scanResolution") or 0.0)),
-            max_target_range=max(1000.0, float(ship.getModifiedItemAttr("maxTargetRange") or 0.0)),
-            sensor_strength_gravimetric=max(0.0, float(ship.getModifiedItemAttr("scanGravimetricStrength") or 0.0)),
-            sensor_strength_ladar=max(0.0, float(ship.getModifiedItemAttr("scanLadarStrength") or 0.0)),
-            sensor_strength_magnetometric=max(0.0, float(ship.getModifiedItemAttr("scanMagnetometricStrength") or 0.0)),
-            sensor_strength_radar=max(0.0, float(ship.getModifiedItemAttr("scanRadarStrength") or 0.0)),
-            max_speed=max(1.0, float(ship.getModifiedItemAttr("maxVelocity") or 0.0)),
-            max_cap=max(1.0, float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0)),
-            cap_recharge_time=max(1.0, float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0),
-            shield_hp=max(1.0, float(ship.getModifiedItemAttr("shieldCapacity") or 0.0)),
-            armor_hp=max(1.0, float(ship.getModifiedItemAttr("armorHP") or 0.0)),
-            structure_hp=max(1.0, float(ship.getModifiedItemAttr("hp") or 0.0)),
-            rep_amount=0.0,
-            rep_cycle=5.0,
-            weapon_system=(
-                "mixed"
-                if weapon_stats["turret_dps"] > 0 and weapon_stats["missile_dps"] > 0
-                else ("missile" if weapon_stats["missile_dps"] > 0 else "turret")
-            ),
-            turret_dps=max(0.0, weapon_stats["turret_dps"]),
-            missile_dps=max(0.0, weapon_stats["missile_dps"]),
-            turret_cycle=max(0.0, weapon_stats["turret_cycle"]),
-            missile_cycle=max(0.0, weapon_stats["missile_cycle"]),
-            damage_em=max(0.0, weapon_stats["damage_em"]),
-            damage_thermal=max(0.0, weapon_stats["damage_thermal"]),
-            damage_kinetic=max(0.0, weapon_stats["damage_kinetic"]),
-            damage_explosive=max(0.0, weapon_stats["damage_explosive"]),
-            turret_em_dps=max(0.0, weapon_stats["turret_em_dps"]),
-            turret_thermal_dps=max(0.0, weapon_stats["turret_thermal_dps"]),
-            turret_kinetic_dps=max(0.0, weapon_stats["turret_kinetic_dps"]),
-            turret_explosive_dps=max(0.0, weapon_stats["turret_explosive_dps"]),
-            missile_em_dps=max(0.0, weapon_stats["missile_em_dps"]),
-            missile_thermal_dps=max(0.0, weapon_stats["missile_thermal_dps"]),
-            missile_kinetic_dps=max(0.0, weapon_stats["missile_kinetic_dps"]),
-            missile_explosive_dps=max(0.0, weapon_stats["missile_explosive_dps"]),
-            missile_explosion_radius=max(0.0, weapon_stats["missile_explosion_radius"]),
-            missile_explosion_velocity=max(0.0, weapon_stats["missile_explosion_velocity"]),
-            missile_max_range=max(0.0, weapon_stats["missile_max_range"]),
-            missile_damage_reduction_factor=max(0.1, min(2.0, weapon_stats["missile_damage_reduction_factor"])),
-            shield_resonance_em=max(0.01, min(1.0, float(ship.getModifiedItemAttr("shieldEmDamageResonance") or 1.0))),
-            shield_resonance_thermal=max(0.01, min(1.0, float(ship.getModifiedItemAttr("shieldThermalDamageResonance") or 1.0))),
-            shield_resonance_kinetic=max(0.01, min(1.0, float(ship.getModifiedItemAttr("shieldKineticDamageResonance") or 1.0))),
-            shield_resonance_explosive=max(0.01, min(1.0, float(ship.getModifiedItemAttr("shieldExplosiveDamageResonance") or 1.0))),
-            armor_resonance_em=max(0.01, min(1.0, float(ship.getModifiedItemAttr("armorEmDamageResonance") or 1.0))),
-            armor_resonance_thermal=max(0.01, min(1.0, float(ship.getModifiedItemAttr("armorThermalDamageResonance") or 1.0))),
-            armor_resonance_kinetic=max(0.01, min(1.0, float(ship.getModifiedItemAttr("armorKineticDamageResonance") or 1.0))),
-            armor_resonance_explosive=max(0.01, min(1.0, float(ship.getModifiedItemAttr("armorExplosiveDamageResonance") or 1.0))),
-            structure_resonance_em=max(0.01, min(1.0, float(ship.getModifiedItemAttr("emDamageResonance") or 1.0))),
-            structure_resonance_thermal=max(0.01, min(1.0, float(ship.getModifiedItemAttr("thermalDamageResonance") or 1.0))),
-            structure_resonance_kinetic=max(0.01, min(1.0, float(ship.getModifiedItemAttr("kineticDamageResonance") or 1.0))),
-            structure_resonance_explosive=max(0.01, min(1.0, float(ship.getModifiedItemAttr("explosiveDamageResonance") or 1.0))),
+        target_fit.calculateModifiedAttributes()
+        resolved_runtime, _fit, profile = factory._build_runtime_artifacts_from_pyfa_fit(
+            parsed,
+            target_fit,
+            target_fitted_modules,
+            state_by_module_id=state_by_module_id,
+            command_booster_snapshots=snapshots,
         )
+        _copy_dynamic_runtime_state(runtime, resolved_runtime)
     except Exception:
         return None
 
-    _PYFA_RUNTIME_PROFILE_CACHE[cache_key] = replace(profile)
-    return profile
+    _PYFA_RUNTIME_RESOLVED_CACHE[cache_key] = (deepcopy(resolved_runtime), replace(profile))
+    return resolved_runtime, profile
+
+
+def recompute_profile_from_pyfa_runtime(
+    runtime: FitRuntime,
+    command_booster_snapshots: list[dict[str, Any]] | None = None,
+) -> ShipProfile | None:
+    resolved = resolve_runtime_from_pyfa_runtime(runtime, command_booster_snapshots)
+    if resolved is None:
+        return None
+    profile = resolved[1]
+    _PYFA_RUNTIME_PROFILE_CACHE[(runtime.fit_key, tuple(sorted(_runtime_module_state_map(runtime).items())))] = replace(profile)
+    return replace(profile)
 
 
 def get_common_chargeable_modules(fit_texts: list[str], usage_threshold: float = 0.05, language: str = "en") -> list[str]:
