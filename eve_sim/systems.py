@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import math
 import logging
 import random
+import time
 from typing import Any
 
 import numpy as np
 
-from .fleet_setup import get_runtime_resolve_cache_key, resolve_runtime_from_pyfa_runtime
-from .fit_runtime import EffectClass, ProjectedImpact, RuntimeStatEngine
+from .fleet_setup import (
+    _module_affects_local_pyfa_profile,
+    _runtime_local_profile_state_signature,
+    get_runtime_resolve_cache_key,
+    resolve_runtime_from_pyfa_runtime,
+)
+from .fit_runtime import EffectClass, ModuleEffect, ModuleState, ProjectedImpact, RuntimeStatEngine
 from .math2d import Vector2
 from .models import ShipProfile, Team
 from .pyfa_bridge import PyfaBridge
@@ -18,6 +25,66 @@ from .world import WorldState
 
 
 DamageTuple = tuple[float, float, float, float]
+
+_PROFILE_PASSTHROUGH_ATTRS = (
+    "weapon_system",
+    "optimal_sig",
+    "turret_dps",
+    "missile_dps",
+    "turret_cycle",
+    "missile_cycle",
+    "damage_em",
+    "damage_thermal",
+    "damage_kinetic",
+    "damage_explosive",
+    "turret_em_dps",
+    "turret_thermal_dps",
+    "turret_kinetic_dps",
+    "turret_explosive_dps",
+    "missile_em_dps",
+    "missile_thermal_dps",
+    "missile_kinetic_dps",
+    "missile_explosive_dps",
+    "missile_damage_reduction_factor",
+)
+
+_FORMULA_PROJECTED_KEYS = frozenset(
+    {
+        "speed",
+        "sig",
+        "tracking",
+        "optimal",
+        "falloff",
+        "scan",
+        "range",
+        "rep",
+        "shield_hp",
+        "armor_hp",
+        "structure_hp",
+        "sensor_strength_gravimetric",
+        "sensor_strength_ladar",
+        "sensor_strength_magnetometric",
+        "sensor_strength_radar",
+        "shield_resonance_em",
+        "shield_resonance_thermal",
+        "shield_resonance_kinetic",
+        "shield_resonance_explosive",
+        "armor_resonance_em",
+        "armor_resonance_thermal",
+        "armor_resonance_kinetic",
+        "armor_resonance_explosive",
+        "structure_resonance_em",
+        "structure_resonance_thermal",
+        "structure_resonance_kinetic",
+        "structure_resonance_explosive",
+        "missile_explosion_radius",
+        "missile_explosion_velocity",
+        "missile_range",
+        "dps",
+        "cap_max",
+        "cap_recharge",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +100,33 @@ class CycleTargetSnapshot:
     distance: float
     effect_strengths: dict[int, float] = field(default_factory=dict)
     effect_damage_factors: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleStaticMetadata:
+    active_effects: tuple[ModuleEffect, ...]
+    projected_effects: tuple[tuple[int, ModuleEffect], ...]
+    cycle_cost: float
+    cycle_time: float
+    reactivation_delay: float
+    has_projected: bool
+    target_side: str
+    is_command_burst: bool
+    is_smart_bomb: bool
+    is_burst_jammer: bool
+    is_area_effect: bool
+    is_weapon: bool
+    has_projected_rep: bool
+    is_cap_warfare: bool
+    is_target_ewar: bool
+    is_ecm: bool
+    uses_pyfa_projected_profile: bool
+    is_hardener: bool
+    is_cap_booster: bool
+    is_propulsion: bool
+    is_damage_control: bool
+    affects_local_pyfa_profile: bool
+    decision_rule: ModuleDecisionRule
 
 
 def _scale_damage(dmg: DamageTuple, factor: float) -> DamageTuple:
@@ -165,6 +259,12 @@ class MovementSystem:
             if distance > max(120.0, ship.nav.radius * 1.5):
                 throttle = 1.0
                 desired_angle = to_target.angle_deg()
+        elif bool(ship.nav.propulsion_command_active):
+            current_speed = ship.nav.velocity.length()
+            if current_speed > 1e-6:
+                # Keep burning along the existing travel vector when propulsion toggles on mid-flight.
+                throttle = 1.0
+                desired_angle = ship.nav.velocity.angle_deg()
 
         align_time = self._align_time_for(speed_cap)
         max_turn_rate = 220.0 / max(0.5, align_time)
@@ -212,6 +312,7 @@ class CombatSystem:
         self.runtime = RuntimeStatEngine()
         self.logger: logging.Logger | None = None
         self.detailed_logging: bool = False
+        self.hotspot_logging_enabled: bool = False
         self.event_logging_enabled: bool = False
         self.event_merge_window_sec: float = 1.0
         self._diag_logged_ships: set[str] = set()
@@ -222,11 +323,23 @@ class CombatSystem:
         self._merge_window_start_time: float | None = None
         self._merge_window_end_time: float | None = None
         self._last_focus_queue_by_squad: dict[str, tuple[str, ...]] = {}
+        self._pyfa_remote_inputs_dirty: bool = True
+        self._alive_runtime_ship_ids: set[str] = set()
+        self._cached_command_booster_snapshots: dict[str, list[dict[str, Any]]] | None = None
+        self._cached_projected_source_snapshots: dict[str, list[dict[str, Any]]] | None = None
+        self._module_static_metadata_by_object_id: dict[int, ModuleStaticMetadata] = {}
 
-    def attach_logger(self, logger: logging.Logger, detailed_logging: bool, merge_window_sec: float = 1.0) -> None:
+    def attach_logger(
+        self,
+        logger: logging.Logger,
+        detailed_logging: bool,
+        merge_window_sec: float = 1.0,
+        hotspot_logging: bool = False,
+    ) -> None:
         self.logger = logger
         self.event_logging_enabled = bool(detailed_logging)
         self.detailed_logging = False
+        self.hotspot_logging_enabled = bool(hotspot_logging)
         try:
             self.event_merge_window_sec = max(0.1, float(merge_window_sec))
         except Exception:
@@ -234,6 +347,579 @@ class CombatSystem:
         self._merge_window_start_time = None
         self._merge_window_end_time = None
         self._merged_event_buckets.clear()
+
+    def _log_hotspot(self, name: str, start_time: float, **fields: Any) -> None:
+        if not self.hotspot_logging_enabled:
+            return
+        if self.logger is None or self.logger.disabled:
+            return
+        log_sim_event(
+            self.logger,
+            "hotspot",
+            name=name,
+            duration_ms=(time.perf_counter() - start_time) * 1000.0,
+            **fields,
+        )
+
+    @staticmethod
+    def _copy_profile_passthrough_fields(base: ShipProfile, target: ShipProfile) -> None:
+        for attr in _PROFILE_PASSTHROUGH_ATTRS:
+            setattr(target, attr, getattr(base, attr, getattr(target, attr, 0.0)))
+
+    def _apply_runtime_projected_impacts(self, base: ShipProfile, impacts: list[ProjectedImpact]) -> ShipProfile:
+        effective = self.runtime.apply_projected_effects(replace(base), impacts)
+        self._copy_profile_passthrough_fields(base, effective)
+        return effective
+
+    @staticmethod
+    def _local_runtime_state_signature(runtime) -> tuple[tuple[str, str], ...] | None:
+        blueprint = runtime.diagnostics.get("pyfa_blueprint")
+        if not isinstance(blueprint, dict):
+            return None
+        return _runtime_local_profile_state_signature(runtime)
+
+    def _local_runtime_state_signature_from_metadata(self, runtime) -> tuple[tuple[str, str], ...] | None:
+        blueprint = runtime.diagnostics.get("pyfa_blueprint")
+        if not isinstance(blueprint, dict):
+            return None
+        return tuple(
+            (str(module.module_id), str(module.state.value or "ONLINE").upper())
+            for module in runtime.modules
+            if self._module_static_metadata(module).affects_local_pyfa_profile
+        )
+
+    def _mark_pyfa_remote_inputs_dirty(self) -> None:
+        self._pyfa_remote_inputs_dirty = True
+
+    def _refresh_alive_runtime_ship_ids(self, world: WorldState) -> None:
+        current_alive_runtime_ship_ids = {
+            ship.ship_id
+            for ship in world.ships.values()
+            if ship.vital.alive and ship.runtime is not None
+        }
+        if current_alive_runtime_ship_ids != self._alive_runtime_ship_ids:
+            self._alive_runtime_ship_ids = current_alive_runtime_ship_ids
+            self._mark_pyfa_remote_inputs_dirty()
+
+    def _cached_pyfa_remote_inputs_available(self) -> bool:
+        return self._cached_command_booster_snapshots is not None and self._cached_projected_source_snapshots is not None
+
+    def _module_static_metadata(self, module) -> ModuleStaticMetadata:
+        key = id(module)
+        cached = self._module_static_metadata_by_object_id.get(key)
+        if cached is not None:
+            return cached
+
+        group_name = str(getattr(module, "group", "") or "").strip().lower()
+        active_effects = tuple(
+            effect
+            for effect in module.effects
+            if str(effect.state_required.value).upper() == "ACTIVE"
+        )
+        projected_effects = tuple(
+            (effect_index, effect)
+            for effect_index, effect in enumerate(module.effects)
+            if effect.effect_class == EffectClass.PROJECTED
+        )
+        has_projected = bool(projected_effects)
+        has_projected_damage = False
+        has_projected_rep = False
+        friendly_score = 0
+        hostile_score = 0
+        for _effect_index, effect in projected_effects:
+            for key_name, value in effect.projected_add.items():
+                amount = float(value or 0.0)
+                if amount <= 0.0:
+                    continue
+                if key_name in {"shield_rep", "armor_rep"}:
+                    has_projected_rep = True
+                    friendly_score += 2
+                elif key_name in {"cap_drain", "ecm_gravimetric", "ecm_ladar", "ecm_magnetometric", "ecm_radar"}:
+                    hostile_score += 2
+                elif key_name.startswith("damage_"):
+                    has_projected_damage = True
+                    hostile_score += 3
+                elif key_name.startswith("weapon_"):
+                    hostile_score += 1
+            for value in effect.projected_mult.values():
+                mult = float(value or 0.0)
+                if mult < 1.0:
+                    hostile_score += 1
+                elif mult > 1.0:
+                    friendly_score += 1
+
+        target_side = "ally" if friendly_score > hostile_score else "enemy"
+        is_command_burst = group_name == "command burst"
+        is_smart_bomb = group_name in {"smart bomb", "structure area denial module"}
+        is_burst_jammer = group_name == "burst jammer"
+        is_area_effect = is_command_burst or is_smart_bomb or is_burst_jammer
+        is_cap_booster = "capacitor booster" in group_name
+        is_propulsion = "propulsion module" in group_name
+        is_damage_control = group_name == "damage control"
+        is_hardener = any(
+            token in group_name
+            for token in (
+                "shield hardener",
+                "armor hardener",
+                "energized",
+                "armor resistance shift hardener",
+            )
+        )
+        is_cap_warfare = any(token in group_name for token in ("energy neutral", "nosferatu"))
+        is_target_ewar = any(token in group_name for token in ("target painter", "stasis web", "stasis grappler"))
+        is_ecm = "ecm" in group_name
+        ammo_like = int(getattr(module, "charge_capacity", 0) or 0) > 0 and float(getattr(module, "charge_rate", 0.0) or 0.0) > 0.0
+        is_weapon = has_projected and has_projected_damage and (("weapon" in group_name) or ("missile launcher" in group_name) or ammo_like)
+        is_offensive_ewar = (
+            has_projected
+            and not is_weapon
+            and target_side == "enemy"
+            and any(
+                token in group_name
+                for token in (
+                    "weapon disruptor",
+                    "sensor damp",
+                    "energy neutral",
+                    "nosferatu",
+                    "ecm",
+                    "warp scrambler",
+                )
+            )
+        )
+        uses_pyfa_projected_profile = (
+            has_projected
+            and not is_command_burst
+            and not is_smart_bomb
+            and not is_burst_jammer
+            and not is_ecm
+            and not is_weapon
+            and not has_projected_rep
+            and not is_cap_warfare
+        )
+
+        if is_command_burst:
+            decision_rule = ModuleDecisionRule(
+                rule_id="area_command_burst",
+                activation_mode="always",
+                target_mode="none",
+            )
+        elif is_smart_bomb:
+            decision_rule = ModuleDecisionRule(
+                rule_id="area_smart_bomb",
+                activation_mode="enemy_in_area",
+                target_mode="none",
+                cap_threshold=0.15,
+            )
+        elif is_burst_jammer:
+            decision_rule = ModuleDecisionRule(
+                rule_id="area_burst_jammer",
+                activation_mode="enemy_in_area",
+                target_mode="none",
+                cap_threshold=0.15,
+            )
+        elif is_weapon:
+            decision_rule = ModuleDecisionRule(
+                rule_id="weapon_focus_only",
+                activation_mode="weapon_focus_only",
+                target_mode="weapon_focus_prefocus",
+            )
+        elif has_projected:
+            if has_projected_rep:
+                decision_rule = ModuleDecisionRule(
+                    rule_id="projected_remote_repair",
+                    activation_mode="always",
+                    target_mode="ally_lowest_hp",
+                )
+            elif is_offensive_ewar:
+                decision_rule = ModuleDecisionRule(
+                    rule_id="projected_offensive_ewar",
+                    activation_mode="cap_min",
+                    target_mode="enemy_random",
+                    cap_threshold=0.15,
+                )
+            elif is_target_ewar:
+                decision_rule = ModuleDecisionRule(
+                    rule_id="weapon_focus_only",
+                    activation_mode="weapon_focus_only",
+                    target_mode="weapon_focus_prefocus",
+                )
+            elif target_side == "ally":
+                decision_rule = ModuleDecisionRule(
+                    rule_id="projected_support_generic",
+                    activation_mode="always",
+                    target_mode="ally_lowest_hp",
+                )
+            else:
+                decision_rule = ModuleDecisionRule(
+                    rule_id="projected_hostile_generic",
+                    activation_mode="never",
+                    target_mode="none",
+                )
+        elif is_propulsion:
+            decision_rule = ModuleDecisionRule(
+                rule_id="local_propulsion",
+                activation_mode="propulsion_command",
+                target_mode="none",
+            )
+        elif is_damage_control:
+            decision_rule = ModuleDecisionRule(
+                rule_id="local_damage_control",
+                activation_mode="recent_enemy_weapon_damage",
+                target_mode="none",
+            )
+        elif is_hardener:
+            decision_rule = ModuleDecisionRule(
+                rule_id="local_hardener",
+                activation_mode="cap_or_low_hp",
+                target_mode="none",
+                cap_threshold=0.10,
+            )
+        elif is_cap_booster:
+            decision_rule = ModuleDecisionRule(
+                rule_id="local_cap_booster",
+                activation_mode="cap_max",
+                target_mode="none",
+                cap_threshold=0.85,
+            )
+        else:
+            decision_rule = ModuleDecisionRule(
+                rule_id="local_active_default",
+                activation_mode="never",
+                target_mode="none",
+            )
+
+        metadata = ModuleStaticMetadata(
+            active_effects=active_effects,
+            projected_effects=projected_effects,
+            cycle_cost=sum(max(0.0, effect.cap_need) for effect in active_effects),
+            cycle_time=min((max(0.1, effect.cycle_time) for effect in active_effects if effect.cycle_time > 0), default=0.0),
+            reactivation_delay=max((max(0.0, float(getattr(effect, "reactivation_delay", 0.0) or 0.0)) for effect in active_effects), default=0.0),
+            has_projected=has_projected,
+            target_side=target_side,
+            is_command_burst=is_command_burst,
+            is_smart_bomb=is_smart_bomb,
+            is_burst_jammer=is_burst_jammer,
+            is_area_effect=is_area_effect,
+            is_weapon=is_weapon,
+            has_projected_rep=has_projected_rep,
+            is_cap_warfare=is_cap_warfare,
+            is_target_ewar=is_target_ewar,
+            is_ecm=is_ecm,
+            uses_pyfa_projected_profile=uses_pyfa_projected_profile,
+            is_hardener=is_hardener,
+            is_cap_booster=is_cap_booster,
+            is_propulsion=is_propulsion,
+            is_damage_control=is_damage_control,
+            affects_local_pyfa_profile=_module_affects_local_pyfa_profile(module),
+            decision_rule=decision_rule,
+        )
+        self._module_static_metadata_by_object_id[key] = metadata
+        return metadata
+
+    def _validate_cached_pyfa_base_profiles(
+        self,
+        world: WorldState,
+    ) -> tuple[bool, bool, list[tuple[Any, ShipProfile]]]:
+        reusable_profiles: list[tuple[Any, ShipProfile]] = []
+        reusable = True
+        remote_recollect_required = False
+
+        for ship in world.ships.values():
+            if not ship.vital.alive or ship.runtime is None:
+                continue
+
+            local_signature = self._local_runtime_state_signature_from_metadata(ship.runtime)
+            cached_local_signature = ship.runtime.diagnostics.get("pyfa_local_state_signature")
+            cached_base_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
+            if local_signature != cached_local_signature or not isinstance(cached_base_profile, ShipProfile):
+                reusable = False
+                if (
+                    local_signature != cached_local_signature
+                    and self._runtime_has_active_pyfa_remote_inputs(ship.runtime)
+                ):
+                    remote_recollect_required = True
+                continue
+
+            reusable_profiles.append((ship, cached_base_profile))
+
+        return reusable, remote_recollect_required, reusable_profiles
+
+    @staticmethod
+    def _command_snapshot_list_signature(snapshots: list[dict[str, Any]]) -> tuple[Any, ...]:
+        signature: list[tuple[Any, ...]] = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            state_raw = snapshot.get("state_by_module_id")
+            state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
+            signature.append(
+                (
+                    str(snapshot.get("fit_key", "") or ""),
+                    tuple(sorted((str(module_id), str(state)) for module_id, state in state_by_module_id.items())),
+                )
+            )
+        return tuple(signature)
+
+    @staticmethod
+    def _formula_effect_signature(effect_payload: dict[str, Any]) -> tuple[Any, ...]:
+        mult_raw = effect_payload.get("projected_mult")
+        add_raw = effect_payload.get("projected_add")
+        projected_mult: dict[str, Any] = mult_raw if isinstance(mult_raw, dict) else {}
+        projected_add: dict[str, Any] = add_raw if isinstance(add_raw, dict) else {}
+        return (
+            str(effect_payload.get("name", "") or ""),
+            tuple(sorted((str(key), round(float(value or 0.0), 6)) for key, value in projected_mult.items())),
+            tuple(sorted((str(key), round(float(value or 0.0), 6)) for key, value in projected_add.items())),
+        )
+
+    @classmethod
+    def _projected_snapshot_list_signature(cls, snapshots: list[dict[str, Any]]) -> tuple[Any, ...]:
+        signature: list[tuple[Any, ...]] = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            state_raw = snapshot.get("state_by_module_id")
+            state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
+            command_raw = snapshot.get("command_booster_snapshots")
+            command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
+            formula_raw = snapshot.get("formula_effects")
+            formula_effects = [raw for raw in formula_raw if isinstance(raw, dict)] if isinstance(formula_raw, list) else []
+            distance_mode = str(snapshot.get("distance_mode", "pyfa_range") or "pyfa_range")
+            if distance_mode == "formula" and formula_effects:
+                distance_signature: Any = tuple(round(float(raw.get("strength", 1.0) or 1.0), 6) for raw in formula_effects)
+            elif distance_mode == "pyfa_range":
+                try:
+                    distance_signature = round(float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0), 3)
+                except Exception:
+                    distance_signature = 0.0
+            else:
+                distance_signature = None
+            signature.append(
+                (
+                    str(snapshot.get("fit_key", "") or ""),
+                    tuple(sorted((str(module_id), str(state)) for module_id, state in state_by_module_id.items())),
+                    cls._command_snapshot_list_signature(command_snapshots),
+                    distance_mode,
+                    tuple(cls._formula_effect_signature(raw) for raw in formula_effects),
+                    distance_signature,
+                )
+            )
+        return tuple(signature)
+
+    def _module_affects_pyfa_remote_inputs(self, module) -> bool:
+        metadata = self._module_static_metadata(module)
+        return metadata.is_command_burst or metadata.uses_pyfa_projected_profile
+
+    def _runtime_has_active_pyfa_remote_inputs(self, runtime) -> bool:
+        for module in runtime.modules:
+            if str(module.state.value or "ONLINE").upper() not in {"ACTIVE", "OVERHEATED"}:
+                continue
+            if self._module_affects_pyfa_remote_inputs(module):
+                return True
+        return False
+
+    @classmethod
+    def _projected_snapshot_structure_signature(cls, snapshots: list[dict[str, Any]]) -> tuple[Any, ...]:
+        return tuple(item[:-1] for item in cls._projected_snapshot_list_signature(snapshots))
+
+    @staticmethod
+    def _projected_effect_supports_formula_profile(effect) -> bool:
+        mult_keys = {str(key) for key in effect.projected_mult.keys()}
+        add_keys = {str(key) for key in effect.projected_add.keys()}
+        if not mult_keys and not add_keys:
+            return False
+        return mult_keys.issubset(_FORMULA_PROJECTED_KEYS) and add_keys.issubset(_FORMULA_PROJECTED_KEYS)
+
+    def _projected_distance_mode(self, module) -> str:
+        projected_effects = [effect for effect in module.effects if effect.effect_class == EffectClass.PROJECTED]
+        if not projected_effects:
+            return "pyfa_range"
+        if all(max(0.0, float(getattr(effect, "falloff_m", 0.0) or 0.0)) <= 0.0 for effect in projected_effects):
+            return "constant"
+        if all(self._projected_effect_supports_formula_profile(effect) for effect in projected_effects):
+            return "formula"
+        return "pyfa_range"
+
+    def _module_formula_effect_payloads(self, module, target_snapshot: CycleTargetSnapshot) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for effect_index, effect in enumerate(module.effects):
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            if not self._projected_effect_supports_formula_profile(effect):
+                continue
+            strength = max(0.0, min(1.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0)))
+            if strength <= 0.0:
+                continue
+            payloads.append(
+                {
+                    "name": str(effect.name or ""),
+                    "projected_mult": dict(effect.projected_mult),
+                    "projected_add": dict(effect.projected_add),
+                    "strength": strength,
+                }
+            )
+        return payloads
+
+    def _formula_impacts_from_projected_snapshots(self, snapshots: list[dict[str, Any]]) -> list[ProjectedImpact] | None:
+        impacts: list[ProjectedImpact] = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                return None
+            raw_effects = snapshot.get("formula_effects")
+            if not isinstance(raw_effects, list) or not raw_effects:
+                return None
+            source_ship_id = str(snapshot.get("fit_key", "") or "")
+            for raw_effect in raw_effects:
+                if not isinstance(raw_effect, dict):
+                    return None
+                mult_raw = raw_effect.get("projected_mult")
+                add_raw = raw_effect.get("projected_add")
+                projected_mult: dict[str, Any] = mult_raw if isinstance(mult_raw, dict) else {}
+                projected_add: dict[str, Any] = add_raw if isinstance(add_raw, dict) else {}
+                strength = max(0.0, min(1.0, float(raw_effect.get("strength", 0.0) or 0.0)))
+                if strength <= 0.0:
+                    continue
+                impacts.append(
+                    ProjectedImpact(
+                        source_ship_id=source_ship_id,
+                        target_ship_id="",
+                        effect=ModuleEffect(
+                            name=str(raw_effect.get("name", "") or ""),
+                            effect_class=EffectClass.PROJECTED,
+                            state_required=ModuleState.ACTIVE,
+                            projected_mult={str(key): float(value) for key, value in projected_mult.items()},
+                            projected_add={str(key): float(value) for key, value in projected_add.items()},
+                        ),
+                        strength=strength,
+                    )
+                )
+        return impacts or None
+
+    def _remember_projection_formula_base(
+        self,
+        runtime,
+        profile: ShipProfile,
+        local_signature: tuple[tuple[str, str], ...] | None,
+        booster_signature: tuple[Any, ...],
+        projected_snapshots: list[dict[str, Any]],
+    ) -> None:
+        if projected_snapshots:
+            return
+        runtime.diagnostics["pyfa_projection_formula_base_profile"] = replace(profile)
+        runtime.diagnostics["pyfa_projection_formula_local_signature"] = local_signature
+        runtime.diagnostics["pyfa_projection_formula_command_signature"] = booster_signature
+
+    def _recompute_profile_from_formula_base(
+        self,
+        runtime,
+        local_signature: tuple[tuple[str, str], ...] | None,
+        booster_signature: tuple[Any, ...],
+        projected_snapshots: list[dict[str, Any]],
+        *,
+        tick: int,
+        ship_id: str,
+    ) -> ShipProfile | None:
+        baseline = runtime.diagnostics.get("pyfa_projection_formula_base_profile")
+        baseline_local_signature = runtime.diagnostics.get("pyfa_projection_formula_local_signature")
+        baseline_command_signature = runtime.diagnostics.get("pyfa_projection_formula_command_signature")
+        if not isinstance(baseline, ShipProfile):
+            return None
+        if baseline_local_signature != local_signature:
+            return None
+        if baseline_command_signature != booster_signature:
+            return None
+        impacts = self._formula_impacts_from_projected_snapshots(projected_snapshots)
+        if impacts is None:
+            return None
+        started = time.perf_counter()
+        profile = self._apply_runtime_projected_impacts(replace(baseline), impacts)
+        self._log_hotspot(
+            "combat.projected_formula_profile",
+            started,
+            tick=tick,
+            ship=ship_id,
+            projected_sources=len(projected_snapshots),
+        )
+        return profile
+
+    @staticmethod
+    def _copy_runtime_dynamic_state(source_runtime, target_runtime) -> None:
+        source_by_module_id = {module.module_id: module for module in source_runtime.modules}
+        for module in target_runtime.modules:
+            source_module = source_by_module_id.get(module.module_id)
+            if source_module is None:
+                continue
+            module.state = source_module.state
+            if module.charge_capacity > 0:
+                module.charge_remaining = max(0.0, min(float(source_module.charge_remaining), float(module.charge_capacity)))
+
+    def _minimum_potential_cycle_time(self, world: WorldState) -> float | None:
+        minimum: float | None = None
+        for ship in world.ships.values():
+            if not ship.vital.alive or ship.runtime is None:
+                continue
+            for module in ship.runtime.modules:
+                if module.state == module.state.OFFLINE:
+                    continue
+                active_effects = [
+                    effect
+                    for effect in module.effects
+                    if str(effect.state_required.value).upper() == "ACTIVE" and effect.cycle_time > 0.0
+                ]
+                if not active_effects:
+                    continue
+                cycle_time = min(max(0.1, float(effect.cycle_time)) for effect in active_effects)
+                if minimum is None or cycle_time < minimum:
+                    minimum = cycle_time
+        return minimum
+
+    def recommended_time_slice(self, world: WorldState, max_dt: float) -> float:
+        slice_dt = max(1e-6, float(max_dt))
+        now = float(world.now)
+        epsilon = 1e-6
+
+        def note_duration(value: float | None) -> None:
+            nonlocal slice_dt
+            if value is None:
+                return
+            try:
+                duration = float(value)
+            except Exception:
+                return
+            if epsilon < duration < slice_dt:
+                slice_dt = duration
+
+        for ship in world.ships.values():
+            if not ship.vital.alive:
+                continue
+
+            for timers in (
+                ship.combat.lock_timers,
+                ship.combat.module_cycle_timers,
+                ship.combat.module_reactivation_timers,
+                ship.combat.module_ammo_reload_timers,
+                ship.combat.module_pending_ammo_reload_timers,
+            ):
+                for remaining in timers.values():
+                    note_duration(remaining)
+
+            for ready_at in ship.combat.fire_delay_timers.values():
+                note_duration(float(ready_at) - now)
+
+            for jam_until in ship.combat.ecm_jam_sources.values():
+                note_duration(float(jam_until) - now)
+
+            last_enemy_damage = float(getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) or -1e9)
+            note_duration(30.0 - (now - last_enemy_damage))
+
+        for timers in world.squad_prelock_timers.values():
+            for remaining in timers.values():
+                note_duration(remaining)
+
+        if abs(slice_dt - float(max_dt)) <= epsilon:
+            note_duration(self._minimum_potential_cycle_time(world))
+
+        return max(epsilon, min(slice_dt, float(max_dt)))
 
     def _log_event(self, event: str, **fields: Any) -> None:
         if not self.event_logging_enabled:
@@ -644,11 +1330,10 @@ class CombatSystem:
             if not source.vital.alive or source.runtime is None:
                 continue
             for module in source.runtime.modules:
-                if self._module_uses_pyfa_projected_profile(module):
+                metadata = self._module_static_metadata(module)
+                if metadata.uses_pyfa_projected_profile:
                     continue
-                for effect_index, effect in enumerate(module.effects):
-                    if effect.effect_class != EffectClass.PROJECTED:
-                        continue
+                for effect_index, effect in metadata.projected_effects:
                     if not module.is_active_for(effect.state_required):
                         continue
 
@@ -797,6 +1482,15 @@ class CombatSystem:
         )
 
     @staticmethod
+    def _module_is_ecm_module(module) -> bool:
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "ecm",
+            ),
+        )
+
+    @staticmethod
     def _module_uses_pyfa_projected_profile(module) -> bool:
         if not CombatSystem._module_has_projected(module):
             return False
@@ -805,6 +1499,8 @@ class CombatSystem:
         if CombatSystem._module_is_smart_bomb_module(module):
             return False
         if CombatSystem._module_is_burst_jammer_module(module):
+            return False
+        if CombatSystem._module_is_ecm_module(module):
             return False
         if CombatSystem._module_is_weapon_module(module):
             return False
@@ -976,7 +1672,8 @@ class CombatSystem:
         state_by_module_id: dict[str, str] = {}
         has_active_in_range = False
         for module in source.runtime.modules:
-            if not self._module_is_command_burst_module(module):
+            metadata = self._module_static_metadata(module)
+            if not metadata.is_command_burst:
                 continue
             state_value = str(module.state.value or "ONLINE").upper()
             target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, module.module_id, target.ship_id)
@@ -1000,24 +1697,64 @@ class CombatSystem:
 
     def _collect_command_booster_snapshots(self, world: WorldState) -> dict[str, list[dict[str, Any]]]:
         snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
-        friendly_sources = [
-            ship
-            for ship in world.ships.values()
-            if ship.vital.alive and ship.runtime is not None and any(self._module_is_command_burst_module(module) for module in ship.runtime.modules)
-        ]
-        if not friendly_sources:
-            return snapshots_by_ship
-
-        for target in world.ships.values():
-            if not target.vital.alive or target.runtime is None:
+        for source in world.ships.values():
+            if not source.vital.alive or source.runtime is None:
                 continue
-            target_snapshots: list[dict[str, Any]] = []
-            for source in friendly_sources:
-                snapshot = self._command_booster_snapshot_for_target(source, target)
-                if snapshot is not None:
-                    target_snapshots.append(snapshot)
-            if target_snapshots:
-                snapshots_by_ship[target.ship_id] = target_snapshots
+
+            blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
+            if not isinstance(blueprint, dict):
+                continue
+
+            command_modules = [
+                module
+                for module in source.runtime.modules
+                if self._module_static_metadata(module).is_command_burst
+            ]
+            if not command_modules:
+                continue
+
+            base_state_by_module_id: dict[str, str] = {}
+            active_state_by_module_id: dict[str, str] = {}
+            active_targets_by_module_id: dict[str, set[str]] = {}
+            covered_targets: set[str] = set()
+
+            for module in command_modules:
+                state_value = str(module.state.value or "ONLINE").upper()
+                base_state_by_module_id[module.module_id] = "ONLINE" if state_value in {"ACTIVE", "OVERHEATED"} else state_value
+                if state_value not in {"ACTIVE", "OVERHEATED"}:
+                    continue
+
+                target_ids = {
+                    target_id
+                    for target_id in self._module_cycle_snapshots_for(source.ship_id, module.module_id)
+                    if (target := world.ships.get(target_id)) is not None and target.vital.alive and target.team == source.team and target.runtime is not None
+                }
+                if not target_ids:
+                    continue
+
+                active_state_by_module_id[module.module_id] = state_value
+                active_targets_by_module_id[module.module_id] = target_ids
+                covered_targets.update(target_ids)
+
+            for target_id in sorted(covered_targets):
+                state_by_module_id = dict(base_state_by_module_id)
+                has_active_in_range = False
+                for module_id, target_ids in active_targets_by_module_id.items():
+                    if target_id not in target_ids:
+                        continue
+                    state_by_module_id[module_id] = active_state_by_module_id[module_id]
+                    has_active_in_range = True
+
+                if not has_active_in_range:
+                    continue
+
+                snapshots_by_ship.setdefault(target_id, []).append(
+                    {
+                        "fit_key": str(source.runtime.fit_key or ""),
+                        "blueprint": blueprint,
+                        "state_by_module_id": state_by_module_id,
+                    }
+                )
 
         return snapshots_by_ship
 
@@ -1036,7 +1773,8 @@ class CombatSystem:
         source_command_snapshots = command_boosters_by_ship.get(source.ship_id, [])
         snapshots: list[dict[str, Any]] = []
         for active_projected_module in source.runtime.modules:
-            if not self._module_uses_pyfa_projected_profile(active_projected_module):
+            active_metadata = self._module_static_metadata(active_projected_module)
+            if not active_metadata.uses_pyfa_projected_profile:
                 continue
             active_state = str(active_projected_module.state.value or "ONLINE").upper()
             if active_state not in {"ACTIVE", "OVERHEATED"}:
@@ -1047,23 +1785,20 @@ class CombatSystem:
             target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target.ship_id)
             if target_snapshot is None:
                 continue
+            distance_mode = self._projected_distance_mode(active_projected_module)
 
             state_by_module_id: dict[str, str] = {}
             for module in source.runtime.modules:
+                metadata = self._module_static_metadata(module)
                 state_value = str(module.state.value or "ONLINE").upper()
                 projected_state = state_value
 
                 if state_value in {"ACTIVE", "OVERHEATED"}:
-                    if self._module_is_command_burst_module(module):
+                    if metadata.is_command_burst:
                         projected_state = state_value
-                    elif self._module_uses_pyfa_projected_profile(module):
+                    elif metadata.uses_pyfa_projected_profile:
                         projected_state = state_value if module.module_id == active_projected_module.module_id else "ONLINE"
-                    elif (
-                        self._module_is_area_effect_module(module)
-                        or self._module_is_weapon_module(module)
-                        or self._module_has_projected_rep(module)
-                        or self._module_is_cap_warfare_module(module)
-                    ):
+                    elif metadata.is_area_effect or metadata.is_weapon or metadata.has_projected_rep or metadata.is_cap_warfare:
                         projected_state = "ONLINE"
 
                 state_by_module_id[module.module_id] = projected_state
@@ -1074,6 +1809,9 @@ class CombatSystem:
                     "blueprint": blueprint,
                     "state_by_module_id": state_by_module_id,
                     "command_booster_snapshots": source_command_snapshots,
+                    "distance_mode": distance_mode,
+                    "formula_effects": self._module_formula_effect_payloads(active_projected_module, target_snapshot),
+                    "pyfa_projection_range": target_snapshot.distance,
                     "projection_range": target_snapshot.distance,
                 }
             )
@@ -1086,24 +1824,62 @@ class CombatSystem:
         command_boosters_by_ship: dict[str, list[dict[str, Any]]],
     ) -> dict[str, list[dict[str, Any]]]:
         snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
-        projected_sources = [
-            ship
-            for ship in world.ships.values()
-            if ship.vital.alive
-            and ship.runtime is not None
-            and any(self._module_uses_pyfa_projected_profile(module) for module in ship.runtime.modules)
-        ]
-        if not projected_sources:
-            return snapshots_by_ship
-
-        for target in world.ships.values():
-            if not target.vital.alive or target.runtime is None:
+        for source in world.ships.values():
+            if not source.vital.alive or source.runtime is None:
                 continue
-            target_snapshots: list[dict[str, Any]] = []
-            for source in projected_sources:
-                target_snapshots.extend(self._projected_source_snapshots_for_target(source, target, command_boosters_by_ship))
-            if target_snapshots:
-                snapshots_by_ship[target.ship_id] = target_snapshots
+
+            blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
+            if not isinstance(blueprint, dict):
+                continue
+
+            source_command_snapshots = command_boosters_by_ship.get(source.ship_id, [])
+            base_state_by_module_id: dict[str, str] = {}
+            active_projected_modules: list[tuple[Any, str]] = []
+
+            for module in source.runtime.modules:
+                metadata = self._module_static_metadata(module)
+                state_value = str(module.state.value or "ONLINE").upper()
+                projected_state = state_value
+
+                if state_value in {"ACTIVE", "OVERHEATED"}:
+                    if metadata.is_command_burst:
+                        projected_state = state_value
+                    elif metadata.uses_pyfa_projected_profile:
+                        projected_state = "ONLINE"
+                    elif metadata.is_area_effect or metadata.is_weapon or metadata.has_projected_rep or metadata.is_cap_warfare:
+                        projected_state = "ONLINE"
+
+                base_state_by_module_id[module.module_id] = projected_state
+
+                if metadata.uses_pyfa_projected_profile and state_value in {"ACTIVE", "OVERHEATED"}:
+                    active_projected_modules.append((module, state_value))
+
+            for active_projected_module, active_state in active_projected_modules:
+                target_id = source.combat.projected_targets.get(active_projected_module.module_id)
+                if not target_id:
+                    continue
+                target = world.ships.get(target_id)
+                if target is None or not target.vital.alive or target.runtime is None:
+                    continue
+                target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target_id)
+                if target_snapshot is None:
+                    continue
+                distance_mode = self._projected_distance_mode(active_projected_module)
+
+                state_by_module_id = dict(base_state_by_module_id)
+                state_by_module_id[active_projected_module.module_id] = active_state
+                snapshots_by_ship.setdefault(target_id, []).append(
+                    {
+                        "fit_key": f"{source.runtime.fit_key}:{active_projected_module.module_id}",
+                        "blueprint": blueprint,
+                        "state_by_module_id": state_by_module_id,
+                        "command_booster_snapshots": source_command_snapshots,
+                        "distance_mode": distance_mode,
+                        "formula_effects": self._module_formula_effect_payloads(active_projected_module, target_snapshot),
+                        "pyfa_projection_range": target_snapshot.distance,
+                        "projection_range": target_snapshot.distance,
+                    }
+                )
 
         return snapshots_by_ship
 
@@ -1113,30 +1889,160 @@ class CombatSystem:
         command_boosters_by_ship: dict[str, list[dict[str, Any]]],
         projected_sources_by_ship: dict[str, list[dict[str, Any]]],
     ) -> None:
+        pending_batches: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+
         for ship in world.ships.values():
             if not ship.vital.alive or ship.runtime is None:
                 continue
 
-            booster_snapshots = command_boosters_by_ship.get(ship.ship_id)
-            projected_snapshots = projected_sources_by_ship.get(ship.ship_id)
-            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots, projected_snapshots)
+            booster_snapshots = command_boosters_by_ship.get(ship.ship_id, [])
+            projected_snapshots = projected_sources_by_ship.get(ship.ship_id, [])
+            local_signature = self._local_runtime_state_signature_from_metadata(ship.runtime)
+            booster_signature = self._command_snapshot_list_signature(booster_snapshots)
+            projected_signature = self._projected_snapshot_list_signature(projected_snapshots)
+            projected_structure_signature = self._projected_snapshot_structure_signature(projected_snapshots)
             cached_signature = ship.runtime.diagnostics.get("pyfa_resolve_signature")
             cached_base_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
-            if cache_key is not None and cached_signature == cache_key and isinstance(cached_base_profile, ShipProfile):
+            cached_local_signature = ship.runtime.diagnostics.get("pyfa_local_state_signature")
+            cached_command_signature = ship.runtime.diagnostics.get("pyfa_command_booster_signature")
+            cached_projected_signature = ship.runtime.diagnostics.get("pyfa_projected_sources_signature")
+            cached_projected_structure_signature = ship.runtime.diagnostics.get("pyfa_projected_sources_structure_signature")
+            if (
+                local_signature is not None
+                and cached_local_signature == local_signature
+                and cached_command_signature == booster_signature
+                and cached_projected_signature == projected_signature
+                and isinstance(cached_base_profile, ShipProfile)
+            ):
+                ship.runtime.diagnostics["pyfa_command_boosters"] = booster_snapshots
+                ship.runtime.diagnostics["pyfa_projected_sources"] = projected_snapshots
+                ship.runtime.diagnostics["pyfa_command_booster_signature"] = booster_signature
+                ship.runtime.diagnostics["pyfa_projected_sources_signature"] = projected_signature
+                ship.runtime.diagnostics["pyfa_projected_sources_structure_signature"] = projected_structure_signature
                 ship.profile = replace(cached_base_profile)
+                self._remember_projection_formula_base(ship.runtime, ship.profile, local_signature, booster_signature, projected_snapshots)
                 continue
 
-            resolved = resolve_runtime_from_pyfa_runtime(ship.runtime, booster_snapshots, projected_snapshots)
-            if resolved is None:
-                if isinstance(cached_base_profile, ShipProfile):
-                    ship.profile = replace(cached_base_profile)
+            formula_profile = None
+            if projected_snapshots:
+                formula_profile = self._recompute_profile_from_formula_base(
+                    ship.runtime,
+                    local_signature,
+                    booster_signature,
+                    projected_snapshots,
+                    tick=int(world.tick),
+                    ship_id=ship.ship_id,
+                )
+            if formula_profile is not None:
+                ship.runtime.diagnostics.pop("pyfa_resolve_signature", None)
+                if local_signature is not None:
+                    ship.runtime.diagnostics["pyfa_local_state_signature"] = local_signature
+                ship.runtime.diagnostics["pyfa_command_boosters"] = booster_snapshots
+                ship.runtime.diagnostics["pyfa_projected_sources"] = projected_snapshots
+                ship.runtime.diagnostics["pyfa_command_booster_signature"] = booster_signature
+                ship.runtime.diagnostics["pyfa_projected_sources_signature"] = projected_signature
+                ship.runtime.diagnostics["pyfa_projected_sources_structure_signature"] = projected_structure_signature
+                ship.runtime.diagnostics["pyfa_base_profile"] = replace(formula_profile)
+                ship.profile = replace(formula_profile)
                 continue
+
+            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots, projected_snapshots)
+            if cache_key is not None and cached_signature == cache_key and isinstance(cached_base_profile, ShipProfile):
+                if local_signature is not None:
+                    ship.runtime.diagnostics["pyfa_local_state_signature"] = local_signature
+                ship.runtime.diagnostics["pyfa_command_boosters"] = booster_snapshots
+                ship.runtime.diagnostics["pyfa_projected_sources"] = projected_snapshots
+                ship.runtime.diagnostics["pyfa_command_booster_signature"] = booster_signature
+                ship.runtime.diagnostics["pyfa_projected_sources_signature"] = projected_signature
+                ship.runtime.diagnostics["pyfa_projected_sources_structure_signature"] = projected_structure_signature
+                ship.profile = replace(cached_base_profile)
+                self._remember_projection_formula_base(ship.runtime, ship.profile, local_signature, booster_signature, projected_snapshots)
+                continue
+
+            batch_key = cache_key if cache_key is not None else ("ship", ship.ship_id)
+            pending_batches.setdefault(batch_key, []).append(
+                {
+                    "ship": ship,
+                    "runtime": ship.runtime,
+                    "booster_snapshots": booster_snapshots,
+                    "projected_snapshots": projected_snapshots,
+                    "booster_signature": booster_signature,
+                    "projected_signature": projected_signature,
+                    "local_signature": local_signature,
+                    "cache_key": cache_key,
+                }
+            )
+
+        for pending_group in pending_batches.values():
+            first_pending = pending_group[0]
+            resolve_started = time.perf_counter()
+            resolved = resolve_runtime_from_pyfa_runtime(
+                first_pending["runtime"],
+                first_pending["booster_snapshots"],
+                first_pending["projected_snapshots"],
+            )
+            resolve_cache = "error"
+            if resolved is not None:
+                resolve_cache = str(resolved[0].diagnostics.get("pyfa_runtime_resolve_cache", "unknown") or "unknown")
+            self._log_hotspot(
+                "combat.pyfa_resolve_batch",
+                resolve_started,
+                tick=int(world.tick),
+                batch_size=len(pending_group),
+                ship_ids=tuple(str(pending["ship"].ship_id) for pending in pending_group),
+                fit_key=str(first_pending["runtime"].fit_key or ""),
+                command_sources=len(first_pending["booster_snapshots"]),
+                projected_sources=len(first_pending["projected_snapshots"]),
+                success=resolved is not None,
+                resolve_cache=resolve_cache,
+            )
+            if resolved is None:
+                for pending in pending_group:
+                    cached_base_profile = pending["runtime"].diagnostics.get("pyfa_base_profile")
+                    if isinstance(cached_base_profile, ShipProfile):
+                        pending["ship"].profile = replace(cached_base_profile)
+                continue
+
             resolved_runtime, resolved_profile = resolved
-            if cache_key is not None:
-                resolved_runtime.diagnostics["pyfa_resolve_signature"] = cache_key
             resolved_runtime.diagnostics["pyfa_base_profile"] = replace(resolved_profile)
-            ship.runtime = resolved_runtime
-            ship.profile = resolved_profile
+
+            for index, pending in enumerate(pending_group):
+                source_runtime = pending["runtime"]
+                ship = pending["ship"]
+                target_runtime = resolved_runtime if index == 0 else deepcopy(resolved_runtime)
+                target_runtime.fit_key = source_runtime.fit_key
+
+                blueprint = source_runtime.diagnostics.get("pyfa_blueprint")
+                if isinstance(blueprint, dict):
+                    target_runtime.diagnostics["pyfa_blueprint"] = deepcopy(blueprint)
+
+                if pending["cache_key"] is not None:
+                    target_runtime.diagnostics["pyfa_resolve_signature"] = pending["cache_key"]
+                else:
+                    target_runtime.diagnostics.pop("pyfa_resolve_signature", None)
+
+                if pending["local_signature"] is not None:
+                    target_runtime.diagnostics["pyfa_local_state_signature"] = pending["local_signature"]
+                else:
+                    target_runtime.diagnostics.pop("pyfa_local_state_signature", None)
+
+                target_runtime.diagnostics["pyfa_command_boosters"] = pending["booster_snapshots"]
+                target_runtime.diagnostics["pyfa_projected_sources"] = pending["projected_snapshots"]
+                target_runtime.diagnostics["pyfa_command_booster_signature"] = pending["booster_signature"]
+                target_runtime.diagnostics["pyfa_projected_sources_signature"] = pending["projected_signature"]
+                target_runtime.diagnostics["pyfa_projected_sources_structure_signature"] = self._projected_snapshot_structure_signature(pending["projected_snapshots"])
+                target_runtime.diagnostics["pyfa_base_profile"] = replace(resolved_profile)
+
+                self._copy_runtime_dynamic_state(source_runtime, target_runtime)
+                self._remember_projection_formula_base(
+                    target_runtime,
+                    resolved_profile,
+                    pending["local_signature"],
+                    pending["booster_signature"],
+                    pending["projected_snapshots"],
+                )
+                ship.runtime = target_runtime
+                ship.profile = replace(resolved_profile)
 
     def _module_has_area_enemies_in_range(self, world: WorldState, source, module) -> bool:
         for effect in module.effects:
@@ -1686,13 +2592,14 @@ class CombatSystem:
                     },
                 )
 
-    def _update_module_states(self, world: WorldState, dt: float) -> None:
+    def _update_module_states(self, world: WorldState, dt: float) -> bool:
         alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
         for candidate in world.ships.values():
             if candidate.vital.alive:
                 alive_by_team[candidate.team].append(candidate)
 
         changed_focus_keys = self._changed_focus_queues(world)
+        pyfa_remote_inputs_dirty = False
 
         for ship in world.ships.values():
             if not ship.vital.alive or ship.runtime is None:
@@ -1703,7 +2610,22 @@ class CombatSystem:
             force_target_reselect = self._focus_key(ship.team, ship.squad_id) in changed_focus_keys
 
             for module in ship.runtime.modules:
+                metadata = self._module_static_metadata(module)
+                if module.state == module.state.ACTIVE:
+                    active_timer = ship.combat.module_cycle_timers.get(module.module_id)
+                    if active_timer is not None:
+                        timer_left = active_timer - dt
+                        if timer_left > 0:
+                            ship.combat.module_cycle_timers[module.module_id] = timer_left
+                            continue
+
                 if module.state == module.state.OFFLINE:
+                    if self._module_affects_pyfa_remote_inputs(module) and (
+                        module.module_id in ship.combat.projected_targets
+                        or module.module_id in ship.combat.module_cycle_timers
+                        or bool(self._module_cycle_snapshots_for(ship.ship_id, module.module_id))
+                    ):
+                        pyfa_remote_inputs_dirty = True
                     self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
                     ship.combat.module_reactivation_timers.pop(module.module_id, None)
                     ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
@@ -1712,12 +2634,9 @@ class CombatSystem:
 
                 previous_state = module.state
                 previous_projected_target = ship.combat.projected_targets.get(module.module_id)
+                active_timer = ship.combat.module_cycle_timers.get(module.module_id) if module.state == module.state.ACTIVE else None
 
-                active_effects = [
-                    effect
-                    for effect in module.effects
-                    if str(effect.state_required.value).upper() == "ACTIVE"
-                ]
+                active_effects = metadata.active_effects
                 if not active_effects:
                     if previous_state == module.state.ACTIVE:
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
@@ -1730,20 +2649,13 @@ class CombatSystem:
                     ship.combat.projected_targets.pop(module.module_id, None)
                     continue
 
-                cycle_cost = sum(max(0.0, effect.cap_need) for effect in active_effects)
-                cycle_time = min(
-                    (max(0.1, effect.cycle_time) for effect in active_effects if effect.cycle_time > 0),
-                    default=0.0,
-                )
-                reactivation_delay = max(
-                    (max(0.0, float(getattr(effect, "reactivation_delay", 0.0) or 0.0)) for effect in active_effects),
-                    default=0.0,
-                )
+                cycle_cost = metadata.cycle_cost
+                cycle_time = metadata.cycle_time
+                reactivation_delay = metadata.reactivation_delay
                 cycle_just_completed = False
                 ammo_reload_started_this_tick = False
 
                 if module.state == module.state.ACTIVE and cycle_time > 0:
-                    active_timer = ship.combat.module_cycle_timers.get(module.module_id)
                     if active_timer is not None:
                         timer_left = active_timer - dt
                         if timer_left > 0:
@@ -1783,10 +2695,10 @@ class CombatSystem:
                             ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
                             ammo_reload_started_this_tick = True
 
-                decision_rule = self._module_decision_rule(module)
+                decision_rule = metadata.decision_rule
                 desired_active = False
                 projected_target_id: str | None = None
-                has_projected = self._module_has_projected(module)
+                has_projected = metadata.has_projected
                 cycle_started = False
 
                 if has_projected:
@@ -1825,7 +2737,7 @@ class CombatSystem:
                     decision_rule,
                     projected_target_id,
                 )
-                if has_projected and projected_target_id is None and not self._module_is_area_effect_module(module):
+                if has_projected and projected_target_id is None and not metadata.is_area_effect:
                     desired_active = False
 
                 ammo_reload_left = max(
@@ -1881,7 +2793,7 @@ class CombatSystem:
 
                 activation_target_id: str | None = (
                     projected_target_id
-                    if has_projected and not self._module_is_area_effect_module(module)
+                    if has_projected and not metadata.is_area_effect
                     else None
                 )
 
@@ -1896,7 +2808,7 @@ class CombatSystem:
                     ):
                         desired_active = False
 
-                if has_projected and projected_target_id is None and not self._module_is_area_effect_module(module):
+                if has_projected and projected_target_id is None and not metadata.is_area_effect:
                     desired_active = False
 
                 if desired_active:
@@ -1922,7 +2834,7 @@ class CombatSystem:
 
                 # ECM is resolved once at cycle start so first activation round shows immediate result.
                 if cycle_started:
-                    if self._module_is_burst_jammer_module(module):
+                    if metadata.is_burst_jammer:
                         self._resolve_area_ecm_cycle(world, ship, module)
                     elif projected_target_id is not None:
                         self._resolve_ecm_cycle(world, ship, module, projected_target_id)
@@ -1975,6 +2887,19 @@ class CombatSystem:
                             "cap_cost": cycle_cost,
                         },
                     )
+
+                if metadata.affects_local_pyfa_profile and previous_state != module.state:
+                    if self._runtime_has_active_pyfa_remote_inputs(ship.runtime):
+                        pyfa_remote_inputs_dirty = True
+
+                if self._module_affects_pyfa_remote_inputs(module) and (
+                    previous_state != module.state
+                    or previous_projected_target != projected_target_id
+                    or cycle_started
+                ):
+                    pyfa_remote_inputs_dirty = True
+
+        return pyfa_remote_inputs_dirty
 
     def _apply_projected_cycle_effects(
         self,
@@ -2071,34 +2996,10 @@ class CombatSystem:
         if ship.runtime is None:
             return ship.profile
 
-        base = replace(ship.profile)
         applied = impacts.get(ship.ship_id)
         if not applied:
-            return base
-        effective = self.runtime.apply_projected_effects(base, applied)
-        for attr in (
-            "weapon_system",
-            "optimal_sig",
-            "turret_dps",
-            "missile_dps",
-            "turret_cycle",
-            "missile_cycle",
-            "damage_em",
-            "damage_thermal",
-            "damage_kinetic",
-            "damage_explosive",
-            "turret_em_dps",
-            "turret_thermal_dps",
-            "turret_kinetic_dps",
-            "turret_explosive_dps",
-            "missile_em_dps",
-            "missile_thermal_dps",
-            "missile_kinetic_dps",
-            "missile_explosive_dps",
-            "missile_damage_reduction_factor",
-        ):
-            setattr(effective, attr, getattr(base, attr, getattr(effective, attr, 0.0)))
-        return effective
+            return ship.profile
+        return self._apply_runtime_projected_impacts(ship.profile, applied)
 
     @staticmethod
     def _focus_key(team, squad_id: str) -> str:
@@ -2198,20 +3099,73 @@ class CombatSystem:
 
     def run(self, world: WorldState, dt: float) -> None:
         self._prune_cycle_effect_snapshots(world)
+        self._refresh_alive_runtime_ship_ids(world)
         if self.event_logging_enabled:
             self._advance_merge_window(world.now)
         else:
             self._merged_event_buckets.clear()
             self._merge_window_start_time = None
             self._merge_window_end_time = None
-        self._update_ecm_restrictions(world)
-        self._advance_target_locks(world, dt)
-        self._update_module_states(world, dt)
-        command_boosters = self._collect_command_booster_snapshots(world)
-        projected_sources = self._collect_projected_source_snapshots(world, command_boosters)
-        self._refresh_effective_runtimes_from_pyfa(world, command_boosters, projected_sources)
-        projected = self._collect_projected_impacts(world, dt)
 
+        started = time.perf_counter()
+        self._update_ecm_restrictions(world)
+        self._log_hotspot("combat.update_ecm_restrictions", started, tick=int(world.tick), dt=dt)
+
+        started = time.perf_counter()
+        self._advance_target_locks(world, dt)
+        self._log_hotspot("combat.advance_target_locks", started, tick=int(world.tick), dt=dt)
+
+        started = time.perf_counter()
+        if self._update_module_states(world, dt):
+            self._mark_pyfa_remote_inputs_dirty()
+        self._log_hotspot("combat.update_module_states", started, tick=int(world.tick), dt=dt)
+
+        reusable_cached_profiles: list[tuple[Any, ShipProfile]] = []
+        can_restore_cached_pyfa_bases = False
+        if (not self._pyfa_remote_inputs_dirty) and self._cached_pyfa_remote_inputs_available():
+            can_restore_cached_pyfa_bases, remote_recollect_required, reusable_cached_profiles = self._validate_cached_pyfa_base_profiles(world)
+            if remote_recollect_required:
+                self._mark_pyfa_remote_inputs_dirty()
+                can_restore_cached_pyfa_bases = False
+                reusable_cached_profiles = []
+
+        reuse_remote_pyfa_inputs = (not self._pyfa_remote_inputs_dirty) and self._cached_pyfa_remote_inputs_available()
+
+        started = time.perf_counter()
+        if reuse_remote_pyfa_inputs:
+            command_boosters = self._cached_command_booster_snapshots or {}
+        else:
+            command_boosters = self._collect_command_booster_snapshots(world)
+        self._log_hotspot("combat.collect_command_boosters", started, tick=int(world.tick), ships=len(command_boosters))
+
+        started = time.perf_counter()
+        if reuse_remote_pyfa_inputs:
+            projected_sources = self._cached_projected_source_snapshots or {}
+        else:
+            projected_sources = self._collect_projected_source_snapshots(world, command_boosters)
+            self._cached_command_booster_snapshots = command_boosters
+            self._cached_projected_source_snapshots = projected_sources
+            self._pyfa_remote_inputs_dirty = False
+        self._log_hotspot("combat.collect_projected_sources", started, tick=int(world.tick), ships=len(projected_sources))
+
+        started = time.perf_counter()
+        if reuse_remote_pyfa_inputs and can_restore_cached_pyfa_bases:
+            for ship, cached_profile in reusable_cached_profiles:
+                ship.profile = replace(cached_profile)
+        else:
+            self._refresh_effective_runtimes_from_pyfa(world, command_boosters, projected_sources)
+        self._log_hotspot("combat.refresh_effective_runtimes", started, tick=int(world.tick), ships=len(world.ships))
+
+        started = time.perf_counter()
+        projected = self._collect_projected_impacts(world, dt)
+        self._log_hotspot(
+            "combat.collect_projected_impacts",
+            started,
+            tick=int(world.tick),
+            targets=sum(len(v) for v in projected.values()),
+        )
+
+        started = time.perf_counter()
         effective_profiles: dict[str, ShipProfile] = {}
         for ship in world.ships.values():
             if not ship.vital.alive:
@@ -2223,6 +3177,7 @@ class CombatSystem:
             effective = effective_profiles.get(ship.ship_id)
             if effective is not None:
                 ship.profile = effective
+        self._log_hotspot("combat.apply_effective_profiles", started, tick=int(world.tick), ships=len(effective_profiles))
 
         self._update_squad_prelocks(world, dt, effective_profiles)
 

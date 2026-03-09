@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import logging
+import time
 
 from .agents import CommanderAgent, ShipAgent
 from .config import EngineConfig
-from .sim_logging import get_sim_logger
+from .sim_logging import get_sim_logger, log_sim_event
 from .systems import CombatSystem, LogisticsSystem, MovementSystem, PerceptionSystem
 from .world import WorldState
 
@@ -21,10 +22,28 @@ class SimulationEngine:
         self.perception = PerceptionSystem()
         self.movement = MovementSystem(config.battlefield_radius)
         self.combat = combat_system
-        self.combat.attach_logger(self._logger, self.config.detailed_logging, self.config.log_merge_window_sec)
+        self.combat.attach_logger(
+            self._logger,
+            self.config.detailed_logging,
+            self.config.log_merge_window_sec,
+            self.config.hotspot_logging,
+        )
         self.logistics = LogisticsSystem()
 
         self._dt = 1.0 / config.tick_rate
+
+    def _log_hotspot(self, name: str, start_time: float, **fields) -> None:
+        if not bool(getattr(self.config, "hotspot_logging", False)):
+            return
+        if self._logger.disabled:
+            return
+        log_sim_event(
+            self._logger,
+            "hotspot",
+            name=name,
+            duration_ms=(time.perf_counter() - start_time) * 1000.0,
+            **fields,
+        )
 
     def register_commander(self, commander: CommanderAgent) -> None:
         self.commanders.append(commander)
@@ -33,23 +52,56 @@ class SimulationEngine:
         self.ship_agents[ship_id] = ShipAgent(agent_id=f"agent:{ship_id}", ship_id=ship_id)
 
     def step(self) -> None:
+        step_perf_started = time.perf_counter()
         self.world.tick += 1
-        self.world.now += self._dt
 
+        step_start = float(self.world.now)
+        step_end = step_start + self._dt
+        self.world.now = step_end
+
+        perf_started = time.perf_counter()
         self.perception.run(self.world)
+        self._log_hotspot("engine.perception", perf_started, tick=self.world.tick)
 
+        perf_started = time.perf_counter()
         for commander in self.commanders:
             commander.think(self.world)
+        self._log_hotspot("engine.commanders", perf_started, tick=self.world.tick, commanders=len(self.commanders))
 
+        perf_started = time.perf_counter()
         for agent in self.ship_agents.values():
             agent.sense(self.world)
             agent.think(self.world)
+        self._log_hotspot("engine.ship_agents", perf_started, tick=self.world.tick, agents=len(self.ship_agents))
 
-        sub_dt = self._dt / max(1, self.config.physics_substeps)
-        for _ in range(self.config.physics_substeps):
-            self.movement.run(self.world, sub_dt)
-            self.combat.run(self.world, sub_dt)
-            self.logistics.run(self.world, sub_dt)
+        remaining_dt = self._dt
+        base_slice_dt = self._dt / max(1, self.config.physics_substeps)
+        self.world.now = step_start
+        slice_index = 0
+
+        while remaining_dt > 1e-9:
+            slice_budget = min(base_slice_dt, remaining_dt)
+            slice_dt = self.combat.recommended_time_slice(self.world, slice_budget)
+            slice_dt = max(1e-6, min(slice_budget, slice_dt))
+            self.world.now = min(step_end, float(self.world.now) + slice_dt)
+
+            perf_started = time.perf_counter()
+            self.movement.run(self.world, slice_dt)
+            self._log_hotspot("engine.movement", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
+
+            perf_started = time.perf_counter()
+            self.combat.run(self.world, slice_dt)
+            self._log_hotspot("engine.combat", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
+
+            perf_started = time.perf_counter()
+            self.logistics.run(self.world, slice_dt)
+            self._log_hotspot("engine.logistics", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
+
+            remaining_dt = max(0.0, remaining_dt - slice_dt)
+            slice_index += 1
+
+        self.world.now = step_end
+        self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=slice_index)
 
     def snapshot(self) -> dict:
         ships = {}

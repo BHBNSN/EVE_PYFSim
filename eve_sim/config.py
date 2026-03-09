@@ -12,7 +12,9 @@ class EngineConfig:
     lockstep: bool = True
     battlefield_radius: float = 800_000.0
     detailed_logging: bool = False
+    hotspot_logging: bool = False
     detail_log_file: str = "logs/sim_detail.log"
+    hotspot_log_file: str = "logs/sim_hotspot.log"
     log_merge_window_sec: float = 1.0
 
 

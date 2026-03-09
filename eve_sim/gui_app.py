@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import random
 import time
-from typing import Callable, Literal, cast
+from typing import Any, Callable, Literal, cast
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
@@ -121,7 +121,7 @@ class UiState:
 
 @dataclass(slots=True)
 class UiPreferences:
-    config_version: int = 4
+    config_version: int = 6
     selected_squad: str = "BLUE-ALPHA"
     filter_team: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"] = "ALL"
     filter_role: str = "ALL"
@@ -136,7 +136,9 @@ class UiPreferences:
     engine_lockstep: bool = True
     engine_battlefield_radius: float = 800_000.0
     engine_detailed_logging: bool = True
+    engine_hotspot_logging: bool = False
     engine_detail_log_file: str = "logs/sim_detail.log"
+    engine_hotspot_log_file: str = "logs/sim_hotspot.log"
     engine_log_merge_window_sec: float = 1.0
 
 
@@ -697,8 +699,14 @@ class FleetSetupDialog(QDialog):
         self.lbl_cfg_detailed_log = QLabel(settings_tab)
         self.chk_cfg_detailed_log = QCheckBox(settings_tab)
 
+        self.lbl_cfg_hotspot_log = QLabel(settings_tab)
+        self.chk_cfg_hotspot_log = QCheckBox(settings_tab)
+
         self.lbl_cfg_log_file = QLabel(settings_tab)
         self.edit_cfg_log_file = QLineEdit(settings_tab)
+
+        self.lbl_cfg_hotspot_log_file = QLabel(settings_tab)
+        self.edit_cfg_hotspot_log_file = QLineEdit(settings_tab)
 
         self.lbl_cfg_log_merge_window = QLabel(settings_tab)
         self.spin_cfg_log_merge_window = QDoubleSpinBox(settings_tab)
@@ -711,7 +719,9 @@ class FleetSetupDialog(QDialog):
         settings_form.addRow(self.lbl_cfg_radius, self.spin_cfg_radius)
         settings_form.addRow(self.lbl_cfg_lockstep, self.chk_cfg_lockstep)
         settings_form.addRow(self.lbl_cfg_detailed_log, self.chk_cfg_detailed_log)
+        settings_form.addRow(self.lbl_cfg_hotspot_log, self.chk_cfg_hotspot_log)
         settings_form.addRow(self.lbl_cfg_log_file, self.edit_cfg_log_file)
+        settings_form.addRow(self.lbl_cfg_hotspot_log_file, self.edit_cfg_hotspot_log_file)
         settings_form.addRow(self.lbl_cfg_log_merge_window, self.spin_cfg_log_merge_window)
         settings_layout.addLayout(settings_form)
         settings_layout.addStretch(1)
@@ -771,7 +781,9 @@ class FleetSetupDialog(QDialog):
         self.spin_cfg_radius.valueChanged.connect(self._on_engine_pref_changed)
         self.chk_cfg_lockstep.toggled.connect(self._on_engine_pref_changed)
         self.chk_cfg_detailed_log.toggled.connect(self._on_engine_pref_changed)
+        self.chk_cfg_hotspot_log.toggled.connect(self._on_engine_pref_changed)
         self.edit_cfg_log_file.textChanged.connect(self._on_engine_pref_changed)
+        self.edit_cfg_hotspot_log_file.textChanged.connect(self._on_engine_pref_changed)
         self.spin_cfg_log_merge_window.valueChanged.connect(self._on_engine_pref_changed)
 
         self._load_engine_preferences_into_controls()
@@ -960,7 +972,9 @@ class FleetSetupDialog(QDialog):
         self.lbl_cfg_radius.setText(tr(lang, "setup_cfg_battlefield_radius"))
         self.lbl_cfg_lockstep.setText(tr(lang, "setup_cfg_lockstep"))
         self.lbl_cfg_detailed_log.setText(tr(lang, "setup_cfg_detailed_logging"))
+        self.lbl_cfg_hotspot_log.setText(tr(lang, "setup_cfg_hotspot_logging"))
         self.lbl_cfg_log_file.setText(tr(lang, "setup_cfg_log_file"))
+        self.lbl_cfg_hotspot_log_file.setText(tr(lang, "setup_cfg_hotspot_log_file"))
         self.lbl_cfg_log_merge_window.setText(tr(lang, "setup_cfg_log_merge_window"))
         if self._network_mode == "client":
             self.lbl_engine_hint.setText(tr(lang, "setup_cfg_host_authority"))
@@ -973,7 +987,9 @@ class FleetSetupDialog(QDialog):
         self.spin_cfg_radius.setEnabled(enabled)
         self.chk_cfg_lockstep.setEnabled(enabled)
         self.chk_cfg_detailed_log.setEnabled(enabled)
+        self.chk_cfg_hotspot_log.setEnabled(enabled)
         self.edit_cfg_log_file.setEnabled(enabled)
+        self.edit_cfg_hotspot_log_file.setEnabled(enabled)
         self.spin_cfg_log_merge_window.setEnabled(enabled)
 
     def _load_engine_preferences_into_controls(self) -> None:
@@ -985,8 +1001,11 @@ class FleetSetupDialog(QDialog):
             self.spin_cfg_radius.setValue(max(1_000.0, float(self._pref.engine_battlefield_radius)))
             self.chk_cfg_lockstep.setChecked(bool(self._pref.engine_lockstep))
             self.chk_cfg_detailed_log.setChecked(bool(self._pref.engine_detailed_logging))
+            self.chk_cfg_hotspot_log.setChecked(bool(self._pref.engine_hotspot_logging))
             log_path = str(self._pref.engine_detail_log_file or "").strip() or defaults.detail_log_file
+            hotspot_log_path = str(self._pref.engine_hotspot_log_file or "").strip() or defaults.hotspot_log_file
             self.edit_cfg_log_file.setText(log_path)
+            self.edit_cfg_hotspot_log_file.setText(hotspot_log_path)
             self.spin_cfg_log_merge_window.setValue(max(0.1, float(self._pref.engine_log_merge_window_sec)))
         finally:
             self._engine_pref_loading = False
@@ -1000,7 +1019,9 @@ class FleetSetupDialog(QDialog):
         self._pref.engine_battlefield_radius = max(1_000.0, float(self.spin_cfg_radius.value()))
         self._pref.engine_lockstep = bool(self.chk_cfg_lockstep.isChecked())
         self._pref.engine_detailed_logging = bool(self.chk_cfg_detailed_log.isChecked())
+        self._pref.engine_hotspot_logging = bool(self.chk_cfg_hotspot_log.isChecked())
         self._pref.engine_detail_log_file = self.edit_cfg_log_file.text().strip() or defaults.detail_log_file
+        self._pref.engine_hotspot_log_file = self.edit_cfg_hotspot_log_file.text().strip() or defaults.hotspot_log_file
         self._pref.engine_log_merge_window_sec = max(0.1, float(self.spin_cfg_log_merge_window.value()))
         self._store.save(self._pref)
 
@@ -1012,7 +1033,9 @@ class FleetSetupDialog(QDialog):
             lockstep=bool(self.chk_cfg_lockstep.isChecked()),
             battlefield_radius=max(1_000.0, float(self.spin_cfg_radius.value())),
             detailed_logging=bool(self.chk_cfg_detailed_log.isChecked()),
+            hotspot_logging=bool(self.chk_cfg_hotspot_log.isChecked()),
             detail_log_file=self.edit_cfg_log_file.text().strip() or defaults.detail_log_file,
+            hotspot_log_file=self.edit_cfg_hotspot_log_file.text().strip() or defaults.hotspot_log_file,
             log_merge_window_sec=max(0.1, float(self.spin_cfg_log_merge_window.value())),
         )
 
@@ -1142,7 +1165,7 @@ class FleetSetupDialog(QDialog):
 
 
 class PreferencesStore:
-    CURRENT_VERSION = 4
+    CURRENT_VERSION = 6
 
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
@@ -1254,10 +1277,20 @@ class PreferencesStore:
                     "engine_detailed_logging",
                     defaults.engine_detailed_logging,
                 ),
+                engine_hotspot_logging=self._read_bool(
+                    migrated,
+                    "engine_hotspot_logging",
+                    defaults.engine_hotspot_logging,
+                ),
                 engine_detail_log_file=self._read_str(
                     migrated,
                     "engine_detail_log_file",
                     defaults.engine_detail_log_file,
+                ),
+                engine_hotspot_log_file=self._read_str(
+                    migrated,
+                    "engine_hotspot_log_file",
+                    defaults.engine_hotspot_log_file,
                 ),
                 engine_log_merge_window_sec=self._read_float(
                     migrated,
@@ -1353,7 +1386,9 @@ class OverviewOptionsDialog(QDialog):
             engine_lockstep=prefs.engine_lockstep,
             engine_battlefield_radius=prefs.engine_battlefield_radius,
             engine_detailed_logging=prefs.engine_detailed_logging,
+            engine_hotspot_logging=prefs.engine_hotspot_logging,
             engine_detail_log_file=prefs.engine_detail_log_file,
+            engine_hotspot_log_file=prefs.engine_hotspot_log_file,
             engine_log_merge_window_sec=prefs.engine_log_merge_window_sec,
         )
 
@@ -3417,7 +3452,9 @@ class MainWindow(QMainWindow):
             engine_lockstep=self.prefs.engine_lockstep,
             engine_battlefield_radius=self.prefs.engine_battlefield_radius,
             engine_detailed_logging=self.prefs.engine_detailed_logging,
+            engine_hotspot_logging=self.prefs.engine_hotspot_logging,
             engine_detail_log_file=self.prefs.engine_detail_log_file,
+            engine_hotspot_log_file=self.prefs.engine_hotspot_log_file,
             engine_log_merge_window_sec=self.prefs.engine_log_merge_window_sec,
         )
         self.store.save(self.prefs)
@@ -4589,7 +4626,9 @@ class MainWindow(QMainWindow):
             "lockstep": bool(cfg.lockstep),
             "battlefield_radius": float(cfg.battlefield_radius),
             "detailed_logging": bool(cfg.detailed_logging),
+            "hotspot_logging": bool(cfg.hotspot_logging),
             "detail_log_file": str(cfg.detail_log_file),
+            "hotspot_log_file": str(cfg.hotspot_log_file),
             "log_merge_window_sec": float(cfg.log_merge_window_sec),
         }
 
@@ -4619,7 +4658,9 @@ class MainWindow(QMainWindow):
         self.engine.config.lockstep = bool(payload.get("lockstep", self.engine.config.lockstep))
         self.engine.config.battlefield_radius = radius
         self.engine.config.detailed_logging = bool(payload.get("detailed_logging", self.engine.config.detailed_logging))
+        self.engine.config.hotspot_logging = bool(payload.get("hotspot_logging", self.engine.config.hotspot_logging))
         self.engine.config.detail_log_file = str(payload.get("detail_log_file", self.engine.config.detail_log_file))
+        self.engine.config.hotspot_log_file = str(payload.get("hotspot_log_file", self.engine.config.hotspot_log_file))
         self.engine.config.log_merge_window_sec = merge_window
 
         new_logger = get_sim_logger(self.engine.config)
@@ -4628,6 +4669,7 @@ class MainWindow(QMainWindow):
             new_logger,
             self.engine.config.detailed_logging,
             self.engine.config.log_merge_window_sec,
+            self.engine.config.hotspot_logging,
         )
 
         if hasattr(self.engine, "_dt"):
