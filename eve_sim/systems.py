@@ -202,6 +202,7 @@ class PerceptionSystem:
 class MovementSystem:
     def __init__(self, battlefield_radius: float) -> None:
         self.battlefield_radius = battlefield_radius
+        self._large_angle_threshold_deg = 45.0
 
     @staticmethod
     def _wrap_angle_deg(angle: float) -> float:
@@ -217,7 +218,23 @@ class MovementSystem:
         return max(2.5, min(14.0, 14_000.0 / speed))
 
     @staticmethod
-    def _motion_tau(ship, speed_cap: float) -> float:
+    def _heading_vector(angle_deg: float) -> Vector2:
+        facing_rad = math.radians(angle_deg)
+        return Vector2(math.cos(facing_rad), math.sin(facing_rad))
+
+    @staticmethod
+    def _motion_params(ship) -> tuple[float, float]:
+        profile = getattr(ship, "profile", None)
+        if profile is not None:
+            try:
+                mass = float(getattr(profile, "mass", 0.0) or 0.0)
+                agility = float(getattr(profile, "agility", 0.0) or 0.0)
+            except Exception:
+                mass = 0.0
+                agility = 0.0
+            if mass > 0.0 and agility > 0.0:
+                return mass, agility
+
         runtime = getattr(ship, "runtime", None)
         if runtime is not None:
             diagnostics = getattr(runtime, "diagnostics", None)
@@ -233,8 +250,42 @@ class MovementSystem:
                         mass = 0.0
                         agility = 0.0
                     if mass > 0.0 and agility > 0.0:
-                        return max(0.25, (mass * agility) / 1_000_000.0)
-        return max(0.25, MovementSystem._align_time_for(speed_cap))
+                        return mass, agility
+        return 0.0, 0.0
+
+    @classmethod
+    def _motion_tau(cls, ship, speed_cap: float) -> float:
+        mass, agility = cls._motion_params(ship)
+        if mass > 0.0 and agility > 0.0:
+            return max(0.25, (mass * agility) / 1_000_000.0)
+        return max(0.25, cls._align_time_for(speed_cap))
+
+    @staticmethod
+    def _exponential_velocity_step(current_velocity: Vector2, desired_velocity: Vector2, tau: float, dt: float) -> tuple[Vector2, Vector2]:
+        tau = max(1e-6, float(tau))
+        decay = math.exp(-float(dt) / tau)
+        new_velocity = current_velocity * decay + desired_velocity * (1.0 - decay)
+        displacement = desired_velocity * float(dt) + (current_velocity - desired_velocity) * (tau * (1.0 - decay))
+        return new_velocity, displacement
+
+    @staticmethod
+    def _stable_turn_radius(speed: float, speed_cap: float, tau: float) -> float:
+        orbit_speed = max(0.0, min(float(speed), float(speed_cap) * 0.999999))
+        if orbit_speed <= 1e-6:
+            return 0.0
+        turn_budget = max(0.0, float(speed_cap) ** 2 - orbit_speed ** 2)
+        if turn_budget <= 1e-9:
+            return float("inf")
+        return max(0.0, float(tau)) * orbit_speed * orbit_speed / math.sqrt(turn_budget)
+
+    @classmethod
+    def _stable_angular_velocity(cls, speed: float, speed_cap: float, tau: float) -> float:
+        radius = cls._stable_turn_radius(speed, speed_cap, tau)
+        if radius == 0.0:
+            return float("inf")
+        if math.isinf(radius):
+            return 0.0
+        return max(0.0, float(speed)) / radius
 
     def _effective_speed_cap(self, world: WorldState, ship) -> float:
         base_cap = max(1.0, float(ship.nav.max_speed))
@@ -247,46 +298,66 @@ class MovementSystem:
             return base_cap
         return max(1.0, min(base_cap, cap))
 
-    def _update_velocity_with_inertia(self, world: WorldState, ship, dt: float) -> None:
+    def _update_velocity_with_inertia(self, world: WorldState, ship, dt: float) -> Vector2:
         target = ship.nav.command_target
         speed_cap = self._effective_speed_cap(world, ship)
         desired_angle = ship.nav.facing_deg
-        throttle = 0.0
+        target_speed = 0.0
+        current_velocity = ship.nav.velocity
+        current_speed = current_velocity.length()
 
         if target is not None:
             to_target = target - ship.nav.position
             distance = to_target.length()
             if distance > max(120.0, ship.nav.radius * 1.5):
-                throttle = 1.0
                 desired_angle = to_target.angle_deg()
+                target_speed = speed_cap
         elif bool(ship.nav.propulsion_command_active):
-            current_speed = ship.nav.velocity.length()
             if current_speed > 1e-6:
                 # Keep burning along the existing travel vector when propulsion toggles on mid-flight.
-                throttle = 1.0
-                desired_angle = ship.nav.velocity.angle_deg()
-
-        align_time = self._align_time_for(speed_cap)
-        max_turn_rate = 220.0 / max(0.5, align_time)
-        max_turn_step = max_turn_rate * dt
-        angle_delta = self._wrap_angle_deg(desired_angle - ship.nav.facing_deg)
-        angle_step = max(-max_turn_step, min(max_turn_step, angle_delta))
-        ship.nav.facing_deg = self._wrap_angle_deg(ship.nav.facing_deg + angle_step)
+                desired_angle = current_velocity.angle_deg()
+                target_speed = speed_cap
 
         tau = self._motion_tau(ship, speed_cap)
-        thrust_acc = (speed_cap / max(0.1, tau)) * throttle
-        facing_rad = math.radians(ship.nav.facing_deg)
-        thrust_vec = Vector2(math.cos(facing_rad) * thrust_acc, math.sin(facing_rad) * thrust_acc)
-        drag_vec = ship.nav.velocity * (1.0 / max(0.1, tau))
-        acceleration = thrust_vec - drag_vec
-        ship.nav.velocity = ship.nav.velocity + acceleration * dt
+        desired_velocity = self._heading_vector(desired_angle) * target_speed
+        new_velocity, displacement = self._exponential_velocity_step(current_velocity, desired_velocity, tau, dt)
+
+        if target_speed > 1e-6 and current_speed > 1e-6:
+            current_heading = current_velocity.angle_deg()
+            desired_turn = abs(self._wrap_angle_deg(desired_angle - current_heading))
+            if desired_turn <= self._large_angle_threshold_deg:
+                new_speed = new_velocity.length()
+                raw_heading = new_velocity.angle_deg() if new_speed > 1e-6 else desired_angle
+                angular_velocity = self._stable_angular_velocity(max(current_speed, new_speed), speed_cap, tau)
+                max_turn_step_deg = 180.0 if math.isinf(angular_velocity) else math.degrees(angular_velocity * dt)
+                heading_delta = self._wrap_angle_deg(raw_heading - current_heading)
+                if abs(heading_delta) > max_turn_step_deg:
+                    capped_heading = self._wrap_angle_deg(
+                        current_heading + max(-max_turn_step_deg, min(max_turn_step_deg, heading_delta))
+                    )
+                    new_velocity = self._heading_vector(capped_heading) * new_speed
+                    displacement = (current_velocity + new_velocity) * (0.5 * dt)
+
+        new_speed = new_velocity.length()
+        if new_speed > speed_cap:
+            new_velocity = new_velocity.normalized() * speed_cap
+            displacement = (current_velocity + new_velocity) * (0.5 * dt)
+            new_speed = speed_cap
+
+        ship.nav.velocity = new_velocity
+        ship.nav.facing_deg = new_velocity.angle_deg() if new_speed > 1e-6 else desired_angle
+        return displacement
 
     def run(self, world: WorldState, dt: float) -> None:
         for ship in world.ships.values():
             if not ship.vital.alive:
                 continue
-            self._update_velocity_with_inertia(world, ship, dt)
-            next_pos = ship.nav.position + ship.nav.velocity * dt
+            profile_speed = float(getattr(ship.profile, "max_speed", ship.nav.max_speed) or ship.nav.max_speed)
+            if profile_speed > 0.0:
+                ship.nav.max_speed = profile_speed
+
+            displacement = self._update_velocity_with_inertia(world, ship, dt)
+            next_pos = ship.nav.position + displacement
             if next_pos.length() > self.battlefield_radius:
                 n = next_pos.normalized()
                 next_pos = n * self.battlefield_radius

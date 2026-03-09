@@ -47,6 +47,8 @@ class HullProfile:
     structure_hp: float
     rep_amount: float
     rep_cycle: float
+    mass: float = 0.0
+    agility: float = 0.0
 
 
 @dataclass(slots=True)
@@ -146,6 +148,8 @@ class RuntimeStatEngine:
             "cap_max": [],
             "cap_recharge": [],
             "rep": [],
+            "mass": [],
+            "agility": [],
         }
         add: dict[str, float] = {k: 0.0 for k in mul}
         for module in runtime.modules:
@@ -178,6 +182,8 @@ class RuntimeStatEngine:
             structure_hp=max(1.0, hull.structure_hp),
             rep_amount=max(0.0, (hull.rep_amount + add["rep"]) * self._stacking_multiplier(mul["rep"])),
             rep_cycle=max(0.1, hull.rep_cycle),
+            mass=max(0.0, (hull.mass + add["mass"]) * self._stacking_multiplier(mul["mass"])),
+            agility=max(0.0, (hull.agility + add["agility"]) * self._stacking_multiplier(mul["agility"])),
         )
         self._cache[key] = profile
         return profile
@@ -217,6 +223,8 @@ class RuntimeStatEngine:
             "dps": [],
             "cap_max": [],
             "cap_recharge": [],
+            "mass": [],
+            "agility": [],
         }
         add: dict[str, float] = {k: 0.0 for k in mul}
         for impact in impacts:
@@ -261,6 +269,8 @@ class RuntimeStatEngine:
             structure_hp=max(1.0, (target.structure_hp + add["structure_hp"]) * self._stacking_multiplier(mul["structure_hp"])),
             rep_amount=max(0.0, (target.rep_amount + add["rep"]) * self._stacking_multiplier(mul["rep"])),
             rep_cycle=target.rep_cycle,
+            mass=max(0.0, (target.mass + add["mass"]) * self._stacking_multiplier(mul["mass"])),
+            agility=max(0.0, (target.agility + add["agility"]) * self._stacking_multiplier(mul["agility"])),
             sensor_strength_gravimetric=max(
                 0.0,
                 (target.sensor_strength_gravimetric + add["sensor_strength_gravimetric"])
@@ -317,6 +327,8 @@ class RuntimeStatEngine:
             hull.structure_hp,
             hull.rep_amount,
             hull.rep_cycle,
+            hull.mass,
+            hull.agility,
         )
         modules = tuple(
             (

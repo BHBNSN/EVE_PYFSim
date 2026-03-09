@@ -48,6 +48,8 @@ class FitDescriptor:
     structure_hp: float = 4000.0
     rep_amount: float = 0.0
     rep_cycle: float = 5.0
+    mass: float = 0.0
+    agility: float = 0.0
 
 
 @dataclass(slots=True)
@@ -111,6 +113,8 @@ class ShipProfile:
     ecm_jam_chance: float = 0.0
     warp_scramble_status: float = 0.0
     warp_stability: float = 0.0
+    mass: float = 0.0
+    agility: float = 0.0
 
 
 @dataclass(slots=True)

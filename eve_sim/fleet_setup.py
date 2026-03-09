@@ -1119,6 +1119,8 @@ class RuntimeFromEftFactory:
             structure_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_thermal", 1.0) or 1.0))),
             structure_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_kinetic", 1.0) or 1.0))),
             structure_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_explosive", 1.0) or 1.0))),
+            mass=max(0.0, float(pyfa_final.get("mass", 0.0) or 0.0)),
+            agility=max(0.0, float(pyfa_final.get("agility", 0.0) or 0.0)),
         )
 
         hull = HullProfile(
@@ -1140,6 +1142,8 @@ class RuntimeFromEftFactory:
             structure_hp=profile.structure_hp,
             rep_amount=profile.rep_amount,
             rep_cycle=profile.rep_cycle,
+            mass=profile.mass,
+            agility=profile.agility,
         )
 
         runtime = FitRuntime(
@@ -1182,6 +1186,8 @@ class RuntimeFromEftFactory:
             structure_hp=profile.structure_hp,
             rep_amount=profile.rep_amount,
             rep_cycle=profile.rep_cycle,
+            mass=profile.mass,
+            agility=profile.agility,
         )
         return runtime, fit, profile
 
