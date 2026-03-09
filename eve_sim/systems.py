@@ -1176,8 +1176,9 @@ class CombatSystem:
         projected_target_id: str | None,
     ) -> None:
         target_snapshots: dict[str, CycleTargetSnapshot] = {}
+        metadata = self._module_static_metadata(module)
 
-        if self._module_is_area_effect_module(module):
+        if metadata.is_area_effect:
             for effect in module.effects:
                 if effect.effect_class != EffectClass.PROJECTED:
                     continue
@@ -1375,10 +1376,6 @@ class CombatSystem:
         return hp_now / hp_max
 
     @staticmethod
-    def _module_has_projected(module) -> bool:
-        return any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects)
-
-    @staticmethod
     def _module_in_projected_range(source, target, module) -> bool:
         distance = source.nav.position.distance_to(target.nav.position)
         has_projected = False
@@ -1390,200 +1387,6 @@ class CombatSystem:
             if max_range <= 0 or distance <= max_range:
                 return True
         return not has_projected
-
-    @staticmethod
-    def _module_group_name(module) -> str:
-        return str(getattr(module, "group", "") or "").lower()
-
-    @staticmethod
-    def _module_group_has_any(module, tokens: tuple[str, ...]) -> bool:
-        group_name = CombatSystem._module_group_name(module)
-        return any(token in group_name for token in tokens)
-
-    @staticmethod
-    def _module_group_has_equal(module, tokens: tuple[str, ...]) -> bool:
-        group_name = CombatSystem._module_group_name(module)
-        return any(token == group_name for token in tokens)
-
-    @staticmethod
-    def _module_has_projected_damage(module) -> bool:
-        for effect in module.effects:
-            if effect.effect_class != EffectClass.PROJECTED:
-                continue
-            for key in ("damage_em", "damage_thermal", "damage_kinetic", "damage_explosive"):
-                if float(effect.projected_add.get(key, 0.0) or 0.0) > 0.0:
-                    return True
-        return False
-
-    @staticmethod
-    def _module_has_projected_rep(module) -> bool:
-        for effect in module.effects:
-            if effect.effect_class != EffectClass.PROJECTED:
-                continue
-            if float(effect.projected_add.get("shield_rep", 0.0) or 0.0) > 0.0:
-                return True
-            if float(effect.projected_add.get("armor_rep", 0.0) or 0.0) > 0.0:
-                return True
-        return False
-
-    @staticmethod
-    def _module_is_weapon_module(module) -> bool:
-        if not CombatSystem._module_has_projected(module):
-            return False
-        if not CombatSystem._module_has_projected_damage(module):
-            return False
-        group_name = CombatSystem._module_group_name(module)
-        looks_like_weapon_group = (
-            ("weapon" in group_name)
-            or ("missile launcher" in group_name)
-        )
-        has_ammo_like = int(getattr(module, "charge_capacity", 0) or 0) > 0 and float(getattr(module, "charge_rate", 0.0) or 0.0) > 0.0
-        return looks_like_weapon_group or has_ammo_like
-
-    @staticmethod
-    def _module_is_offensive_ewar_module(module) -> bool:
-        if not CombatSystem._module_has_projected(module):
-            return False
-        if CombatSystem._module_is_weapon_module(module):
-            return False
-        if CombatSystem._module_target_side(module) != "enemy":
-            return False
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "weapon disruptor",
-                "sensor damp",
-                "energy neutral",
-                "nosferatu",
-                "ecm",
-                "warp scrambler",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_cap_warfare_module(module) -> bool:
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "energy neutral",
-                "nosferatu",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_target_ewar_module(module) -> bool:
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "target painter",
-                "stasis web",
-                "stasis grappler",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_ecm_module(module) -> bool:
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "ecm",
-            ),
-        )
-
-    @staticmethod
-    def _module_uses_pyfa_projected_profile(module) -> bool:
-        if not CombatSystem._module_has_projected(module):
-            return False
-        if CombatSystem._module_is_command_burst_module(module):
-            return False
-        if CombatSystem._module_is_smart_bomb_module(module):
-            return False
-        if CombatSystem._module_is_burst_jammer_module(module):
-            return False
-        if CombatSystem._module_is_ecm_module(module):
-            return False
-        if CombatSystem._module_is_weapon_module(module):
-            return False
-        if CombatSystem._module_has_projected_rep(module):
-            return False
-        if CombatSystem._module_is_cap_warfare_module(module):
-            return False
-        return True
-
-    @staticmethod
-    def _module_is_hardener_module(module) -> bool:
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "shield hardener",
-                "armor hardener",
-                "energized",
-                "armor resistance shift hardener",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_cap_booster_module(module) -> bool:
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "capacitor booster",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_propulsion_module(module) -> bool:
-        return CombatSystem._module_group_has_any(
-            module,
-            (
-                "propulsion module",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_damage_control_module(module) -> bool:
-        return CombatSystem._module_group_has_equal(
-            module,
-            (
-                "damage control",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_command_burst_module(module) -> bool:
-        return CombatSystem._module_group_has_equal(
-            module,
-            (
-                "command burst",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_smart_bomb_module(module) -> bool:
-        return CombatSystem._module_group_has_equal(
-            module,
-            (
-                "smart bomb",
-                "structure area denial module",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_burst_jammer_module(module) -> bool:
-        return CombatSystem._module_group_has_equal(
-            module,
-            (
-                "burst jammer",
-            ),
-        )
-
-    @staticmethod
-    def _module_is_area_effect_module(module) -> bool:
-        return (
-            CombatSystem._module_is_command_burst_module(module)
-            or CombatSystem._module_is_smart_bomb_module(module)
-            or CombatSystem._module_is_burst_jammer_module(module)
-        )
 
     @staticmethod
     def _cap_ratio(ship) -> float:
@@ -1644,8 +1447,9 @@ class CombatSystem:
 
     def _iter_area_targets_in_range(self, world: WorldState, source, module, effect) -> list:
         targets: list = []
-        include_self = self._module_is_command_burst_module(module)
-        same_team_only = self._module_is_command_burst_module(module)
+        metadata = self._module_static_metadata(module)
+        include_self = metadata.is_command_burst
+        same_team_only = metadata.is_command_burst
         max_range = self._projected_max_range(effect)
 
         for candidate in world.ships.values():
@@ -1661,39 +1465,6 @@ class CombatSystem:
             targets.append(candidate)
 
         return targets
-
-    def _command_booster_snapshot_for_target(self, source, target) -> dict[str, Any] | None:
-        if source.runtime is None or target.team != source.team or not target.vital.alive:
-            return None
-        blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
-        if not isinstance(blueprint, dict):
-            return None
-
-        state_by_module_id: dict[str, str] = {}
-        has_active_in_range = False
-        for module in source.runtime.modules:
-            metadata = self._module_static_metadata(module)
-            if not metadata.is_command_burst:
-                continue
-            state_value = str(module.state.value or "ONLINE").upper()
-            target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, module.module_id, target.ship_id)
-            if state_value == "ACTIVE" and target_snapshot is not None:
-                state_by_module_id[module.module_id] = "ACTIVE"
-                has_active_in_range = True
-            elif state_value == "OVERHEATED" and target_snapshot is not None:
-                state_by_module_id[module.module_id] = "OVERHEATED"
-                has_active_in_range = True
-            else:
-                state_by_module_id[module.module_id] = "ONLINE" if state_value in {"ACTIVE", "OVERHEATED"} else state_value
-
-        if not has_active_in_range:
-            return None
-
-        return {
-            "fit_key": str(source.runtime.fit_key or ""),
-            "blueprint": blueprint,
-            "state_by_module_id": state_by_module_id,
-        }
 
     def _collect_command_booster_snapshots(self, world: WorldState) -> dict[str, list[dict[str, Any]]]:
         snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
@@ -1757,66 +1528,6 @@ class CombatSystem:
                 )
 
         return snapshots_by_ship
-
-    def _projected_source_snapshots_for_target(
-        self,
-        source,
-        target,
-        command_boosters_by_ship: dict[str, list[dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        if source.runtime is None or not target.vital.alive:
-            return []
-        blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
-        if not isinstance(blueprint, dict):
-            return []
-
-        source_command_snapshots = command_boosters_by_ship.get(source.ship_id, [])
-        snapshots: list[dict[str, Any]] = []
-        for active_projected_module in source.runtime.modules:
-            active_metadata = self._module_static_metadata(active_projected_module)
-            if not active_metadata.uses_pyfa_projected_profile:
-                continue
-            active_state = str(active_projected_module.state.value or "ONLINE").upper()
-            if active_state not in {"ACTIVE", "OVERHEATED"}:
-                continue
-            target_id = source.combat.projected_targets.get(active_projected_module.module_id)
-            if target_id != target.ship_id:
-                continue
-            target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target.ship_id)
-            if target_snapshot is None:
-                continue
-            distance_mode = self._projected_distance_mode(active_projected_module)
-
-            state_by_module_id: dict[str, str] = {}
-            for module in source.runtime.modules:
-                metadata = self._module_static_metadata(module)
-                state_value = str(module.state.value or "ONLINE").upper()
-                projected_state = state_value
-
-                if state_value in {"ACTIVE", "OVERHEATED"}:
-                    if metadata.is_command_burst:
-                        projected_state = state_value
-                    elif metadata.uses_pyfa_projected_profile:
-                        projected_state = state_value if module.module_id == active_projected_module.module_id else "ONLINE"
-                    elif metadata.is_area_effect or metadata.is_weapon or metadata.has_projected_rep or metadata.is_cap_warfare:
-                        projected_state = "ONLINE"
-
-                state_by_module_id[module.module_id] = projected_state
-
-            snapshots.append(
-                {
-                    "fit_key": f"{source.runtime.fit_key}:{active_projected_module.module_id}",
-                    "blueprint": blueprint,
-                    "state_by_module_id": state_by_module_id,
-                    "command_booster_snapshots": source_command_snapshots,
-                    "distance_mode": distance_mode,
-                    "formula_effects": self._module_formula_effect_payloads(active_projected_module, target_snapshot),
-                    "pyfa_projection_range": target_snapshot.distance,
-                    "projection_range": target_snapshot.distance,
-                }
-            )
-
-        return snapshots
 
     def _collect_projected_source_snapshots(
         self,
@@ -2183,107 +1894,6 @@ class CombatSystem:
             use_prefocus = random.random() < self._prefocus_fire_probability(source)
             return valid_prefocus_id if use_prefocus else valid_focus_id
         return valid_focus_id or valid_prefocus_id
-
-    def _module_decision_rule(self, module) -> ModuleDecisionRule:
-        # Central policy router: extend here when adding new active module behaviors.
-        if self._module_is_command_burst_module(module):
-            return ModuleDecisionRule(
-                rule_id="area_command_burst",
-                activation_mode="always",
-                target_mode="none",
-            )
-
-        if self._module_is_smart_bomb_module(module):
-            return ModuleDecisionRule(
-                rule_id="area_smart_bomb",
-                activation_mode="enemy_in_area",
-                target_mode="none",
-                cap_threshold=0.15,
-            )
-
-        if self._module_is_burst_jammer_module(module):
-            return ModuleDecisionRule(
-                rule_id="area_burst_jammer",
-                activation_mode="enemy_in_area",
-                target_mode="none",
-                cap_threshold=0.15,
-            )
-
-        if self._module_is_weapon_module(module):
-            return ModuleDecisionRule(
-                rule_id="weapon_focus_only",
-                activation_mode="weapon_focus_only",
-                target_mode="weapon_focus_prefocus",
-            )
-
-        if self._module_has_projected(module):
-            if self._module_has_projected_rep(module):
-                return ModuleDecisionRule(
-                    rule_id="projected_remote_repair",
-                    activation_mode="always",
-                    target_mode="ally_lowest_hp",
-                )
-            if self._module_is_offensive_ewar_module(module):
-                return ModuleDecisionRule(
-                    rule_id="projected_offensive_ewar",
-                    activation_mode="cap_min",
-                    target_mode="enemy_random",
-                    cap_threshold=0.15,
-                )
-            if self._module_is_target_ewar_module(module):
-                return ModuleDecisionRule(
-                    rule_id="weapon_focus_only",
-                    activation_mode="weapon_focus_only",
-                    target_mode="weapon_focus_prefocus",
-                )
-            side = self._module_target_side(module)
-            if side == "ally":
-                return ModuleDecisionRule(
-                    rule_id="projected_support_generic",
-                    activation_mode="always",
-                    target_mode="ally_lowest_hp",
-                )
-            return ModuleDecisionRule(
-                rule_id="projected_hostile_generic",
-                activation_mode="never",
-                target_mode="none",
-            )
-
-        if self._module_is_propulsion_module(module):
-            return ModuleDecisionRule(
-                rule_id="local_propulsion",
-                activation_mode="propulsion_command",
-                target_mode="none",
-            )
-
-        if self._module_is_damage_control_module(module):
-            return ModuleDecisionRule(
-                rule_id="local_damage_control",
-                activation_mode="recent_enemy_weapon_damage",
-                target_mode="none",
-            )
-
-        if self._module_is_hardener_module(module):
-            return ModuleDecisionRule(
-                rule_id="local_hardener",
-                activation_mode="cap_or_low_hp",
-                target_mode="none",
-                cap_threshold=0.10,
-            )
-
-        if self._module_is_cap_booster_module(module):
-            return ModuleDecisionRule(
-                rule_id="local_cap_booster",
-                activation_mode="cap_max",
-                target_mode="none",
-                cap_threshold=0.85,
-            )
-
-        return ModuleDecisionRule(
-            rule_id="local_active_default",
-            activation_mode="never",
-            target_mode="none",
-        )
 
     def _should_activate_module(self, world: WorldState, ship, module, rule: ModuleDecisionRule, target_id: str | None) -> bool:
         cap_ratio = self._cap_ratio(ship)
@@ -3185,9 +2795,10 @@ class CombatSystem:
             if not source.vital.alive or source.runtime is None:
                 continue
             for module in source.runtime.modules:
+                metadata = self._module_static_metadata(module)
                 if module.state != module.state.ACTIVE:
                     continue
-                if self._module_is_command_burst_module(module) or self._module_is_burst_jammer_module(module):
+                if metadata.is_command_burst or metadata.is_burst_jammer:
                     continue
 
                 cycle_target_snapshots = self._module_cycle_snapshots_for(source.ship_id, module.module_id)
@@ -3199,7 +2810,7 @@ class CombatSystem:
                         continue
 
                     targets: list[tuple[Any, CycleTargetSnapshot, float]] = []
-                    if self._module_is_smart_bomb_module(module):
+                    if metadata.is_smart_bomb:
                         for target_id, target_snapshot in cycle_target_snapshots.items():
                             target = world.ships.get(target_id)
                             if target is None or not target.vital.alive:
@@ -3258,7 +2869,7 @@ class CombatSystem:
                         if (
                             applied_damage > 0.0
                             and source.team != target.team
-                            and self._module_is_weapon_module(module)
+                            and metadata.is_weapon
                         ):
                             target.combat.last_enemy_weapon_damaged_at = float(world.now)
                         if (
