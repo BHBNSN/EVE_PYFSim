@@ -389,6 +389,7 @@ class CombatSystem:
         self._diag_logged_ships: set[str] = set()
         self._lock_time_cache: dict[tuple[float, float], float] = {}
         self._projected_cycle_totals: dict[tuple[str, str, str], dict[str, float]] = {}
+        self._projected_cycle_starts_this_tick: set[tuple[str, str]] = set()
         self._module_cycle_target_snapshots: dict[tuple[str, str], dict[str, CycleTargetSnapshot]] = {}
         self._merged_event_buckets: dict[tuple, dict[str, Any]] = {}
         self._merge_window_start_time: float | None = None
@@ -1143,6 +1144,16 @@ class CombatSystem:
     @staticmethod
     def _module_cycle_snapshot_key(source_ship_id: str, module_id: str) -> tuple[str, str]:
         return source_ship_id, module_id
+
+    @staticmethod
+    def _uses_cycle_start_projected_application(metadata: ModuleStaticMetadata) -> bool:
+        return metadata.is_area_effect or metadata.is_weapon or metadata.has_projected_rep or metadata.is_cap_warfare
+
+    def _mark_projected_cycle_started(self, source_ship_id: str, module_id: str) -> None:
+        self._projected_cycle_starts_this_tick.add(self._module_cycle_snapshot_key(source_ship_id, module_id))
+
+    def _projected_cycle_started_this_tick(self, source_ship_id: str, module_id: str) -> bool:
+        return self._module_cycle_snapshot_key(source_ship_id, module_id) in self._projected_cycle_starts_this_tick
 
     def _module_cycle_snapshots_for(self, source_ship_id: str, module_id: str) -> dict[str, CycleTargetSnapshot]:
         return self._module_cycle_target_snapshots.get(self._module_cycle_snapshot_key(source_ship_id, module_id), {})
@@ -2527,6 +2538,9 @@ class CombatSystem:
                 ):
                     self._capture_module_cycle_snapshots(world, ship, module, projected_target_id)
 
+                if cycle_started and self._uses_cycle_start_projected_application(metadata):
+                    self._mark_projected_cycle_started(ship.ship_id, module.module_id)
+
                 if previous_projected_target and (
                     module.state != module.state.ACTIVE or previous_projected_target != projected_target_id
                 ):
@@ -2589,7 +2603,6 @@ class CombatSystem:
         target,
         target_profile: ShipProfile,
         effect,
-        dt: float,
         strength: float,
         damage_factor_override: float | None = None,
     ) -> tuple[float, float, float, float, float, float, float, float]:
@@ -2600,7 +2613,6 @@ class CombatSystem:
         self._clamp_ship_layer_hp(target)
 
         strength = max(0.0, min(1.0, strength))
-        cycle_scale = dt / max(0.1, effect.cycle_time)
 
         shield_repaired = 0.0
         armor_repaired = 0.0
@@ -2608,30 +2620,30 @@ class CombatSystem:
 
         shield_rep = float(effect.projected_add.get("shield_rep", 0.0) or 0.0)
         if shield_rep > 0.0:
-            amount = shield_rep * strength * cycle_scale
+            amount = shield_rep * strength
             before = target.vital.shield
             target.vital.shield = min(target.vital.shield_max, target.vital.shield + amount)
             shield_repaired = max(0.0, target.vital.shield - before)
 
         armor_rep = float(effect.projected_add.get("armor_rep", 0.0) or 0.0)
         if armor_rep > 0.0:
-            amount = armor_rep * strength * cycle_scale
+            amount = armor_rep * strength
             before = target.vital.armor
             target.vital.armor = min(target.vital.armor_max, target.vital.armor + amount)
             armor_repaired = max(0.0, target.vital.armor - before)
 
         cap_drain = float(effect.projected_add.get("cap_drain", 0.0) or 0.0)
         if cap_drain > 0.0:
-            amount = cap_drain * strength * cycle_scale
+            amount = cap_drain * strength
             before_cap = target.vital.cap
             target.vital.cap = max(0.0, target.vital.cap - amount)
             cap_drained = max(0.0, before_cap - target.vital.cap)
 
         base_damage = (
-            max(0.0, float(effect.projected_add.get("damage_em", 0.0) or 0.0)) * cycle_scale,
-            max(0.0, float(effect.projected_add.get("damage_thermal", 0.0) or 0.0)) * cycle_scale,
-            max(0.0, float(effect.projected_add.get("damage_kinetic", 0.0) or 0.0)) * cycle_scale,
-            max(0.0, float(effect.projected_add.get("damage_explosive", 0.0) or 0.0)) * cycle_scale,
+            max(0.0, float(effect.projected_add.get("damage_em", 0.0) or 0.0)),
+            max(0.0, float(effect.projected_add.get("damage_thermal", 0.0) or 0.0)),
+            max(0.0, float(effect.projected_add.get("damage_kinetic", 0.0) or 0.0)),
+            max(0.0, float(effect.projected_add.get("damage_explosive", 0.0) or 0.0)),
         )
         if _sum_damage(base_damage) <= 0.0:
             return shield_repaired, armor_repaired, cap_drained, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -2779,6 +2791,7 @@ class CombatSystem:
                 world.squad_prelock_timers.pop(focus_key, None)
 
     def run(self, world: WorldState, dt: float) -> None:
+        self._projected_cycle_starts_this_tick.clear()
         self._prune_cycle_effect_snapshots(world)
         self._refresh_alive_runtime_ship_ids(world)
         if self.event_logging_enabled:
@@ -2871,6 +2884,12 @@ class CombatSystem:
                     continue
                 if metadata.is_command_burst or metadata.is_burst_jammer:
                     continue
+                if (
+                    metadata.cycle_time > 0.0
+                    and self._uses_cycle_start_projected_application(metadata)
+                    and not self._projected_cycle_started_this_tick(source.ship_id, module.module_id)
+                ):
+                    continue
 
                 cycle_target_snapshots = self._module_cycle_snapshots_for(source.ship_id, module.module_id)
                 if not cycle_target_snapshots:
@@ -2931,7 +2950,6 @@ class CombatSystem:
                             target=target,
                             target_profile=target_profile,
                             effect=effect,
-                            dt=dt,
                             strength=strength,
                             damage_factor_override=damage_factor_override,
                         )
