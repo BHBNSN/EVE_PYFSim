@@ -464,7 +464,7 @@ class RuntimeFromEftFactory:
                 local_mult[key] = pct_to_mult(value)
 
         speed_factor = attr_opt("speedFactor")
-        if speed_factor is not None:
+        if speed_factor is not None and abs(float(speed_factor) - 1.0) > 1e-6:
             if is_web and range_m > 0 and abs(speed_factor) > 1e-9:
                 projected_mult["speed"] = pct_to_mult(speed_factor)
                 handled_projection_attrs.add("speedFactor")
@@ -653,7 +653,7 @@ class RuntimeFromEftFactory:
             is_active_module = True
 
         state_required = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
-        module_state = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
+        module_state = ModuleState.ONLINE
         module_id = f"mod{suffix}"
 
         charge_capacity = 0
@@ -914,15 +914,6 @@ class RuntimeFromEftFactory:
             module = module_cls(module_item)
             module.owner = fit
             module_id = f"mod-{idx}"
-            runtime_state = str((state_by_module_id or {}).get(module_id, "ACTIVE") or "ACTIVE").upper()
-            if spec.offline or runtime_state == "OFFLINE":
-                module.state = offline_state
-            elif runtime_state == "OVERHEATED":
-                module.state = overheated_state if overheated_state is not None else active_state
-            elif runtime_state == "ONLINE":
-                module.state = online_state
-            else:
-                module.state = active_state
 
             group_name = (module_item.group.name or "").lower()
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
@@ -933,6 +924,17 @@ class RuntimeFromEftFactory:
                 if charge_item is None:
                     raise ValueError(f"pyfa中未找到弹药：{charge_name}")
                 module.charge = charge_item
+
+            default_runtime_state = "ACTIVE" if self._is_weapon_like_group(group_name) else "ONLINE"
+            runtime_state = str((state_by_module_id or {}).get(module_id, default_runtime_state) or default_runtime_state).upper()
+            if spec.offline or runtime_state == "OFFLINE":
+                module.state = offline_state
+            elif runtime_state == "OVERHEATED":
+                module.state = overheated_state if overheated_state is not None else active_state
+            elif runtime_state == "ONLINE":
+                module.state = online_state
+            else:
+                module.state = active_state
 
             fit.modules.append(module)
             fitted_modules.append((spec, module, charge_name))
@@ -1921,11 +1923,12 @@ def _projected_source_state_maps(runtime: FitRuntime) -> list[dict[str, str]]:
     for module in runtime.modules:
         state_value = str(module.state.value or "ONLINE").upper()
         projected_state = state_value
+        uses_projected_profile = _module_uses_pyfa_projected_profile_runtime(module)
 
         if state_value in {"ACTIVE", "OVERHEATED"}:
             if _module_is_command_burst_module(module):
                 projected_state = state_value
-            elif _module_uses_pyfa_projected_profile_runtime(module):
+            elif uses_projected_profile:
                 projected_state = "ONLINE"
                 active_projected_modules.append((module.module_id, state_value))
             elif (
@@ -1935,6 +1938,8 @@ def _projected_source_state_maps(runtime: FitRuntime) -> list[dict[str, str]]:
                 or _module_is_cap_warfare_module(module)
             ):
                 projected_state = "ONLINE"
+        elif state_value != "OFFLINE" and uses_projected_profile:
+            active_projected_modules.append((module.module_id, "ACTIVE"))
 
         base_state_by_module_id[module.module_id] = projected_state
 
