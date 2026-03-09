@@ -297,6 +297,27 @@ class RuntimeStatEngine:
 
     @staticmethod
     def _cache_key(runtime: FitRuntime) -> tuple:
+        hull = runtime.hull
+        hull_signature = (
+            hull.ship_name,
+            hull.role,
+            hull.base_dps,
+            hull.volley,
+            hull.optimal,
+            hull.falloff,
+            hull.tracking,
+            hull.sig_radius,
+            hull.scan_resolution,
+            hull.max_target_range,
+            hull.max_speed,
+            hull.cap_max,
+            hull.cap_recharge_time,
+            hull.shield_hp,
+            hull.armor_hp,
+            hull.structure_hp,
+            hull.rep_amount,
+            hull.rep_cycle,
+        )
         modules = tuple(
             (
                 m.module_id,
@@ -323,8 +344,4 @@ class RuntimeStatEngine:
             for m in runtime.modules
         )
         skills = tuple(sorted(runtime.skills.levels.items()))
-        return runtime.fit_key, modules, skills
-
-
-def build_profile_from_runtime(runtime: FitRuntime) -> ShipProfile:
-    return RuntimeStatEngine().compute_base_profile(runtime)
+        return hull_signature, modules, skills

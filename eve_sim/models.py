@@ -106,6 +106,11 @@ class ShipProfile:
     structure_resonance_thermal: float = 1.0
     structure_resonance_kinetic: float = 1.0
     structure_resonance_explosive: float = 1.0
+    max_locked_targets: int = 0
+    scan_strength: float = 0.0
+    ecm_jam_chance: float = 0.0
+    warp_scramble_status: float = 0.0
+    warp_stability: float = 0.0
 
 
 @dataclass(slots=True)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 import logging
 import random
@@ -26,6 +26,13 @@ class ModuleDecisionRule:
     activation_mode: str
     target_mode: str
     cap_threshold: float = 0.0
+
+
+@dataclass(slots=True)
+class CycleTargetSnapshot:
+    distance: float
+    effect_strengths: dict[int, float] = field(default_factory=dict)
+    effect_damage_factors: dict[int, float] = field(default_factory=dict)
 
 
 def _scale_damage(dmg: DamageTuple, factor: float) -> DamageTuple:
@@ -210,6 +217,7 @@ class CombatSystem:
         self._diag_logged_ships: set[str] = set()
         self._lock_time_cache: dict[tuple[float, float], float] = {}
         self._projected_cycle_totals: dict[tuple[str, str, str], dict[str, float]] = {}
+        self._module_cycle_target_snapshots: dict[tuple[str, str], dict[str, CycleTargetSnapshot]] = {}
         self._merged_event_buckets: dict[tuple, dict[str, Any]] = {}
         self._merge_window_start_time: float | None = None
         self._merge_window_end_time: float | None = None
@@ -375,6 +383,157 @@ class CombatSystem:
             },
         )
 
+    @staticmethod
+    def _module_cycle_snapshot_key(source_ship_id: str, module_id: str) -> tuple[str, str]:
+        return source_ship_id, module_id
+
+    def _module_cycle_snapshots_for(self, source_ship_id: str, module_id: str) -> dict[str, CycleTargetSnapshot]:
+        return self._module_cycle_target_snapshots.get(self._module_cycle_snapshot_key(source_ship_id, module_id), {})
+
+    def _module_cycle_snapshot_for_target(
+        self,
+        source_ship_id: str,
+        module_id: str,
+        target_ship_id: str,
+    ) -> CycleTargetSnapshot | None:
+        return self._module_cycle_snapshots_for(source_ship_id, module_id).get(target_ship_id)
+
+    def _clear_module_cycle_snapshots(self, source_ship_id: str, module_id: str) -> None:
+        self._module_cycle_target_snapshots.pop(self._module_cycle_snapshot_key(source_ship_id, module_id), None)
+
+    def _prune_cycle_effect_snapshots(self, world: WorldState) -> None:
+        for key in list(self._module_cycle_target_snapshots.keys()):
+            source_ship_id, module_id = key
+            source = world.ships.get(source_ship_id)
+            if source is None or not source.vital.alive or source.runtime is None:
+                self._module_cycle_target_snapshots.pop(key, None)
+                continue
+            module = next((candidate for candidate in source.runtime.modules if candidate.module_id == module_id), None)
+            if module is None or module.state != module.state.ACTIVE:
+                self._module_cycle_target_snapshots.pop(key, None)
+
+    def _compute_projected_damage_factor(
+        self,
+        source,
+        target,
+        target_profile: ShipProfile,
+        effect,
+        strength: float,
+        distance: float,
+    ) -> float:
+        damage_factor = strength
+        if float(effect.projected_add.get("weapon_is_turret", 0.0) or 0.0) > 0.5:
+            relative_velocity = source.nav.velocity - target.nav.velocity
+            radial = (target.nav.position - source.nav.position).normalized()
+            tangential = Vector2(-radial.y, radial.x)
+            transversal = abs(relative_velocity.x * tangential.x + relative_velocity.y * tangential.y)
+            chance = self.pyfa.turret_chance_to_hit(
+                tracking=max(0.0, float(effect.projected_add.get("weapon_tracking", 0.0) or 0.0)),
+                optimal_sig=max(1.0, float(effect.projected_add.get("weapon_optimal_sig", 40_000.0) or 40_000.0)),
+                distance=distance,
+                optimal=effect.range_m,
+                falloff=effect.falloff_m,
+                transversal_speed=transversal,
+                target_sig=target_profile.sig_radius,
+                attacker_radius=source.nav.radius,
+                target_radius=target.nav.radius,
+            )
+            damage_factor = max(0.0, self.pyfa.turret_damage_multiplier(chance))
+        elif float(effect.projected_add.get("weapon_is_missile", 0.0) or 0.0) > 0.5:
+            relative_speed = (source.nav.velocity - target.nav.velocity).length()
+            explosion_radius = max(0.0, float(effect.projected_add.get("weapon_explosion_radius", 0.0) or 0.0))
+            explosion_velocity = max(0.0, float(effect.projected_add.get("weapon_explosion_velocity", 0.0) or 0.0))
+            drf = max(0.1, float(effect.projected_add.get("weapon_drf", 0.5) or 0.5))
+            if explosion_radius > 0.0:
+                sig_factor = target_profile.sig_radius / max(1.0, explosion_radius)
+                vel_term = (sig_factor * explosion_velocity) / max(1.0, relative_speed)
+                vel_factor = vel_term ** drf
+                application = max(0.0, min(1.0, min(sig_factor, vel_factor, 1.0)))
+            else:
+                application = 1.0
+            damage_factor = max(0.0, min(1.0, application * strength))
+        return max(0.0, damage_factor)
+
+    def _cycle_effect_damage_factor(
+        self,
+        source,
+        target,
+        target_profile: ShipProfile,
+        effect,
+        effect_index: int,
+        target_snapshot: CycleTargetSnapshot,
+        strength: float,
+    ) -> float | None:
+        cached = target_snapshot.effect_damage_factors.get(effect_index)
+        if cached is not None:
+            return cached
+        is_turret = float(effect.projected_add.get("weapon_is_turret", 0.0) or 0.0) > 0.5
+        is_missile = float(effect.projected_add.get("weapon_is_missile", 0.0) or 0.0) > 0.5
+        if not (is_turret or is_missile):
+            return None
+        damage_factor = self._compute_projected_damage_factor(
+            source=source,
+            target=target,
+            target_profile=target_profile,
+            effect=effect,
+            strength=strength,
+            distance=target_snapshot.distance,
+        )
+        target_snapshot.effect_damage_factors[effect_index] = damage_factor
+        return damage_factor
+
+    def _capture_module_cycle_snapshots(
+        self,
+        world: WorldState,
+        source,
+        module,
+        projected_target_id: str | None,
+    ) -> None:
+        target_snapshots: dict[str, CycleTargetSnapshot] = {}
+
+        if self._module_is_area_effect_module(module):
+            for effect in module.effects:
+                if effect.effect_class != EffectClass.PROJECTED:
+                    continue
+                for target in self._iter_area_targets_in_range(world, source, module, effect):
+                    distance = source.nav.position.distance_to(target.nav.position)
+                    existing = target_snapshots.get(target.ship_id)
+                    if existing is None:
+                        target_snapshots[target.ship_id] = CycleTargetSnapshot(distance=distance)
+                    else:
+                        existing.distance = min(existing.distance, distance)
+        elif projected_target_id:
+            target = world.ships.get(projected_target_id)
+            if target is not None and target.vital.alive:
+                target_snapshots[target.ship_id] = CycleTargetSnapshot(
+                    distance=source.nav.position.distance_to(target.nav.position)
+                )
+
+        if not target_snapshots:
+            self._clear_module_cycle_snapshots(source.ship_id, module.module_id)
+            return
+
+        for effect_index, effect in enumerate(module.effects):
+            if effect.effect_class != EffectClass.PROJECTED:
+                continue
+            max_range = self._projected_max_range(effect)
+            for target_snapshot in target_snapshots.values():
+                if max_range > 0.0 and target_snapshot.distance > max_range:
+                    continue
+                strength = self._projected_strength(effect, target_snapshot.distance)
+                if strength > 0.0:
+                    target_snapshot.effect_strengths[effect_index] = max(0.0, min(1.0, strength))
+
+        filtered = {
+            target_id: snapshot
+            for target_id, snapshot in target_snapshots.items()
+            if snapshot.effect_strengths
+        }
+        if filtered:
+            self._module_cycle_target_snapshots[self._module_cycle_snapshot_key(source.ship_id, module.module_id)] = filtered
+        else:
+            self._clear_module_cycle_snapshots(source.ship_id, module.module_id)
+
     def _resolve_cap_recharge(self, cap_now: float, cap_max: float, recharge_time: float, dt: float) -> float:
         if cap_max <= 0 or recharge_time <= 0:
             return cap_now
@@ -485,7 +644,9 @@ class CombatSystem:
             if not source.vital.alive or source.runtime is None:
                 continue
             for module in source.runtime.modules:
-                for effect in module.effects:
+                if self._module_uses_pyfa_projected_profile(module):
+                    continue
+                for effect_index, effect in enumerate(module.effects):
                     if effect.effect_class != EffectClass.PROJECTED:
                         continue
                     if not module.is_active_for(effect.state_required):
@@ -507,17 +668,15 @@ class CombatSystem:
                     ):
                         continue
 
-                    distance = source.nav.position.distance_to(target.nav.position)
-                    max_range = self._projected_max_range(effect)
-                    if max_range > 0 and distance > max_range:
+                    target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, module.module_id, target_id)
+                    if target_snapshot is None:
                         continue
-
-                    strength = self._projected_strength(effect, distance)
+                    strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
                     if strength <= 0:
                         continue
                     if self.detailed_logging and self.logger is not None:
                         self.logger.debug(
-                            f"projected_formula source={source.ship_id} target={target_id} module={module.module_id} dist={distance:.1f} range={effect.range_m:.1f} falloff={effect.falloff_m:.1f} strength={strength:.4f}"
+                            f"projected_formula source={source.ship_id} target={target_id} module={module.module_id} dist={target_snapshot.distance:.1f} range={effect.range_m:.1f} falloff={effect.falloff_m:.1f} strength={strength:.4f}"
                         )
                     impacts.setdefault(target_id, []).append(
                         ProjectedImpact(source_ship_id=source.ship_id, target_ship_id=target_id, effect=effect, strength=strength)
@@ -546,18 +705,6 @@ class CombatSystem:
             if max_range <= 0 or distance <= max_range:
                 return True
         return not has_projected
-
-    @staticmethod
-    def _module_prefers_propulsion_command(module) -> bool:
-        for effect in module.effects:
-            if effect.effect_class != EffectClass.LOCAL:
-                continue
-            if str(effect.state_required.value).upper() != "ACTIVE":
-                continue
-            speed_mult = float(effect.local_mult.get("speed", 1.0) or 1.0)
-            if speed_mult > 1.0:
-                return True
-        return False
 
     @staticmethod
     def _module_group_name(module) -> str:
@@ -629,6 +776,16 @@ class CombatSystem:
         )
 
     @staticmethod
+    def _module_is_cap_warfare_module(module) -> bool:
+        return CombatSystem._module_group_has_any(
+            module,
+            (
+                "energy neutral",
+                "nosferatu",
+            ),
+        )
+
+    @staticmethod
     def _module_is_target_ewar_module(module) -> bool:
         return CombatSystem._module_group_has_any(
             module,
@@ -638,6 +795,24 @@ class CombatSystem:
                 "stasis grappler",
             ),
         )
+
+    @staticmethod
+    def _module_uses_pyfa_projected_profile(module) -> bool:
+        if not CombatSystem._module_has_projected(module):
+            return False
+        if CombatSystem._module_is_command_burst_module(module):
+            return False
+        if CombatSystem._module_is_smart_bomb_module(module):
+            return False
+        if CombatSystem._module_is_burst_jammer_module(module):
+            return False
+        if CombatSystem._module_is_weapon_module(module):
+            return False
+        if CombatSystem._module_has_projected_rep(module):
+            return False
+        if CombatSystem._module_is_cap_warfare_module(module):
+            return False
+        return True
 
     @staticmethod
     def _module_is_hardener_module(module) -> bool:
@@ -804,10 +979,11 @@ class CombatSystem:
             if not self._module_is_command_burst_module(module):
                 continue
             state_value = str(module.state.value or "ONLINE").upper()
-            if state_value == "ACTIVE" and self._module_in_projected_range(source, target, module):
+            target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, module.module_id, target.ship_id)
+            if state_value == "ACTIVE" and target_snapshot is not None:
                 state_by_module_id[module.module_id] = "ACTIVE"
                 has_active_in_range = True
-            elif state_value == "OVERHEATED" and self._module_in_projected_range(source, target, module):
+            elif state_value == "OVERHEATED" and target_snapshot is not None:
                 state_by_module_id[module.module_id] = "OVERHEATED"
                 has_active_in_range = True
             else:
@@ -845,20 +1021,112 @@ class CombatSystem:
 
         return snapshots_by_ship
 
-    def _refresh_effective_runtimes_from_pyfa(self, world: WorldState, command_boosters_by_ship: dict[str, list[dict[str, Any]]]) -> None:
+    def _projected_source_snapshots_for_target(
+        self,
+        source,
+        target,
+        command_boosters_by_ship: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        if source.runtime is None or not target.vital.alive:
+            return []
+        blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
+        if not isinstance(blueprint, dict):
+            return []
+
+        source_command_snapshots = command_boosters_by_ship.get(source.ship_id, [])
+        snapshots: list[dict[str, Any]] = []
+        for active_projected_module in source.runtime.modules:
+            if not self._module_uses_pyfa_projected_profile(active_projected_module):
+                continue
+            active_state = str(active_projected_module.state.value or "ONLINE").upper()
+            if active_state not in {"ACTIVE", "OVERHEATED"}:
+                continue
+            target_id = source.combat.projected_targets.get(active_projected_module.module_id)
+            if target_id != target.ship_id:
+                continue
+            target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target.ship_id)
+            if target_snapshot is None:
+                continue
+
+            state_by_module_id: dict[str, str] = {}
+            for module in source.runtime.modules:
+                state_value = str(module.state.value or "ONLINE").upper()
+                projected_state = state_value
+
+                if state_value in {"ACTIVE", "OVERHEATED"}:
+                    if self._module_is_command_burst_module(module):
+                        projected_state = state_value
+                    elif self._module_uses_pyfa_projected_profile(module):
+                        projected_state = state_value if module.module_id == active_projected_module.module_id else "ONLINE"
+                    elif (
+                        self._module_is_area_effect_module(module)
+                        or self._module_is_weapon_module(module)
+                        or self._module_has_projected_rep(module)
+                        or self._module_is_cap_warfare_module(module)
+                    ):
+                        projected_state = "ONLINE"
+
+                state_by_module_id[module.module_id] = projected_state
+
+            snapshots.append(
+                {
+                    "fit_key": f"{source.runtime.fit_key}:{active_projected_module.module_id}",
+                    "blueprint": blueprint,
+                    "state_by_module_id": state_by_module_id,
+                    "command_booster_snapshots": source_command_snapshots,
+                    "projection_range": target_snapshot.distance,
+                }
+            )
+
+        return snapshots
+
+    def _collect_projected_source_snapshots(
+        self,
+        world: WorldState,
+        command_boosters_by_ship: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
+        projected_sources = [
+            ship
+            for ship in world.ships.values()
+            if ship.vital.alive
+            and ship.runtime is not None
+            and any(self._module_uses_pyfa_projected_profile(module) for module in ship.runtime.modules)
+        ]
+        if not projected_sources:
+            return snapshots_by_ship
+
+        for target in world.ships.values():
+            if not target.vital.alive or target.runtime is None:
+                continue
+            target_snapshots: list[dict[str, Any]] = []
+            for source in projected_sources:
+                target_snapshots.extend(self._projected_source_snapshots_for_target(source, target, command_boosters_by_ship))
+            if target_snapshots:
+                snapshots_by_ship[target.ship_id] = target_snapshots
+
+        return snapshots_by_ship
+
+    def _refresh_effective_runtimes_from_pyfa(
+        self,
+        world: WorldState,
+        command_boosters_by_ship: dict[str, list[dict[str, Any]]],
+        projected_sources_by_ship: dict[str, list[dict[str, Any]]],
+    ) -> None:
         for ship in world.ships.values():
             if not ship.vital.alive or ship.runtime is None:
                 continue
 
             booster_snapshots = command_boosters_by_ship.get(ship.ship_id)
-            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots)
+            projected_snapshots = projected_sources_by_ship.get(ship.ship_id)
+            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots, projected_snapshots)
             cached_signature = ship.runtime.diagnostics.get("pyfa_resolve_signature")
             cached_base_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
             if cache_key is not None and cached_signature == cache_key and isinstance(cached_base_profile, ShipProfile):
                 ship.profile = replace(cached_base_profile)
                 continue
 
-            resolved = resolve_runtime_from_pyfa_runtime(ship.runtime, booster_snapshots)
+            resolved = resolve_runtime_from_pyfa_runtime(ship.runtime, booster_snapshots, projected_snapshots)
             if resolved is None:
                 if isinstance(cached_base_profile, ShipProfile):
                     ship.profile = replace(cached_base_profile)
@@ -1271,6 +1539,14 @@ class CombatSystem:
                 continue
             self._enforce_ecm_restrictions(ship, now)
 
+    @staticmethod
+    def _break_all_locks(ship) -> None:
+        ship.combat.lock_targets.clear()
+        ship.combat.lock_timers.clear()
+        ship.combat.fire_delay_timers.clear()
+        ship.combat.projected_targets.clear()
+        ship.combat.current_target = None
+
     def _resolve_ecm_cycle(self, world: WorldState, source, module, target_id: str) -> None:
         target = world.ships.get(target_id)
         if target is None or not target.vital.alive:
@@ -1396,14 +1672,9 @@ class CombatSystem:
                 if not jammed:
                     continue
 
-                jam_until = now + self._ecm_duration_seconds(module.group)
-                target.combat.ecm_jam_sources[source.ship_id] = max(
-                    float(target.combat.ecm_jam_sources.get(source.ship_id, 0.0) or 0.0),
-                    jam_until,
-                )
-                self._enforce_ecm_restrictions(target, now)
+                self._break_all_locks(target)
                 self._queue_merged_event(
-                    "ecm_jam_applied",
+                    "ecm_burst_lock_break",
                     merge_fields={
                         "source": source.ship_id,
                         "target": target.ship_id,
@@ -1433,6 +1704,7 @@ class CombatSystem:
 
             for module in ship.runtime.modules:
                 if module.state == module.state.OFFLINE:
+                    self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
                     ship.combat.module_reactivation_timers.pop(module.module_id, None)
                     ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
                     ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
@@ -1449,6 +1721,7 @@ class CombatSystem:
                 if not active_effects:
                     if previous_state == module.state.ACTIVE:
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
+                    self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
                     module.state = module.state.ONLINE
                     ship.combat.module_cycle_timers.pop(module.module_id, None)
                     ship.combat.module_reactivation_timers.pop(module.module_id, None)
@@ -1478,6 +1751,7 @@ class CombatSystem:
                             continue
                         ship.combat.module_cycle_timers.pop(module.module_id, None)
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
+                        self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
                         cycle_just_completed = True
                         if reactivation_delay > 0.0:
                             ship.combat.module_reactivation_timers[module.module_id] = max(
@@ -1637,6 +1911,7 @@ class CombatSystem:
                     else:
                         ship.combat.module_cycle_timers.pop(module.module_id, None)
                 else:
+                    self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
                     ship.combat.module_cycle_timers.pop(module.module_id, None)
 
                 module.state = module.state.ACTIVE if desired_active else module.state.ONLINE
@@ -1651,6 +1926,13 @@ class CombatSystem:
                         self._resolve_area_ecm_cycle(world, ship, module)
                     elif projected_target_id is not None:
                         self._resolve_ecm_cycle(world, ship, module, projected_target_id)
+
+                if module.state == module.state.ACTIVE and (
+                    cycle_started
+                    or previous_state != module.state.ACTIVE
+                    or previous_projected_target != projected_target_id
+                ):
+                    self._capture_module_cycle_snapshots(world, ship, module, projected_target_id)
 
                 if previous_projected_target and (
                     module.state != module.state.ACTIVE or previous_projected_target != projected_target_id
@@ -1703,6 +1985,7 @@ class CombatSystem:
         effect,
         dt: float,
         strength: float,
+        damage_factor_override: float | None = None,
     ) -> tuple[float, float, float, float, float, float, float, float]:
         if target is None:
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -1747,37 +2030,7 @@ class CombatSystem:
         if _sum_damage(base_damage) <= 0.0:
             return shield_repaired, armor_repaired, cap_drained, 0.0, 0.0, 0.0, 0.0, 0.0
 
-        damage_factor = strength
-        if float(effect.projected_add.get("weapon_is_turret", 0.0) or 0.0) > 0.5:
-            relative_velocity = source.nav.velocity - target.nav.velocity
-            radial = (target.nav.position - source.nav.position).normalized()
-            tangential = Vector2(-radial.y, radial.x)
-            transversal = abs(relative_velocity.x * tangential.x + relative_velocity.y * tangential.y)
-            chance = self.pyfa.turret_chance_to_hit(
-                tracking=max(0.0, float(effect.projected_add.get("weapon_tracking", 0.0) or 0.0)),
-                optimal_sig=max(1.0, float(effect.projected_add.get("weapon_optimal_sig", 40_000.0) or 40_000.0)),
-                distance=source.nav.position.distance_to(target.nav.position),
-                optimal=effect.range_m,
-                falloff=effect.falloff_m,
-                transversal_speed=transversal,
-                target_sig=target_profile.sig_radius,
-                attacker_radius=source.nav.radius,
-                target_radius=target.nav.radius,
-            )
-            damage_factor = max(0.0, self.pyfa.turret_damage_multiplier(chance))
-        elif float(effect.projected_add.get("weapon_is_missile", 0.0) or 0.0) > 0.5:
-            relative_speed = (source.nav.velocity - target.nav.velocity).length()
-            explosion_radius = max(0.0, float(effect.projected_add.get("weapon_explosion_radius", 0.0) or 0.0))
-            explosion_velocity = max(0.0, float(effect.projected_add.get("weapon_explosion_velocity", 0.0) or 0.0))
-            drf = max(0.1, float(effect.projected_add.get("weapon_drf", 0.5) or 0.5))
-            if explosion_radius > 0.0:
-                sig_factor = target_profile.sig_radius / max(1.0, explosion_radius)
-                vel_term = (sig_factor * explosion_velocity) / max(1.0, relative_speed)
-                vel_factor = vel_term ** drf
-                application = max(0.0, min(1.0, min(sig_factor, vel_factor, 1.0)))
-            else:
-                application = 1.0
-            damage_factor = max(0.0, min(1.0, application * strength))
+        damage_factor = strength if damage_factor_override is None else max(0.0, float(damage_factor_override))
 
         dealt_damage = _scale_damage(base_damage, damage_factor)
         total_damage = _sum_damage(dealt_damage)
@@ -1944,6 +2197,7 @@ class CombatSystem:
                 world.squad_prelock_timers.pop(focus_key, None)
 
     def run(self, world: WorldState, dt: float) -> None:
+        self._prune_cycle_effect_snapshots(world)
         if self.event_logging_enabled:
             self._advance_merge_window(world.now)
         else:
@@ -1954,7 +2208,8 @@ class CombatSystem:
         self._advance_target_locks(world, dt)
         self._update_module_states(world, dt)
         command_boosters = self._collect_command_booster_snapshots(world)
-        self._refresh_effective_runtimes_from_pyfa(world, command_boosters)
+        projected_sources = self._collect_projected_source_snapshots(world, command_boosters)
+        self._refresh_effective_runtimes_from_pyfa(world, command_boosters, projected_sources)
         projected = self._collect_projected_impacts(world, dt)
 
         effective_profiles: dict[str, ShipProfile] = {}
@@ -1980,17 +2235,23 @@ class CombatSystem:
                 if self._module_is_command_burst_module(module) or self._module_is_burst_jammer_module(module):
                     continue
 
-                for effect in module.effects:
+                cycle_target_snapshots = self._module_cycle_snapshots_for(source.ship_id, module.module_id)
+                if not cycle_target_snapshots:
+                    continue
+
+                for effect_index, effect in enumerate(module.effects):
                     if effect.effect_class != EffectClass.PROJECTED:
                         continue
 
-                    targets: list[tuple[Any, float]] = []
+                    targets: list[tuple[Any, CycleTargetSnapshot, float]] = []
                     if self._module_is_smart_bomb_module(module):
-                        for target in self._iter_area_targets_in_range(world, source, module, effect):
-                            distance = source.nav.position.distance_to(target.nav.position)
-                            strength = self._projected_strength(effect, distance)
+                        for target_id, target_snapshot in cycle_target_snapshots.items():
+                            target = world.ships.get(target_id)
+                            if target is None or not target.vital.alive:
+                                continue
+                            strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
                             if strength > 0.0:
-                                targets.append((target, strength))
+                                targets.append((target, target_snapshot, strength))
                     else:
                         tgt_id = source.combat.projected_targets.get(module.module_id)
                         if not tgt_id:
@@ -1998,17 +2259,25 @@ class CombatSystem:
                         target = world.ships.get(tgt_id)
                         if target is None or not target.vital.alive:
                             continue
-                        distance = source.nav.position.distance_to(target.nav.position)
-                        max_range = self._projected_max_range(effect)
-                        if max_range > 0 and distance > max_range:
+                        target_snapshot = cycle_target_snapshots.get(tgt_id)
+                        if target_snapshot is None:
                             continue
-                        strength = self._projected_strength(effect, distance)
+                        strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
                         if strength <= 0.0:
                             continue
-                        targets.append((target, strength))
+                        targets.append((target, target_snapshot, strength))
 
-                    for target, strength in targets:
+                    for target, target_snapshot, strength in targets:
                         target_profile = effective_profiles.get(target.ship_id) or target.profile
+                        damage_factor_override = self._cycle_effect_damage_factor(
+                            source=source,
+                            target=target,
+                            target_profile=target_profile,
+                            effect=effect,
+                            effect_index=effect_index,
+                            target_snapshot=target_snapshot,
+                            strength=strength,
+                        )
                         hp_before = target.vital.shield + target.vital.armor + target.vital.structure
                         (
                             shield_repaired,
@@ -2027,6 +2296,7 @@ class CombatSystem:
                             effect=effect,
                             dt=dt,
                             strength=strength,
+                            damage_factor_override=damage_factor_override,
                         )
                         hp_after = target.vital.shield + target.vital.armor + target.vital.structure
                         applied_damage = max(0.0, hp_before - hp_after)

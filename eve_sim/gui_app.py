@@ -1630,7 +1630,7 @@ class ShipStatusDialog(QDialog):
         self._lock_module_specs: dict[str, ParsedModuleSpec] = {}
         self._lock_ammo_draft_by_module: dict[str, str] = {}
         self._stable_profile_cache = None
-        self._stable_profile_cache_key: tuple[str, int] | None = None
+        self._stable_profile_cache_key: tuple[Any, ...] | None = None
         self.setWindowTitle(f"{tr(self._language_getter(), 'ship_status_title')} - {ship_id}")
         self.resize(520, 480)
 
@@ -1960,14 +1960,20 @@ class ShipStatusDialog(QDialog):
         if ship.runtime is None:
             return ship.profile
         fit_text = self._fit_text_getter(self.ship_id) or ""
-        cache_key = (fit_text, id(ship.runtime))
+        runtime_state_key = tuple((module.module_id, module.state.value) for module in ship.runtime.modules)
+        cache_key = (fit_text, id(ship.runtime), runtime_state_key)
         if self._stable_profile_cache is not None and self._stable_profile_cache_key == cache_key:
             return self._stable_profile_cache
-        pyfa_profile = recompute_profile_from_pyfa_runtime(ship.runtime)
-        if pyfa_profile is not None:
-            base = replace(pyfa_profile)
+
+        cached_pyfa_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
+        if isinstance(cached_pyfa_profile, ShipProfile):
+            base = replace(cached_pyfa_profile)
         else:
-            base = replace(self._runtime_engine.compute_base_profile(ship.runtime))
+            pyfa_profile = recompute_profile_from_pyfa_runtime(ship.runtime)
+            if pyfa_profile is not None:
+                base = replace(pyfa_profile)
+            else:
+                base = replace(self._runtime_engine.compute_base_profile(ship.runtime))
         self._stable_profile_cache = base
         self._stable_profile_cache_key = cache_key
         return base
@@ -4176,6 +4182,11 @@ class MainWindow(QMainWindow):
                     sig_radius=float(data.get("profile_sig_radius", 120.0)),
                     scan_resolution=float(data.get("profile_scan_resolution", 300.0)),
                     max_target_range=float(data.get("profile_max_target_range", 120000.0)),
+                    max_locked_targets=int(data.get("profile_max_locked_targets", 0) or 0),
+                    scan_strength=float(data.get("profile_scan_strength", 0.0)),
+                    ecm_jam_chance=float(data.get("profile_ecm_jam_chance", 0.0)),
+                    warp_scramble_status=float(data.get("profile_warp_scramble_status", 0.0)),
+                    warp_stability=float(data.get("profile_warp_stability", 0.0)),
                     max_speed=float(data.get("profile_max_speed", 1800.0)),
                     max_cap=float(data.get("profile_max_cap", 4000.0)),
                     cap_recharge_time=float(data.get("profile_cap_recharge_time", 450.0)),
@@ -4205,6 +4216,11 @@ class MainWindow(QMainWindow):
                 sig_radius=float(data.get("profile_sig_radius", 120.0)),
                 scan_resolution=float(data.get("profile_scan_resolution", 300.0)),
                 max_target_range=float(data.get("profile_max_target_range", 120000.0)),
+                max_locked_targets=int(data.get("profile_max_locked_targets", 0) or 0),
+                scan_strength=float(data.get("profile_scan_strength", 0.0)),
+                ecm_jam_chance=float(data.get("profile_ecm_jam_chance", 0.0)),
+                warp_scramble_status=float(data.get("profile_warp_scramble_status", 0.0)),
+                warp_stability=float(data.get("profile_warp_stability", 0.0)),
                 max_speed=float(data.get("profile_max_speed", 1800.0)),
                 max_cap=float(data.get("profile_max_cap", 4000.0)),
                 cap_recharge_time=float(data.get("profile_cap_recharge_time", 450.0)),
@@ -4282,6 +4298,11 @@ class MainWindow(QMainWindow):
                     "profile_sig_radius": ship.profile.sig_radius,
                     "profile_scan_resolution": ship.profile.scan_resolution,
                     "profile_max_target_range": ship.profile.max_target_range,
+                    "profile_max_locked_targets": ship.profile.max_locked_targets,
+                    "profile_scan_strength": ship.profile.scan_strength,
+                    "profile_ecm_jam_chance": ship.profile.ecm_jam_chance,
+                    "profile_warp_scramble_status": ship.profile.warp_scramble_status,
+                    "profile_warp_stability": ship.profile.warp_stability,
                     "profile_max_speed": ship.profile.max_speed,
                     "profile_max_cap": ship.profile.max_cap,
                     "profile_cap_recharge_time": ship.profile.cap_recharge_time,

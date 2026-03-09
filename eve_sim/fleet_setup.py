@@ -941,6 +941,7 @@ class RuntimeFromEftFactory:
     def _compute_pyfa_final_stats(self, fit) -> dict[str, float]:
         ship = fit.ship
         weapon_stats = self._collect_pyfa_weapon_stats(cast(list[Any], fit.modules), ship, require_volley=True)
+        warp_scramble_status = float(ship.getModifiedItemAttr("warpScrambleStatus") or 0.0)
         return {
             "dps": float(fit.getTotalDps().total),
             "volley": float(fit.getTotalVolley().total),
@@ -974,10 +975,15 @@ class RuntimeFromEftFactory:
             "sig_radius": float(ship.getModifiedItemAttr("signatureRadius") or 0.0),
             "scan_resolution": float(ship.getModifiedItemAttr("scanResolution") or 0.0),
             "max_target_range": float(ship.getModifiedItemAttr("maxTargetRange") or 0.0),
+            "max_locked_targets": int(fit.maxTargets),
+            "scan_strength": float(fit.scanStrength or 0.0),
+            "ecm_jam_chance": max(0.0, min(1.0, float(fit.jamChance or 0.0) / 100.0)),
             "sensor_strength_gravimetric": float(ship.getModifiedItemAttr("scanGravimetricStrength") or 0.0),
             "sensor_strength_ladar": float(ship.getModifiedItemAttr("scanLadarStrength") or 0.0),
             "sensor_strength_magnetometric": float(ship.getModifiedItemAttr("scanMagnetometricStrength") or 0.0),
             "sensor_strength_radar": float(ship.getModifiedItemAttr("scanRadarStrength") or 0.0),
+            "warp_scramble_status": warp_scramble_status,
+            "warp_stability": -warp_scramble_status,
             "max_cap": float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0),
             "cap_recharge_time": float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0,
             "shield_hp": float(ship.getModifiedItemAttr("shieldCapacity") or 0.0),
@@ -1056,10 +1062,15 @@ class RuntimeFromEftFactory:
             sig_radius=max(1.0, float(pyfa_final.get("sig_radius", 0.0) or 0.0)),
             scan_resolution=max(1.0, float(pyfa_final.get("scan_resolution", 0.0) or 0.0)),
             max_target_range=max(1000.0, float(pyfa_final.get("max_target_range", 0.0) or 0.0)),
+            max_locked_targets=max(0, int(pyfa_final.get("max_locked_targets", 0) or 0)),
+            scan_strength=max(0.0, float(pyfa_final.get("scan_strength", 0.0) or 0.0)),
+            ecm_jam_chance=max(0.0, min(1.0, float(pyfa_final.get("ecm_jam_chance", 0.0) or 0.0))),
             sensor_strength_gravimetric=max(0.0, float(pyfa_final.get("sensor_strength_gravimetric", 0.0) or 0.0)),
             sensor_strength_ladar=max(0.0, float(pyfa_final.get("sensor_strength_ladar", 0.0) or 0.0)),
             sensor_strength_magnetometric=max(0.0, float(pyfa_final.get("sensor_strength_magnetometric", 0.0) or 0.0)),
             sensor_strength_radar=max(0.0, float(pyfa_final.get("sensor_strength_radar", 0.0) or 0.0)),
+            warp_scramble_status=float(pyfa_final.get("warp_scramble_status", 0.0) or 0.0),
+            warp_stability=float(pyfa_final.get("warp_stability", 0.0) or 0.0),
             max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
             max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
             cap_recharge_time=max(1.0, float(pyfa_final.get("cap_recharge_time", 0.0) or 0.0)),
@@ -1613,9 +1624,40 @@ def _normalized_command_booster_snapshots(
     return [snap for snap in snapshots if isinstance(snap, dict)]
 
 
+def _projected_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    blueprint_raw = snapshot.get("blueprint")
+    blueprint: dict[str, Any] = blueprint_raw if isinstance(blueprint_raw, dict) else {}
+    state_raw = snapshot.get("state_by_module_id")
+    state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
+    command_raw = snapshot.get("command_booster_snapshots")
+    command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
+    try:
+        projection_range = round(float(snapshot.get("projection_range", 0.0) or 0.0), 3)
+    except Exception:
+        projection_range = 0.0
+    return (
+        _runtime_blueprint_signature(blueprint),
+        tuple(sorted((str(module_id), str(state)) for module_id, state in state_by_module_id.items())),
+        tuple(sorted(_command_snapshot_signature(command_snapshot) for command_snapshot in command_snapshots)),
+        projection_range,
+    )
+
+
+def _normalized_projected_source_snapshots(
+    runtime: FitRuntime,
+    projected_source_snapshots: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    snapshots = projected_source_snapshots
+    if snapshots is None:
+        raw_snapshots = runtime.diagnostics.get("pyfa_projected_sources")
+        snapshots = [snap for snap in raw_snapshots if isinstance(snap, dict)] if isinstance(raw_snapshots, list) else []
+    return [snap for snap in snapshots if isinstance(snap, dict)]
+
+
 def get_runtime_resolve_cache_key(
     runtime: FitRuntime,
     command_booster_snapshots: list[dict[str, Any]] | None = None,
+    projected_source_snapshots: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, ...] | None:
     blueprint = runtime.diagnostics.get("pyfa_blueprint")
     if not isinstance(blueprint, dict):
@@ -1626,11 +1668,13 @@ def get_runtime_resolve_cache_key(
         return None
 
     snapshots = _normalized_command_booster_snapshots(runtime, command_booster_snapshots)
+    projected_snapshots = _normalized_projected_source_snapshots(runtime, projected_source_snapshots)
     state_by_module_id = _runtime_module_state_map(runtime)
     return (
         blueprint_signature,
         tuple(sorted((module_id, state) for module_id, state in state_by_module_id.items())),
         tuple(sorted(_command_snapshot_signature(snapshot) for snapshot in snapshots)),
+        tuple(sorted(_projected_snapshot_signature(snapshot) for snapshot in projected_snapshots)),
     )
 
 
@@ -1655,9 +1699,100 @@ def _attach_command_fit(target_fit: Any, booster_fit: Any) -> None:
     target_fit.boostedOf[booster_fit.ID] = command_link
 
 
+def _attach_projected_fit(
+    target_fit: Any,
+    source_fit: Any,
+    amount: int = 1,
+    active: bool = True,
+    projection_range: float | None = None,
+) -> None:
+    projected_fit_mod = importlib.import_module("eos.db.saveddata.fit")
+    projected_fit_cls = getattr(projected_fit_mod, "ProjectedFit")
+    projected_link = projected_fit_cls(source_fit.ID, source_fit, amount=amount, active=active)
+    projected_link.victimID = target_fit.ID
+    projected_link.victim_fit = target_fit
+    projected_link.projectionRange = None if projection_range is None else float(projection_range)
+    source_fit.projectedOnto[target_fit.ID] = projected_link
+    target_fit.victimOf[source_fit.ID] = projected_link
+
+
+def _snapshot_state_by_module_id(snapshot: dict[str, Any]) -> dict[str, str]:
+    state_raw = snapshot.get("state_by_module_id")
+    state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
+    return {str(k): str(v) for k, v in state_by_module_id.items()}
+
+
+def _snapshot_has_active_modules(state_by_module_id: dict[str, str]) -> bool:
+    return any(str(state).upper() in {"ACTIVE", "OVERHEATED"} for state in state_by_module_id.values())
+
+
+def _snapshot_command_booster_snapshots(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    command_raw = snapshot.get("command_booster_snapshots")
+    return [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
+
+
+def _snapshot_projection_range(snapshot: dict[str, Any]) -> float:
+    try:
+        return float(snapshot.get("projection_range", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _build_transient_fit_from_snapshot(
+    factory: RuntimeFromEftFactory,
+    snapshot: dict[str, Any],
+    next_fit_id: int,
+    fallback_runtime: FitRuntime,
+    fit_prefix: str,
+) -> tuple[Any | None, int]:
+    snapshot_blueprint = snapshot.get("blueprint") if isinstance(snapshot.get("blueprint"), dict) else None
+    if snapshot_blueprint is None:
+        return None, next_fit_id
+
+    snapshot_runtime = FitRuntime(
+        fit_key=str(snapshot.get("fit_key", "") or f"{fit_prefix}-{next_fit_id}"),
+        hull=fallback_runtime.hull,
+        skills=fallback_runtime.skills,
+    )
+    snapshot_runtime.diagnostics["pyfa_blueprint"] = snapshot_blueprint
+    snapshot_parsed = _parsed_fit_from_runtime_blueprint(snapshot_runtime)
+    if snapshot_parsed is None:
+        return None, next_fit_id
+
+    state_by_module_id = _snapshot_state_by_module_id(snapshot)
+    if not _snapshot_has_active_modules(state_by_module_id):
+        return None, next_fit_id
+
+    snapshot_fit, _ = factory._build_pyfa_fit(snapshot_parsed, state_by_module_id=state_by_module_id)
+    snapshot_fit.ID = next_fit_id
+    return snapshot_fit, next_fit_id + 1
+
+
+def _attach_command_snapshot_fits(
+    factory: RuntimeFromEftFactory,
+    target_fit: Any,
+    snapshots: list[dict[str, Any]],
+    next_fit_id: int,
+    fallback_runtime: FitRuntime,
+) -> int:
+    for snapshot in snapshots:
+        booster_fit, next_fit_id = _build_transient_fit_from_snapshot(
+            factory=factory,
+            snapshot=snapshot,
+            next_fit_id=next_fit_id,
+            fallback_runtime=fallback_runtime,
+            fit_prefix="command",
+        )
+        if booster_fit is None:
+            continue
+        _attach_command_fit(target_fit, booster_fit)
+    return next_fit_id
+
+
 def resolve_runtime_from_pyfa_runtime(
     runtime: FitRuntime,
     command_booster_snapshots: list[dict[str, Any]] | None = None,
+    projected_source_snapshots: list[dict[str, Any]] | None = None,
 ) -> tuple[FitRuntime, ShipProfile] | None:
     backend = _get_static_backend()
     if not backend.fit_engine_ready:
@@ -1668,8 +1803,9 @@ def resolve_runtime_from_pyfa_runtime(
         return None
 
     snapshots = _normalized_command_booster_snapshots(runtime, command_booster_snapshots)
+    projected_snapshots = _normalized_projected_source_snapshots(runtime, projected_source_snapshots)
     state_by_module_id = _runtime_module_state_map(runtime)
-    cache_key = get_runtime_resolve_cache_key(runtime, snapshots)
+    cache_key = get_runtime_resolve_cache_key(runtime, snapshots, projected_snapshots)
     if cache_key is None:
         return None
     cached = _PYFA_RUNTIME_RESOLVED_CACHE.get(cache_key)
@@ -1678,6 +1814,7 @@ def resolve_runtime_from_pyfa_runtime(
         resolved_runtime.fit_key = runtime.fit_key
         resolved_runtime.diagnostics["pyfa_blueprint"] = deepcopy(blueprint)
         resolved_runtime.diagnostics["pyfa_command_boosters"] = deepcopy(snapshots)
+        resolved_runtime.diagnostics["pyfa_projected_sources"] = deepcopy(projected_snapshots)
         _copy_dynamic_runtime_state(runtime, resolved_runtime)
         return resolved_runtime, replace(cached[1])
 
@@ -1687,23 +1824,23 @@ def resolve_runtime_from_pyfa_runtime(
         target_fit.ID = 1
 
         next_fit_id = 2
-        for snapshot in snapshots:
-            booster_blueprint = snapshot.get("blueprint") if isinstance(snapshot.get("blueprint"), dict) else None
-            if booster_blueprint is None:
+        next_fit_id = _attach_command_snapshot_fits(factory, target_fit, snapshots, next_fit_id, runtime)
+
+        for snapshot in projected_snapshots:
+            source_fit, next_fit_id = _build_transient_fit_from_snapshot(
+                factory=factory,
+                snapshot=snapshot,
+                next_fit_id=next_fit_id,
+                fallback_runtime=runtime,
+                fit_prefix="projected",
+            )
+            if source_fit is None:
                 continue
-            booster_runtime = FitRuntime(fit_key=str(snapshot.get("fit_key", "") or f"command-{next_fit_id}"), hull=runtime.hull, skills=runtime.skills)
-            booster_runtime.diagnostics["pyfa_blueprint"] = booster_blueprint
-            booster_parsed = _parsed_fit_from_runtime_blueprint(booster_runtime)
-            if booster_parsed is None:
-                continue
-            booster_state_raw = snapshot.get("state_by_module_id")
-            booster_state_map: dict[str, Any] = booster_state_raw if isinstance(booster_state_raw, dict) else {}
-            if not any(str(state).upper() in {"ACTIVE", "OVERHEATED"} for state in booster_state_map.values()):
-                continue
-            booster_fit, _ = factory._build_pyfa_fit(booster_parsed, state_by_module_id={str(k): str(v) for k, v in booster_state_map.items()})
-            booster_fit.ID = next_fit_id
-            next_fit_id += 1
-            _attach_command_fit(target_fit, booster_fit)
+
+            source_command_snapshots = _snapshot_command_booster_snapshots(snapshot)
+            next_fit_id = _attach_command_snapshot_fits(factory, source_fit, source_command_snapshots, next_fit_id, runtime)
+            source_fit.calculateModifiedAttributes()
+            _attach_projected_fit(target_fit, source_fit, projection_range=_snapshot_projection_range(snapshot))
 
         target_fit.calculateModifiedAttributes()
         resolved_runtime, _fit, profile = factory._build_runtime_artifacts_from_pyfa_fit(
@@ -1713,6 +1850,7 @@ def resolve_runtime_from_pyfa_runtime(
             state_by_module_id=state_by_module_id,
             command_booster_snapshots=snapshots,
         )
+        resolved_runtime.diagnostics["pyfa_projected_sources"] = deepcopy(projected_snapshots)
         _copy_dynamic_runtime_state(runtime, resolved_runtime)
     except Exception:
         return None
@@ -1724,8 +1862,9 @@ def resolve_runtime_from_pyfa_runtime(
 def recompute_profile_from_pyfa_runtime(
     runtime: FitRuntime,
     command_booster_snapshots: list[dict[str, Any]] | None = None,
+    projected_source_snapshots: list[dict[str, Any]] | None = None,
 ) -> ShipProfile | None:
-    resolved = resolve_runtime_from_pyfa_runtime(runtime, command_booster_snapshots)
+    resolved = resolve_runtime_from_pyfa_runtime(runtime, command_booster_snapshots, projected_source_snapshots)
     if resolved is None:
         return None
     profile = resolved[1]
