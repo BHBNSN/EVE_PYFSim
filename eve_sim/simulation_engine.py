@@ -6,6 +6,7 @@ import time
 
 from .agents import CommanderAgent, ShipAgent
 from .config import EngineConfig
+from .fleet_setup import prewarm_runtime_base_cache, prewarm_world_base_cache
 from .sim_logging import get_sim_logger, log_sim_event
 from .systems import CombatSystem, LogisticsSystem, MovementSystem, PerceptionSystem
 from .world import WorldState
@@ -31,6 +32,7 @@ class SimulationEngine:
         self.logistics = LogisticsSystem()
 
         self._dt = 1.0 / config.tick_rate
+        prewarm_world_base_cache(world)
 
     def _log_hotspot(self, name: str, start_time: float, **fields) -> None:
         if not bool(getattr(self.config, "hotspot_logging", False)):
@@ -50,6 +52,9 @@ class SimulationEngine:
 
     def register_ship(self, ship_id: str) -> None:
         self.ship_agents[ship_id] = ShipAgent(agent_id=f"agent:{ship_id}", ship_id=ship_id)
+        ship = self.world.ships.get(ship_id)
+        if ship is not None:
+            prewarm_runtime_base_cache(getattr(ship, "runtime", None))
 
     def step(self) -> None:
         step_perf_started = time.perf_counter()

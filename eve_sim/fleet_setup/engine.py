@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from collections import Counter
@@ -476,6 +476,9 @@ class RuntimeFromEftFactory:
             cap_drain = abs(attr("energyNeutralizerAmount", 0.0))
             if cap_drain > 0.0:
                 projected_add["cap_drain"] = cap_drain
+            nos_drain = abs(attr("powerTransferAmount", 0.0))
+            if nos_drain > 0.0 and "nosferatu" in group_name:
+                projected_add["cap_drain"] = max(projected_add.get("cap_drain", 0.0), nos_drain)
         else:
             local_rep = abs(attr("shieldBonus", 0.0)) + abs(attr("armorDamageAmount", 0.0))
             if local_rep > 0.0:
@@ -801,9 +804,11 @@ class RuntimeFromEftFactory:
         state_by_module_id: dict[str, str] | None = None,
         *,
         calculate_modified_attributes: bool = True,
+        default_online: bool = False,
+        ignore_offline_specs: bool = False,
     ) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
         if not self._pyfa.fit_engine_ready:
-            raise ValueError("pyfa Fit计算链不可用")
+            raise ValueError("pyfa static database unavailable")
 
         fit_cls = self._pyfa._fit_cls
         ship_cls = self._pyfa._ship_cls
@@ -824,7 +829,7 @@ class RuntimeFromEftFactory:
         ship_name = self._pyfa.resolve_type_name(parsed.ship_name)
         ship_item = self._pyfa.get_item(ship_name)
         if ship_item is None:
-            raise ValueError(f"pyfa中未找到舰船：{parsed.ship_name}")
+            raise ValueError(f"pyfa ship not found: {parsed.ship_name}")
 
         fit = fit_cls(ship=ship_cls(ship_item), name=parsed.fit_name)
         fit.character = character_cls.getAll5()
@@ -834,7 +839,7 @@ class RuntimeFromEftFactory:
             module_name = self._pyfa.resolve_type_name(spec.module_name)
             module_item = self._pyfa.get_item(module_name)
             if module_item is None:
-                raise ValueError(f"pyfa中未找到模块：{spec.module_name}")
+                raise ValueError(f"pyfa module not found: {spec.module_name}")
             module = module_cls(module_item)
             module.owner = fit
             module_id = f"mod-{idx}"
@@ -842,16 +847,16 @@ class RuntimeFromEftFactory:
             group_name = (module_item.group.name or "").lower()
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
             if self._is_weapon_like_group(group_name) and not charge_name:
-                raise ValueError(f"武器缺少可解析弹药：{spec.module_name}")
+                raise ValueError(f"姝﹀櫒缂哄皯鍙В鏋愬脊鑽細{spec.module_name}")
             if charge_name:
                 charge_item = self._pyfa.get_item(self._pyfa.resolve_type_name(charge_name))
                 if charge_item is None:
-                    raise ValueError(f"pyfa中未找到弹药：{charge_name}")
+                    raise ValueError(f"pyfa charge not found: {charge_name}")
                 module.charge = charge_item
 
-            default_runtime_state = "ACTIVE" if self._is_weapon_like_group(group_name) else "ONLINE"
+            default_runtime_state = "ONLINE" if default_online else ("ACTIVE" if self._is_weapon_like_group(group_name) else "ONLINE")
             runtime_state = str((state_by_module_id or {}).get(module_id, default_runtime_state) or default_runtime_state).upper()
-            if spec.offline:
+            if spec.offline and not ignore_offline_specs:
                 runtime_state = "OFFLINE"
             module.state = _pyfa_module_state_from_runtime_state(self, module, runtime_state)
 
@@ -908,6 +913,7 @@ class RuntimeFromEftFactory:
             "sensor_strength_radar": float(ship.getModifiedItemAttr("scanRadarStrength") or 0.0),
             "warp_scramble_status": warp_scramble_status,
             "warp_stability": -warp_scramble_status,
+            "energy_warfare_resistance": float(ship.getModifiedItemAttr("energyWarfareResistance") or 1.0),
             "max_cap": float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0),
             "cap_recharge_time": float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0,
             "shield_hp": float(ship.getModifiedItemAttr("shieldCapacity") or 0.0),
@@ -995,6 +1001,7 @@ class RuntimeFromEftFactory:
             sensor_strength_radar=max(0.0, float(pyfa_final.get("sensor_strength_radar", 0.0) or 0.0)),
             warp_scramble_status=float(pyfa_final.get("warp_scramble_status", 0.0) or 0.0),
             warp_stability=float(pyfa_final.get("warp_stability", 0.0) or 0.0),
+            energy_warfare_resistance=max(0.0, float(pyfa_final.get("energy_warfare_resistance", 1.0) or 1.0)),
             max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
             max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
             cap_recharge_time=max(1.0, float(pyfa_final.get("cap_recharge_time", 0.0) or 0.0)),
@@ -1063,6 +1070,7 @@ class RuntimeFromEftFactory:
             structure_hp=profile.structure_hp,
             rep_amount=profile.rep_amount,
             rep_cycle=profile.rep_cycle,
+            energy_warfare_resistance=profile.energy_warfare_resistance,
             mass=profile.mass,
             agility=profile.agility,
         )
@@ -1117,6 +1125,7 @@ class RuntimeFromEftFactory:
             structure_hp=profile.structure_hp,
             rep_amount=profile.rep_amount,
             rep_cycle=profile.rep_cycle,
+            energy_warfare_resistance=profile.energy_warfare_resistance,
             mass=profile.mass,
             agility=profile.agility,
         )
@@ -1124,7 +1133,7 @@ class RuntimeFromEftFactory:
 
     def build(self, parsed: ParsedEftFit) -> tuple[FitRuntime, FitDescriptor]:
         if not self._pyfa.available:
-            raise ValueError("pyfa 静态数据库不可用，无法进行严格数值解析")
+            raise ValueError("pyfa static database unavailable")
 
         cached_runtime = self._runtime_cache.get(parsed.fit_key)
         cached_fit = self._fit_cache.get(parsed.fit_key)
@@ -1135,7 +1144,6 @@ class RuntimeFromEftFactory:
         runtime, fit, profile = self._build_runtime_artifacts_from_pyfa_fit(parsed, fit_ctx, fitted_modules)
         runtime_parsed = _parsed_fit_from_runtime_blueprint(runtime)
         _warm_runtime_precalculated_local_base_fit(self, runtime_parsed or parsed, runtime)
-        _warm_runtime_precalculated_projected_source_fits(self, runtime_parsed or parsed, runtime)
         self._runtime_cache[parsed.fit_key] = runtime
         self._fit_cache[parsed.fit_key] = fit
         self._profile_cache[parsed.fit_key] = profile
@@ -1145,7 +1153,7 @@ class RuntimeFromEftFactory:
         self.build(parsed)
         cached = self._profile_cache.get(parsed.fit_key)
         if cached is None:
-            raise ValueError("内部错误：缺少配装剖面缓存")
+            raise ValueError("missing cached fit profile")
         return replace(cached)
 
     @property
@@ -1156,7 +1164,7 @@ class RuntimeFromEftFactory:
 class _PyfaStaticBackend:
     def __init__(self) -> None:
         self.available = False
-        self.status = "Fallback: 内置规则映射"
+        self.status = "Fallback: 鍐呯疆瑙勫垯鏄犲皠"
         self._get_item = None
         self._get_group = None
         self._fit_cls = None
@@ -1191,7 +1199,7 @@ class _PyfaStaticBackend:
         pyfa_root = resolve_pyfa_source_dir()
         db_path = pyfa_root / "eve.db"
         if not self._check_db_schema(db_path):
-            self.status = f"Fallback: 未检测到可用 pyfa 静态库 ({db_path})"
+            self.status = f"Fallback: 鏈娴嬪埌鍙敤 pyfa 闈欐€佸簱 ({db_path})"
             return
 
         try:
@@ -1227,14 +1235,14 @@ class _PyfaStaticBackend:
             self._fitting_module_state_offline = const_mod.FittingModuleState.OFFLINE
             self._fitting_module_state_overheated = const_mod.FittingModuleState.OVERHEATED
             self.available = True
-            self.status = "Pyfa: 静态数据驱动"
+            self.status = "Pyfa: static data backend ready"
         except ModuleNotFoundError as exc:
             self.available = False
             missing = getattr(exc, "name", None) or str(exc)
-            self.status = f"Fallback: pyfa加载失败 (ModuleNotFoundError: {missing})"
+            self.status = f"Fallback: pyfa鍔犺浇澶辫触 (ModuleNotFoundError: {missing})"
         except Exception as exc:
             self.available = False
-            self.status = f"Fallback: pyfa加载失败 ({type(exc).__name__})"
+            self.status = f"Fallback: pyfa鍔犺浇澶辫触 ({type(exc).__name__})"
 
     @staticmethod
     def _check_db_schema(db_path: Path) -> bool:
@@ -1469,14 +1477,9 @@ class _PyfaStaticBackend:
 
 
 _STATIC_BACKEND: _PyfaStaticBackend | None = None
-_PYFA_RUNTIME_PROFILE_CACHE: dict[tuple[Any, ...], ShipProfile] = {}
 _PYFA_RUNTIME_RESOLVED_CACHE: dict[tuple[Any, ...], tuple[FitRuntime, ShipProfile]] = {}
-_PYFA_FIT_TEMPLATE_CACHE: dict[tuple[Any, ...], tuple[Any, tuple[str | None, ...]]] = {}
 _PYFA_PRECALCULATED_LOCAL_BASE_FIT_CACHE: dict[tuple[Any, ...], tuple[Any, tuple[str | None, ...]]] = {}
-_PYFA_PRECALCULATED_COMMAND_BASE_FIT_CACHE: dict[tuple[Any, ...], tuple[Any, tuple[str | None, ...]]] = {}
-_PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_CACHE: dict[tuple[Any, ...], Any] = {}
-_PYFA_PRECALCULATED_PROJECTED_TARGET_FIT_CACHE: dict[tuple[Any, ...], dict[tuple[Any, ...], Any]] = {}
-_PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_NEXT_ID = 1_000_000
+_PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
 
 
 def _get_static_backend() -> _PyfaStaticBackend:
@@ -1519,30 +1522,6 @@ def _module_state_signature(state_by_module_id: dict[str, str] | None) -> tuple[
     return tuple(sorted((str(module_id), str(state)) for module_id, state in state_map.items()))
 
 
-def _parsed_fit_template_signature(parsed: ParsedEftFit) -> tuple[Any, ...]:
-    return (
-        str(parsed.ship_name or ""),
-        tuple(
-            (
-                str(spec.module_name or ""),
-                str(spec.charge_name or ""),
-                bool(spec.offline),
-            )
-            for spec in parsed.module_specs
-        ),
-    )
-
-
-def _pyfa_fit_template_cache_key(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-) -> tuple[Any, ...]:
-    return (
-        _parsed_fit_template_signature(parsed),
-        _module_state_signature(state_by_module_id),
-    )
-
-
 def _repair_pyfa_fit_owner_refs(fit: Any) -> Any:
     ship = getattr(fit, "ship", None)
     if ship is not None:
@@ -1581,40 +1560,39 @@ def _copy_fitted_modules_from_template(
 ) -> list[tuple[ParsedModuleSpec, Any, str | None]]:
     fit_modules = list(cast(list[Any], fit.modules))
     if len(parsed.module_specs) != len(fit_modules) or len(parsed.module_specs) != len(charge_names):
-        raise ValueError("pyfa Fit模板与模块规格不匹配")
+        raise ValueError("pyfa fit template/module mismatch")
     return [
         (spec, fitted_module, charge_name)
         for spec, fitted_module, charge_name in zip(parsed.module_specs, fit_modules, charge_names, strict=True)
     ]
 
 
-def _copy_pyfa_fit_from_template(
-    factory: RuntimeFromEftFactory,
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None = None,
-) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
-    template_key = _pyfa_fit_template_cache_key(parsed, state_by_module_id)
-    cached = _PYFA_FIT_TEMPLATE_CACHE.get(template_key)
-    if cached is None:
-        template_fit, fitted_modules = factory._build_pyfa_fit(
-            parsed,
-            state_by_module_id=state_by_module_id,
-            calculate_modified_attributes=False,
-        )
-        charge_names = tuple(charge_name for _spec, _fitted_module, charge_name in fitted_modules)
-        cached = (template_fit, charge_names)
-        _PYFA_FIT_TEMPLATE_CACHE[template_key] = cached
+def _parsed_neutral_fit_template_signature(parsed: ParsedEftFit) -> tuple[Any, ...]:
+    return (
+        str(parsed.ship_name or ""),
+        tuple(
+            (
+                str(spec.module_name or ""),
+                str(spec.charge_name or ""),
+            )
+            for spec in parsed.module_specs
+        ),
+    )
 
-    template_fit, charge_names = cached
-    fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(template_fit))
-    return fit_copy, _copy_fitted_modules_from_template(parsed, fit_copy, charge_names)
+
+def _neutral_online_state_map(parsed: ParsedEftFit) -> dict[str, str]:
+    return {
+        f"mod-{idx}": "ONLINE"
+        for idx, _spec in enumerate(parsed.module_specs, start=1)
+    }
 
 
 def _pyfa_local_base_fit_cache_key(
     parsed: ParsedEftFit,
     state_by_module_id: dict[str, str] | None,
 ) -> tuple[Any, ...]:
-    return _pyfa_fit_template_cache_key(parsed, state_by_module_id)
+    del state_by_module_id
+    return _parsed_neutral_fit_template_signature(parsed)
 
 
 def _store_precalculated_local_base_fit(
@@ -1639,35 +1617,23 @@ def _ensure_precalculated_local_base_fit(
     parsed: ParsedEftFit,
     state_by_module_id: dict[str, str] | None,
 ) -> tuple[Any, tuple[str | None, ...]]:
-    cached = _get_precalculated_local_base_fit(parsed, state_by_module_id)
+    del state_by_module_id
+    cached = _get_precalculated_local_base_fit(parsed, None)
     if cached is not None:
         return cached
 
-    derived = _derive_precalculated_local_base_fit(factory, parsed, state_by_module_id)
-    if derived is None:
-        base_fit, fitted_modules = factory._build_pyfa_fit(
-            parsed,
-            state_by_module_id=state_by_module_id,
-            calculate_modified_attributes=True,
-        )
-    else:
-        base_fit, fitted_modules = derived
-    _store_precalculated_local_base_fit(parsed, state_by_module_id, base_fit, fitted_modules)
-    cached = _get_precalculated_local_base_fit(parsed, state_by_module_id)
+    base_fit, fitted_modules = factory._build_pyfa_fit(
+        parsed,
+        state_by_module_id=_neutral_online_state_map(parsed),
+        calculate_modified_attributes=True,
+        default_online=True,
+        ignore_offline_specs=True,
+    )
+    _store_precalculated_local_base_fit(parsed, None, base_fit, fitted_modules)
+    cached = _get_precalculated_local_base_fit(parsed, None)
     if cached is None:
-        raise ValueError("pyfa本地基础Fit缓存构建失败")
+        raise ValueError("pyfa鏈湴鍩虹Fit缂撳瓨鏋勫缓澶辫触")
     return cached
-
-
-def _iter_precalculated_local_base_fit_candidates(
-    parsed: ParsedEftFit,
-) -> list[tuple[tuple[Any, ...], tuple[Any, tuple[str | None, ...]]]]:
-    parsed_signature = _parsed_fit_template_signature(parsed)
-    return [
-        (cache_key, cache_value)
-        for cache_key, cache_value in _PYFA_PRECALCULATED_LOCAL_BASE_FIT_CACHE.items()
-        if cache_key and cache_key[0] == parsed_signature
-    ]
 
 
 def _pyfa_module_state_from_runtime_state(
@@ -1713,209 +1679,13 @@ def _apply_pyfa_local_state_map(
         fitted_module.state = _pyfa_module_state_from_runtime_state(factory, fitted_module, state_map[module_id])
 
 
-def _local_state_signature_distance(
-    left_signature: tuple[tuple[str, str], ...],
-    right_signature: tuple[tuple[str, str], ...],
-) -> int:
-    left_map = dict(left_signature)
-    right_map = dict(right_signature)
-    module_ids = set(left_map) | set(right_map)
-    return sum(1 for module_id in module_ids if left_map.get(module_id) != right_map.get(module_id))
-
-
-def _derive_precalculated_local_base_fit(
+def _copy_precalculated_neutral_base_fit(
     factory: RuntimeFromEftFactory,
     parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]] | None:
-    candidates = _iter_precalculated_local_base_fit_candidates(parsed)
-    if not candidates:
-        return None
-
-    desired_signature = _module_state_signature(state_by_module_id)
-    candidate_key, (candidate_fit, candidate_charge_names) = min(
-        candidates,
-        key=lambda item: _local_state_signature_distance(item[0][1], desired_signature),
-    )
-    _candidate_signature = candidate_key[1]
-
-    fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(candidate_fit))
-    fitted_modules = _copy_fitted_modules_from_template(parsed, fit_copy, candidate_charge_names)
-    _apply_pyfa_local_state_map(factory, fitted_modules, state_by_module_id)
-    fit_copy.calculated = False
-    fit_copy.calculateModifiedAttributes()
-    return fit_copy, fitted_modules
-
-
-def _copy_precalculated_local_base_fit(
-    factory: RuntimeFromEftFactory,
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
 ) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
-    cached = _ensure_precalculated_local_base_fit(factory, parsed, state_by_module_id)
-    base_fit, charge_names = cached
+    base_fit, charge_names = _ensure_precalculated_local_base_fit(factory, parsed, None)
     fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(base_fit))
     return fit_copy, _copy_fitted_modules_from_template(parsed, fit_copy, charge_names)
-
-
-def _pyfa_command_base_fit_cache_key(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-) -> tuple[Any, ...]:
-    return (
-        _pyfa_fit_template_cache_key(parsed, state_by_module_id),
-        tuple(sorted(_command_snapshot_signature(snapshot) for snapshot in command_snapshots)),
-    )
-
-
-def _store_precalculated_command_base_fit(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-    fit: Any,
-    fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]],
-) -> None:
-    if not command_snapshots:
-        return
-    charge_names = tuple(charge_name for _spec, _fitted_module, charge_name in fitted_modules)
-    fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(fit))
-    fit_copy.ID = 1
-    _PYFA_PRECALCULATED_COMMAND_BASE_FIT_CACHE[_pyfa_command_base_fit_cache_key(parsed, state_by_module_id, command_snapshots)] = (
-        fit_copy,
-        charge_names,
-    )
-
-
-def _get_precalculated_command_base_fit(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-) -> tuple[Any, tuple[str | None, ...]] | None:
-    if not command_snapshots:
-        return _get_precalculated_local_base_fit(parsed, state_by_module_id)
-    return _PYFA_PRECALCULATED_COMMAND_BASE_FIT_CACHE.get(
-        _pyfa_command_base_fit_cache_key(parsed, state_by_module_id, command_snapshots)
-    )
-
-
-def _ensure_precalculated_command_base_fit(
-    factory: RuntimeFromEftFactory,
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-    fallback_runtime: FitRuntime,
-) -> tuple[Any, tuple[str | None, ...]]:
-    cached = _get_precalculated_command_base_fit(parsed, state_by_module_id, command_snapshots)
-    if cached is not None:
-        return cached
-
-    base_fit, fitted_modules = _copy_precalculated_local_base_fit(factory, parsed, state_by_module_id)
-    base_fit.ID = 1
-    _apply_command_snapshot_bonuses(factory, base_fit, command_snapshots, 2, fallback_runtime)
-    _store_precalculated_command_base_fit(parsed, state_by_module_id, command_snapshots, base_fit, fitted_modules)
-
-    cached = _get_precalculated_command_base_fit(parsed, state_by_module_id, command_snapshots)
-    if cached is None:
-        raise ValueError("pyfa指挥基础Fit缓存构建失败")
-    return cached
-
-
-def _copy_precalculated_command_base_fit(
-    factory: RuntimeFromEftFactory,
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-    fallback_runtime: FitRuntime,
-) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
-    cached = _ensure_precalculated_command_base_fit(factory, parsed, state_by_module_id, command_snapshots, fallback_runtime)
-    base_fit, charge_names = cached
-    fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(base_fit))
-    fit_copy.ID = 1
-    return fit_copy, _copy_fitted_modules_from_template(parsed, fit_copy, charge_names)
-
-
-def _projected_snapshot_multiset_signature(
-    projected_snapshots: list[dict[str, Any]],
-) -> tuple[Any, ...]:
-    counts = Counter(_projected_snapshot_signature(snapshot) for snapshot in projected_snapshots)
-    return tuple(sorted((signature, int(count)) for signature, count in counts.items()))
-
-
-def _store_precalculated_projected_target_fit(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-    projected_snapshots: list[dict[str, Any]],
-    fit: Any,
-) -> None:
-    if not projected_snapshots:
-        return
-
-    base_key = _pyfa_command_base_fit_cache_key(parsed, state_by_module_id, command_snapshots)
-    projected_key = _projected_snapshot_multiset_signature(projected_snapshots)
-    fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(fit))
-    fit_copy.ID = 1
-    _PYFA_PRECALCULATED_PROJECTED_TARGET_FIT_CACHE.setdefault(base_key, {})[projected_key] = fit_copy
-
-
-def _copy_best_precalculated_projected_target_fit(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str] | None,
-    command_snapshots: list[dict[str, Any]],
-    projected_snapshots: list[dict[str, Any]],
-) -> tuple[Any | None, list[dict[str, Any]], str]:
-    if not projected_snapshots:
-        return None, [], "not_applicable"
-
-    base_key = _pyfa_command_base_fit_cache_key(parsed, state_by_module_id, command_snapshots)
-    cached_fits = _PYFA_PRECALCULATED_PROJECTED_TARGET_FIT_CACHE.get(base_key)
-    if not cached_fits:
-        return None, list(projected_snapshots), "miss"
-
-    projected_key = _projected_snapshot_multiset_signature(projected_snapshots)
-    exact_fit = cached_fits.get(projected_key)
-    if exact_fit is not None:
-        fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(exact_fit))
-        fit_copy.ID = 1
-        return fit_copy, [], "exact"
-
-    target_counts = Counter(_projected_snapshot_signature(snapshot) for snapshot in projected_snapshots)
-    best_key: tuple[Any, ...] | None = None
-    best_total = 0
-    for cached_key in cached_fits:
-        total_count = 0
-        for signature, count in cached_key:
-            if int(target_counts.get(signature, 0)) < int(count):
-                break
-            total_count += int(count)
-        else:
-            if total_count > best_total:
-                best_key = cached_key
-                best_total = total_count
-
-    if best_key is None or best_total <= 0:
-        return None, list(projected_snapshots), "miss"
-
-    fit_copy = _repair_pyfa_fit_owner_refs(deepcopy(cached_fits[best_key]))
-    fit_copy.ID = 1
-    cached_counts = {signature: int(count) for signature, count in best_key}
-    consumed_counts: Counter[Any] = Counter()
-    remaining_snapshots: list[dict[str, Any]] = []
-    for snapshot in projected_snapshots:
-        signature = _projected_snapshot_signature(snapshot)
-        if int(consumed_counts[signature]) < int(cached_counts.get(signature, 0)):
-            consumed_counts[signature] += 1
-            continue
-        remaining_snapshots.append(snapshot)
-    return fit_copy, remaining_snapshots, "subset"
-
-
-def _next_precalculated_projected_source_fit_id() -> int:
-    global _PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_NEXT_ID
-    next_id = int(_PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_NEXT_ID)
-    _PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_NEXT_ID += 1
-    return next_id
 
 
 def _module_group_name(module: ModuleRuntime) -> str:
@@ -1927,169 +1697,14 @@ def _module_group_has_equal(module: ModuleRuntime, tokens: tuple[str, ...]) -> b
     return any(group_name == token for token in tokens)
 
 
-def _module_group_has_any(module: ModuleRuntime, tokens: tuple[str, ...]) -> bool:
-    group_name = _module_group_name(module)
-    return any(token in group_name for token in tokens)
-
-
 def _module_requires_control_state(module: ModuleRuntime) -> bool:
     return module.can_be_active()
-
-
-def _module_has_projected(module: ModuleRuntime) -> bool:
-    return any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects)
-
-
-def _module_has_projected_damage(module: ModuleRuntime) -> bool:
-    for effect in module.effects:
-        if effect.effect_class != EffectClass.PROJECTED:
-            continue
-        for key in ("damage_em", "damage_thermal", "damage_kinetic", "damage_explosive"):
-            if float(effect.projected_add.get(key, 0.0) or 0.0) > 0.0:
-                return True
-    return False
-
-
-def _module_has_projected_rep(module: ModuleRuntime) -> bool:
-    for effect in module.effects:
-        if effect.effect_class != EffectClass.PROJECTED:
-            continue
-        if float(effect.projected_add.get("shield_rep", 0.0) or 0.0) > 0.0:
-            return True
-        if float(effect.projected_add.get("armor_rep", 0.0) or 0.0) > 0.0:
-            return True
-    return False
-
-
-def _module_is_weapon_module(module: ModuleRuntime) -> bool:
-    if not _module_has_projected(module):
-        return False
-    if not _module_has_projected_damage(module):
-        return False
-    group_name = _module_group_name(module)
-    looks_like_weapon_group = ("weapon" in group_name) or ("missile launcher" in group_name)
-    has_ammo_like = int(getattr(module, "charge_capacity", 0) or 0) > 0 and float(getattr(module, "charge_rate", 0.0) or 0.0) > 0.0
-    return looks_like_weapon_group or has_ammo_like
-
-
-def _module_is_cap_warfare_module(module: ModuleRuntime) -> bool:
-    return _module_group_has_any(module, ("energy neutral", "nosferatu"))
-
-
-def _module_is_ecm_module(module: ModuleRuntime) -> bool:
-    return _module_group_has_any(module, ("ecm",))
 
 
 def _module_is_command_burst_module(module: ModuleRuntime) -> bool:
     return _module_group_has_equal(module, ("command burst",))
 
 
-def _module_is_smart_bomb_module(module: ModuleRuntime) -> bool:
-    return _module_group_has_equal(module, ("smart bomb", "structure area denial module"))
-
-
-def _module_is_burst_jammer_module(module: ModuleRuntime) -> bool:
-    return _module_group_has_equal(module, ("burst jammer",))
-
-
-def _module_is_area_effect_module(module: ModuleRuntime) -> bool:
-    return (
-        _module_is_command_burst_module(module)
-        or _module_is_smart_bomb_module(module)
-        or _module_is_burst_jammer_module(module)
-    )
-
-
-def _module_uses_pyfa_projected_profile_runtime(module: ModuleRuntime) -> bool:
-    if not _module_has_projected(module):
-        return False
-    if _module_is_command_burst_module(module):
-        return False
-    if _module_is_smart_bomb_module(module):
-        return False
-    if _module_is_burst_jammer_module(module):
-        return False
-    if _module_is_ecm_module(module):
-        return False
-    if _module_is_weapon_module(module):
-        return False
-    if _module_has_projected_rep(module):
-        return False
-    if _module_is_cap_warfare_module(module):
-        return False
-    return True
-
-
-def _projected_source_state_maps(runtime: FitRuntime) -> list[dict[str, str]]:
-    base_state_by_module_id: dict[str, str] = {}
-    active_projected_modules: list[tuple[str, str]] = []
-
-    for module in runtime.modules:
-        state_value = str(module.state.value or "ONLINE").upper()
-        projected_state = state_value
-        uses_projected_profile = _module_uses_pyfa_projected_profile_runtime(module)
-
-        if state_value in {"ACTIVE", "OVERHEATED"}:
-            if _module_is_command_burst_module(module):
-                projected_state = state_value
-            elif uses_projected_profile:
-                projected_state = "ONLINE"
-                active_projected_modules.append((module.module_id, state_value))
-            elif (
-                _module_is_area_effect_module(module)
-                or _module_is_weapon_module(module)
-                or _module_has_projected_rep(module)
-                or _module_is_cap_warfare_module(module)
-            ):
-                projected_state = "ONLINE"
-        elif state_value != "OFFLINE" and uses_projected_profile:
-            active_projected_modules.append((module.module_id, "ACTIVE"))
-
-        base_state_by_module_id[module.module_id] = projected_state
-
-    signatures_seen: set[tuple[tuple[str, str], ...]] = set()
-    state_maps: list[dict[str, str]] = []
-    for module_id, active_state in active_projected_modules:
-        state_map = dict(base_state_by_module_id)
-        state_map[module_id] = active_state
-        signature = _module_state_signature(state_map)
-        if signature in signatures_seen:
-            continue
-        signatures_seen.add(signature)
-        state_maps.append(state_map)
-    return state_maps
-
-
-def _store_precalculated_projected_source_fit(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str],
-    fit: Any,
-) -> None:
-    fit.ID = _next_precalculated_projected_source_fit_id()
-    _PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_CACHE[_pyfa_fit_template_cache_key(parsed, state_by_module_id)] = fit
-
-
-def _get_precalculated_projected_source_fit(
-    parsed: ParsedEftFit,
-    state_by_module_id: dict[str, str],
-) -> Any | None:
-    return _PYFA_PRECALCULATED_PROJECTED_SOURCE_FIT_CACHE.get(_pyfa_fit_template_cache_key(parsed, state_by_module_id))
-
-
-def _warm_runtime_precalculated_projected_source_fits(
-    factory: RuntimeFromEftFactory,
-    parsed: ParsedEftFit,
-    runtime: FitRuntime,
-) -> None:
-    for projected_state_map in _projected_source_state_maps(runtime):
-        if _get_precalculated_projected_source_fit(parsed, projected_state_map) is not None:
-            continue
-        projected_fit, _ = factory._build_pyfa_fit(
-            parsed,
-            state_by_module_id=projected_state_map,
-            calculate_modified_attributes=True,
-        )
-        _store_precalculated_projected_source_fit(parsed, projected_state_map, projected_fit)
 
 
 def _warm_runtime_precalculated_local_base_fit(
@@ -2097,45 +1712,53 @@ def _warm_runtime_precalculated_local_base_fit(
     parsed: ParsedEftFit,
     runtime: FitRuntime,
 ) -> None:
-    local_state_by_module_id = _runtime_local_profile_state_map(runtime)
-    if _get_precalculated_local_base_fit(parsed, local_state_by_module_id) is not None:
+    del runtime
+    if _get_precalculated_local_base_fit(parsed, None) is not None:
         return
     base_fit, fitted_modules = factory._build_pyfa_fit(
         parsed,
-        state_by_module_id=local_state_by_module_id,
+        state_by_module_id=_neutral_online_state_map(parsed),
         calculate_modified_attributes=True,
+        default_online=True,
+        ignore_offline_specs=True,
     )
-    _store_precalculated_local_base_fit(parsed, local_state_by_module_id, base_fit, fitted_modules)
+    _store_precalculated_local_base_fit(parsed, None, base_fit, fitted_modules)
 
 
-def _get_pyfa_calc_type():
-    fit_mod = importlib.import_module("eos.saveddata.fit")
-    return getattr(fit_mod, "CalcType")
+def prewarm_runtime_base_cache(runtime: FitRuntime | None) -> bool:
+    if runtime is None:
+        return False
+    parsed = _parsed_fit_from_runtime_blueprint(runtime)
+    if parsed is None:
+        return False
+    try:
+        _ensure_precalculated_local_base_fit(RuntimeFromEftFactory(), parsed, None)
+    except Exception:
+        return False
+    return True
 
 
-def _precalculated_projected_source_fit_from_snapshot(
-    snapshot: dict[str, Any],
-    fallback_runtime: FitRuntime,
-) -> Any | None:
-    if _snapshot_command_booster_snapshots(snapshot):
-        return None
-    snapshot_blueprint = snapshot.get("blueprint") if isinstance(snapshot.get("blueprint"), dict) else None
-    if snapshot_blueprint is None:
-        return None
-
-    snapshot_runtime = FitRuntime(
-        fit_key=str(snapshot.get("fit_key", "") or "projected-cached-source"),
-        hull=fallback_runtime.hull,
-        skills=fallback_runtime.skills,
-    )
-    snapshot_runtime.diagnostics["pyfa_blueprint"] = snapshot_blueprint
-    snapshot_parsed = _parsed_fit_from_runtime_blueprint(snapshot_runtime)
-    if snapshot_parsed is None:
-        return None
-    state_by_module_id = _snapshot_state_by_module_id(snapshot)
-    if not _snapshot_has_active_modules(state_by_module_id):
-        return None
-    return _get_precalculated_projected_source_fit(snapshot_parsed, state_by_module_id)
+def prewarm_world_base_cache(world: WorldState) -> int:
+    warmed = 0
+    seen_keys: set[tuple[Any, ...]] = set()
+    factory = RuntimeFromEftFactory()
+    for ship in world.ships.values():
+        runtime = getattr(ship, "runtime", None)
+        if runtime is None:
+            continue
+        parsed = _parsed_fit_from_runtime_blueprint(runtime)
+        if parsed is None:
+            continue
+        cache_key = _pyfa_local_base_fit_cache_key(parsed, None)
+        if cache_key in seen_keys:
+            continue
+        seen_keys.add(cache_key)
+        try:
+            _ensure_precalculated_local_base_fit(factory, parsed, None)
+        except Exception:
+            continue
+        warmed += 1
+    return warmed
 
 
 def _runtime_module_state_map(runtime: FitRuntime) -> dict[str, str]:
@@ -2229,6 +1852,29 @@ def _normalized_command_booster_snapshots(
     return [snap for snap in snapshots if isinstance(snap, dict)]
 
 
+def _quantize_pyfa_projection_range(distance: float) -> float:
+    safe_distance = max(0.0, float(distance or 0.0))
+    if _PYFA_PROJECTION_RANGE_BUCKET_M <= 0.0:
+        return safe_distance
+    return math.floor(safe_distance / _PYFA_PROJECTION_RANGE_BUCKET_M) * _PYFA_PROJECTION_RANGE_BUCKET_M
+
+
+def _normalized_snapshot_projection_signature(snapshot: dict[str, Any]) -> tuple[str, Any]:
+    projection_key_mode = str(snapshot.get("pyfa_projection_key_mode", "in_range") or "in_range")
+    if projection_key_mode == "exact_range":
+        try:
+            distance_signature: Any = round(
+                _quantize_pyfa_projection_range(
+                    float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0)
+                ),
+                3,
+            )
+        except Exception:
+            distance_signature = 0.0
+        return "exact_range", distance_signature
+    return "in_range", None
+
+
 def _projected_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     blueprint_raw = snapshot.get("blueprint")
     blueprint: dict[str, Any] = blueprint_raw if isinstance(blueprint_raw, dict) else {}
@@ -2236,31 +1882,12 @@ def _projected_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
     command_raw = snapshot.get("command_booster_snapshots")
     command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
-    formula_raw = snapshot.get("formula_effects")
-    formula_effects = [raw for raw in formula_raw if isinstance(raw, dict)] if isinstance(formula_raw, list) else []
-    distance_mode = str(snapshot.get("distance_mode", "pyfa_range") or "pyfa_range")
-    if distance_mode == "formula" and formula_effects:
-        distance_signature: Any = tuple(round(float(raw.get("strength", 1.0) or 1.0), 6) for raw in formula_effects)
-    elif distance_mode == "pyfa_range":
-        try:
-            distance_signature = round(float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0), 3)
-        except Exception:
-            distance_signature = 0.0
-    else:
-        distance_signature = None
+    projection_key_mode, distance_signature = _normalized_snapshot_projection_signature(snapshot)
     return (
         _runtime_blueprint_signature(blueprint),
         _module_state_signature({str(module_id): str(state) for module_id, state in state_by_module_id.items()}),
         tuple(sorted(_command_snapshot_signature(command_snapshot) for command_snapshot in command_snapshots)),
-        distance_mode,
-        tuple(
-            (
-                str(raw.get("name", "") or ""),
-                tuple(sorted((str(key), round(float(value or 0.0), 6)) for key, value in ((raw.get("projected_mult") if isinstance(raw.get("projected_mult"), dict) else {}) or {}).items())),
-                tuple(sorted((str(key), round(float(value or 0.0), 6)) for key, value in ((raw.get("projected_add") if isinstance(raw.get("projected_add"), dict) else {}) or {}).items())),
-            )
-            for raw in formula_effects
-        ),
+        projection_key_mode,
         distance_signature,
     )
 
@@ -2293,7 +1920,7 @@ def get_runtime_resolve_cache_key(
     projected_snapshots = _normalized_projected_source_snapshots(runtime, projected_source_snapshots)
     return (
         blueprint_signature,
-        _runtime_local_profile_state_signature(runtime),
+        _module_state_signature(_runtime_module_state_map(runtime)),
         tuple(sorted(_command_snapshot_signature(snapshot) for snapshot in snapshots)),
         tuple(sorted(_projected_snapshot_signature(snapshot) for snapshot in projected_snapshots)),
     )
@@ -2353,8 +1980,11 @@ def _snapshot_command_booster_snapshots(snapshot: dict[str, Any]) -> list[dict[s
 
 
 def _snapshot_projection_range(snapshot: dict[str, Any]) -> float:
+    projection_key_mode, normalized_distance = _normalized_snapshot_projection_signature(snapshot)
+    if projection_key_mode != "exact_range":
+        return 0.0
     try:
-        return float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0)
+        return float(normalized_distance or 0.0)
     except Exception:
         return 0.0
 
@@ -2384,11 +2014,9 @@ def _build_transient_fit_from_snapshot(
     if not _snapshot_has_active_modules(state_by_module_id):
         return None, next_fit_id
 
-    snapshot_fit, _ = _copy_pyfa_fit_from_template(
-        factory,
-        snapshot_parsed,
-        state_by_module_id=state_by_module_id,
-    )
+    snapshot_fit, fitted_modules = _copy_precalculated_neutral_base_fit(factory, snapshot_parsed)
+    _apply_pyfa_local_state_map(factory, fitted_modules, state_by_module_id)
+    snapshot_fit.calculated = False
     snapshot_fit.ID = next_fit_id
     return snapshot_fit, next_fit_id + 1
 
@@ -2414,59 +2042,14 @@ def _attach_command_snapshot_fits(
     return next_fit_id
 
 
-def _apply_command_snapshot_bonuses(
+def _attach_projected_snapshot_fits(
     factory: RuntimeFromEftFactory,
     target_fit: Any,
     snapshots: list[dict[str, Any]],
     next_fit_id: int,
     fallback_runtime: FitRuntime,
 ) -> int:
-    calc_type = _get_pyfa_calc_type()
-    applied_bonus = False
-
     for snapshot in snapshots:
-        booster_fit, next_fit_id = _build_transient_fit_from_snapshot(
-            factory=factory,
-            snapshot=snapshot,
-            next_fit_id=next_fit_id,
-            fallback_runtime=fallback_runtime,
-            fit_prefix="command",
-        )
-        if booster_fit is None:
-            continue
-        booster_fit.calculateModifiedAttributes(target_fit, calc_type.COMMAND)
-        applied_bonus = True
-
-    if applied_bonus:
-        run_command_boosts = getattr(target_fit, "_Fit__runCommandBoosts", None)
-        if callable(run_command_boosts):
-            for run_time in ("early", "normal", "late"):
-                run_command_boosts(run_time)
-
-    return next_fit_id
-
-
-def _apply_projected_snapshot_effects(
-    factory: RuntimeFromEftFactory,
-    target_fit: Any,
-    snapshots: list[dict[str, Any]],
-    next_fit_id: int,
-    fallback_runtime: FitRuntime,
-) -> int:
-    calc_type = _get_pyfa_calc_type()
-
-    for snapshot in snapshots:
-        projection_range = _snapshot_projection_range(snapshot)
-        reusable_source_fit = _precalculated_projected_source_fit_from_snapshot(snapshot, fallback_runtime)
-        if reusable_source_fit is not None:
-            try:
-                _attach_projected_fit(target_fit, reusable_source_fit, projection_range=projection_range)
-                reusable_source_fit.calculateModifiedAttributes(target_fit, type=calc_type.PROJECTED)
-            finally:
-                reusable_source_fit.projectedOnto.pop(target_fit.ID, None)
-                target_fit.victimOf.pop(reusable_source_fit.ID, None)
-            continue
-
         source_fit, next_fit_id = _build_transient_fit_from_snapshot(
             factory=factory,
             snapshot=snapshot,
@@ -2479,14 +2062,7 @@ def _apply_projected_snapshot_effects(
 
         source_command_snapshots = _snapshot_command_booster_snapshots(snapshot)
         next_fit_id = _attach_command_snapshot_fits(factory, source_fit, source_command_snapshots, next_fit_id, fallback_runtime)
-
-        try:
-            _attach_projected_fit(target_fit, source_fit, projection_range=projection_range)
-            source_fit.calculateModifiedAttributes(target_fit, type=calc_type.PROJECTED)
-        finally:
-            source_fit.projectedOnto.pop(target_fit.ID, None)
-            target_fit.victimOf.pop(source_fit.ID, None)
-
+        _attach_projected_fit(target_fit, source_fit, projection_range=_snapshot_projection_range(snapshot))
     return next_fit_id
 
 
@@ -2518,45 +2094,23 @@ def resolve_runtime_from_pyfa_runtime(
         resolved_runtime.diagnostics["pyfa_projected_sources"] = deepcopy(projected_snapshots)
         resolved_runtime.diagnostics["pyfa_runtime_resolve_cache"] = "hit"
         resolved_runtime.diagnostics["pyfa_projected_target_fit_cache"] = "resolved_hit"
+        resolved_runtime.diagnostics["pyfa_resolve_signature"] = cache_key
         _copy_dynamic_runtime_state(runtime, resolved_runtime)
         return resolved_runtime, replace(cached[1])
 
-    projected_target_fit_cache = "not_applicable"
+    projected_target_fit_cache = "single_pass"
     try:
         factory = RuntimeFromEftFactory()
-        local_state_by_module_id = _runtime_local_profile_state_map(runtime)
-        if not snapshots and not projected_snapshots:
-            target_fit, charge_names = _ensure_precalculated_local_base_fit(
-                factory,
-                parsed,
-                state_by_module_id=local_state_by_module_id,
-            )
-            target_fitted_modules = _copy_fitted_modules_from_template(parsed, target_fit, charge_names)
-        else:
-            target_fit, target_fitted_modules = _copy_precalculated_command_base_fit(
-                factory,
-                parsed,
-                state_by_module_id=local_state_by_module_id,
-                command_snapshots=snapshots,
-                fallback_runtime=runtime,
-            )
-            target_fit.ID = 1
-            charge_names = tuple(charge_name for _spec, _fitted_module, charge_name in target_fitted_modules)
+        target_fit, target_fitted_modules = _copy_precalculated_neutral_base_fit(factory, parsed)
+        target_fit.ID = 1
+        _apply_pyfa_local_state_map(factory, target_fitted_modules, state_by_module_id)
 
-            delta_projected_snapshots = projected_snapshots
-            if projected_snapshots:
-                cached_projected_target_fit, delta_projected_snapshots, projected_target_fit_cache = _copy_best_precalculated_projected_target_fit(
-                    parsed,
-                    local_state_by_module_id,
-                    snapshots,
-                    projected_snapshots,
-                )
-                if cached_projected_target_fit is not None:
-                    target_fit = cached_projected_target_fit
-                    target_fitted_modules = _copy_fitted_modules_from_template(parsed, target_fit, charge_names)
+        next_fit_id = 2
+        next_fit_id = _attach_command_snapshot_fits(factory, target_fit, snapshots, next_fit_id, runtime)
+        next_fit_id = _attach_projected_snapshot_fits(factory, target_fit, projected_snapshots, next_fit_id, runtime)
+        target_fit.calculated = False
+        target_fit.calculateModifiedAttributes()
 
-            next_fit_id = 2
-            next_fit_id = _apply_projected_snapshot_effects(factory, target_fit, delta_projected_snapshots, next_fit_id, runtime)
         resolved_runtime, _fit, profile = factory._build_runtime_artifacts_from_pyfa_fit(
             parsed,
             target_fit,
@@ -2564,17 +2118,10 @@ def resolve_runtime_from_pyfa_runtime(
             state_by_module_id=state_by_module_id,
             command_booster_snapshots=snapshots,
         )
-        if projected_snapshots:
-            _store_precalculated_projected_target_fit(
-                parsed,
-                local_state_by_module_id,
-                snapshots,
-                projected_snapshots,
-                target_fit,
-            )
         resolved_runtime.diagnostics["pyfa_projected_sources"] = deepcopy(projected_snapshots)
         resolved_runtime.diagnostics["pyfa_runtime_resolve_cache"] = "miss"
         resolved_runtime.diagnostics["pyfa_projected_target_fit_cache"] = projected_target_fit_cache
+        resolved_runtime.diagnostics["pyfa_resolve_signature"] = cache_key
         _copy_dynamic_runtime_state(runtime, resolved_runtime)
     except Exception:
         return None
@@ -2592,7 +2139,6 @@ def recompute_profile_from_pyfa_runtime(
     if resolved is None:
         return None
     profile = resolved[1]
-    _PYFA_RUNTIME_PROFILE_CACHE[(runtime.fit_key, tuple(sorted(_runtime_module_state_map(runtime).items())))] = replace(profile)
     return replace(profile)
 
 
@@ -2818,3 +2364,4 @@ def build_world_from_manual_setup(ship_setups: list[ManualShipSetup]) -> WorldSt
             world.squad_leaders[squad_key] = first_ship_id
 
     return world
+

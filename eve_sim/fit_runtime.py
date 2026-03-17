@@ -47,6 +47,7 @@ class HullProfile:
     structure_hp: float
     rep_amount: float
     rep_cycle: float
+    energy_warfare_resistance: float = 1.0
     mass: float = 0.0
     agility: float = 0.0
 
@@ -191,6 +192,7 @@ class RuntimeStatEngine:
             structure_hp=max(1.0, hull.structure_hp),
             rep_amount=max(0.0, (hull.rep_amount + add["rep"]) * self._stacking_multiplier(mul["rep"])),
             rep_cycle=max(0.1, hull.rep_cycle),
+            energy_warfare_resistance=max(0.0, float(getattr(hull, "energy_warfare_resistance", 1.0) or 1.0)),
             mass=max(0.0, (hull.mass + add["mass"]) * self._stacking_multiplier(mul["mass"])),
             agility=max(0.0, (hull.agility + add["agility"]) * self._stacking_multiplier(mul["agility"])),
         )
@@ -278,6 +280,7 @@ class RuntimeStatEngine:
             structure_hp=max(1.0, (target.structure_hp + add["structure_hp"]) * self._stacking_multiplier(mul["structure_hp"])),
             rep_amount=max(0.0, (target.rep_amount + add["rep"]) * self._stacking_multiplier(mul["rep"])),
             rep_cycle=target.rep_cycle,
+            energy_warfare_resistance=max(0.0, float(getattr(target, "energy_warfare_resistance", 1.0) or 1.0)),
             mass=max(0.0, (target.mass + add["mass"]) * self._stacking_multiplier(mul["mass"])),
             agility=max(0.0, (target.agility + add["agility"]) * self._stacking_multiplier(mul["agility"])),
             sensor_strength_gravimetric=max(
@@ -336,6 +339,7 @@ class RuntimeStatEngine:
             hull.structure_hp,
             hull.rep_amount,
             hull.rep_cycle,
+            hull.energy_warfare_resistance,
             hull.mass,
             hull.agility,
         )

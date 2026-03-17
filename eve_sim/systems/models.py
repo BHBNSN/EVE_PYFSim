@@ -118,6 +118,7 @@ class ModuleDecisionRule:
 @dataclass(slots=True)
 class CycleTargetSnapshot:
     distance: float
+    active_effect_indices: set[int] = field(default_factory=set)
     effect_strengths: dict[int, float] = field(default_factory=dict)
     effect_damage_factors: dict[int, float] = field(default_factory=dict)
 

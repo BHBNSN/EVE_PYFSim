@@ -81,6 +81,7 @@ class PyfaBridge:
             sensor_strength_ladar=fit.sensor_strength_ladar,
             sensor_strength_magnetometric=fit.sensor_strength_magnetometric,
             sensor_strength_radar=fit.sensor_strength_radar,
+            energy_warfare_resistance=max(0.0, float(getattr(fit, "energy_warfare_resistance", 1.0) or 1.0)),
             mass=max(0.0, float(getattr(fit, "mass", 0.0) or 0.0)),
             agility=max(0.0, float(getattr(fit, "agility", 0.0) or 0.0)),
         )

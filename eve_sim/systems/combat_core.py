@@ -58,43 +58,7 @@ _PROFILE_PASSTHROUGH_ATTRS = (
     "missile_damage_reduction_factor",
 )
 
-_FORMULA_PROJECTED_KEYS = frozenset(
-    {
-        "speed",
-        "sig",
-        "tracking",
-        "optimal",
-        "falloff",
-        "scan",
-        "range",
-        "rep",
-        "shield_hp",
-        "armor_hp",
-        "structure_hp",
-        "sensor_strength_gravimetric",
-        "sensor_strength_ladar",
-        "sensor_strength_magnetometric",
-        "sensor_strength_radar",
-        "shield_resonance_em",
-        "shield_resonance_thermal",
-        "shield_resonance_kinetic",
-        "shield_resonance_explosive",
-        "armor_resonance_em",
-        "armor_resonance_thermal",
-        "armor_resonance_kinetic",
-        "armor_resonance_explosive",
-        "structure_resonance_em",
-        "structure_resonance_thermal",
-        "structure_resonance_kinetic",
-        "structure_resonance_explosive",
-        "missile_explosion_radius",
-        "missile_explosion_velocity",
-        "missile_range",
-        "dps",
-        "cap_max",
-        "cap_recharge",
-    }
-)
+_PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
 
 _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS = frozenset(
     {
@@ -629,18 +593,6 @@ class CombatSystem:
             )
         return tuple(signature)
 
-    @staticmethod
-    def _formula_effect_signature(effect_payload: dict[str, Any]) -> tuple[Any, ...]:
-        mult_raw = effect_payload.get("projected_mult")
-        add_raw = effect_payload.get("projected_add")
-        projected_mult: dict[str, Any] = mult_raw if isinstance(mult_raw, dict) else {}
-        projected_add: dict[str, Any] = add_raw if isinstance(add_raw, dict) else {}
-        return (
-            str(effect_payload.get("name", "") or ""),
-            tuple(sorted((str(key), round(float(value or 0.0), 6)) for key, value in projected_mult.items())),
-            tuple(sorted((str(key), round(float(value or 0.0), 6)) for key, value in projected_add.items())),
-        )
-
     @classmethod
     def _projected_snapshot_list_signature(cls, snapshots: list[dict[str, Any]]) -> tuple[Any, ...]:
         signature: list[tuple[Any, ...]] = []
@@ -651,25 +603,13 @@ class CombatSystem:
             state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
             command_raw = snapshot.get("command_booster_snapshots")
             command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
-            formula_raw = snapshot.get("formula_effects")
-            formula_effects = [raw for raw in formula_raw if isinstance(raw, dict)] if isinstance(formula_raw, list) else []
-            distance_mode = str(snapshot.get("distance_mode", "pyfa_range") or "pyfa_range")
-            if distance_mode == "formula" and formula_effects:
-                distance_signature: Any = tuple(round(float(raw.get("strength", 1.0) or 1.0), 6) for raw in formula_effects)
-            elif distance_mode == "pyfa_range":
-                try:
-                    distance_signature = round(float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0), 3)
-                except Exception:
-                    distance_signature = 0.0
-            else:
-                distance_signature = None
+            projection_key_mode, distance_signature = cls._normalized_snapshot_projection_signature(snapshot)
             signature.append(
                 (
                     str(snapshot.get("fit_key", "") or ""),
                     tuple((str(module_id), str(state)) for module_id, state in state_by_module_id.items()),
                     cls._command_snapshot_list_signature(command_snapshots),
-                    distance_mode,
-                    tuple(cls._formula_effect_signature(raw) for raw in formula_effects),
+                    projection_key_mode,
                     distance_signature,
                 )
             )
@@ -702,124 +642,46 @@ class CombatSystem:
         return tuple(item[:-1] for item in cls._projected_snapshot_list_signature(snapshots))
 
     @staticmethod
-    def _projected_effect_supports_formula_profile(effect) -> bool:
-        mult_keys = {str(key) for key in effect.projected_mult.keys()}
-        add_keys = {str(key) for key in effect.projected_add.keys()}
-        if not mult_keys and not add_keys:
-            return False
-        return mult_keys.issubset(_FORMULA_PROJECTED_KEYS) and add_keys.issubset(_FORMULA_PROJECTED_KEYS)
+    def _quantize_pyfa_projection_range(distance: float) -> float:
+        safe_distance = max(0.0, float(distance or 0.0))
+        if _PYFA_PROJECTION_RANGE_BUCKET_M <= 0.0:
+            return safe_distance
+        return math.floor(safe_distance / _PYFA_PROJECTION_RANGE_BUCKET_M) * _PYFA_PROJECTION_RANGE_BUCKET_M
 
-    def _projected_distance_mode(self, module) -> str:
-        projected_effects = [effect for effect in module.effects if effect.effect_class == EffectClass.PROJECTED]
-        if not projected_effects:
-            return "pyfa_range"
-        if all(max(0.0, float(getattr(effect, "falloff_m", 0.0) or 0.0)) <= 0.0 for effect in projected_effects):
-            return "constant"
-        if all(self._projected_effect_supports_formula_profile(effect) for effect in projected_effects):
-            return "formula"
-        return "pyfa_range"
-
-    def _module_formula_effect_payloads(self, module, target_snapshot: CycleTargetSnapshot) -> list[dict[str, Any]]:
-        payloads: list[dict[str, Any]] = []
-        for effect_index, effect in enumerate(module.effects):
-            if effect.effect_class != EffectClass.PROJECTED:
-                continue
-            if not self._projected_effect_supports_formula_profile(effect):
-                continue
-            strength = max(0.0, min(1.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0)))
-            if strength <= 0.0:
-                continue
-            payloads.append(
-                {
-                    "name": str(effect.name or ""),
-                    "projected_mult": dict(effect.projected_mult),
-                    "projected_add": dict(effect.projected_add),
-                    "strength": strength,
-                }
-            )
-        return payloads
-
-    def _formula_impacts_from_projected_snapshots(self, snapshots: list[dict[str, Any]]) -> list[ProjectedImpact] | None:
-        impacts: list[ProjectedImpact] = []
-        for snapshot in snapshots:
-            if not isinstance(snapshot, dict):
-                return None
-            raw_effects = snapshot.get("formula_effects")
-            if not isinstance(raw_effects, list) or not raw_effects:
-                return None
-            source_ship_id = str(snapshot.get("fit_key", "") or "")
-            for raw_effect in raw_effects:
-                if not isinstance(raw_effect, dict):
-                    return None
-                mult_raw = raw_effect.get("projected_mult")
-                add_raw = raw_effect.get("projected_add")
-                projected_mult: dict[str, Any] = mult_raw if isinstance(mult_raw, dict) else {}
-                projected_add: dict[str, Any] = add_raw if isinstance(add_raw, dict) else {}
-                strength = max(0.0, min(1.0, float(raw_effect.get("strength", 0.0) or 0.0)))
-                if strength <= 0.0:
-                    continue
-                impacts.append(
-                    ProjectedImpact(
-                        source_ship_id=source_ship_id,
-                        target_ship_id="",
-                        effect=ModuleEffect(
-                            name=str(raw_effect.get("name", "") or ""),
-                            effect_class=EffectClass.PROJECTED,
-                            state_required=ModuleState.ACTIVE,
-                            projected_mult={str(key): float(value) for key, value in projected_mult.items()},
-                            projected_add={str(key): float(value) for key, value in projected_add.items()},
-                        ),
-                        strength=strength,
-                    )
+    @classmethod
+    def _normalized_snapshot_projection_signature(cls, snapshot: dict[str, Any]) -> tuple[str, Any]:
+        projection_key_mode = str(snapshot.get("pyfa_projection_key_mode", "in_range") or "in_range")
+        if projection_key_mode == "exact_range":
+            try:
+                distance_signature: Any = round(
+                    cls._quantize_pyfa_projection_range(
+                        float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0)
+                    ),
+                    3,
                 )
-        return impacts or None
+            except Exception:
+                distance_signature = 0.0
+            return "exact_range", distance_signature
+        return "in_range", None
 
-    def _remember_projection_formula_base(
-        self,
-        runtime,
-        profile: ShipProfile,
-        local_signature: tuple[tuple[str, str], ...] | None,
-        booster_signature: tuple[Any, ...],
-        projected_snapshots: list[dict[str, Any]],
-    ) -> None:
-        if projected_snapshots:
-            return
-        runtime.diagnostics["pyfa_projection_formula_base_profile"] = profile
-        runtime.diagnostics["pyfa_projection_formula_local_signature"] = local_signature
-        runtime.diagnostics["pyfa_projection_formula_command_signature"] = booster_signature
-
-    def _recompute_profile_from_formula_base(
-        self,
-        runtime,
-        local_signature: tuple[tuple[str, str], ...] | None,
-        booster_signature: tuple[Any, ...],
-        projected_snapshots: list[dict[str, Any]],
-        *,
-        tick: int,
-        ship_id: str,
-    ) -> ShipProfile | None:
-        baseline = runtime.diagnostics.get("pyfa_projection_formula_base_profile")
-        baseline_local_signature = runtime.diagnostics.get("pyfa_projection_formula_local_signature")
-        baseline_command_signature = runtime.diagnostics.get("pyfa_projection_formula_command_signature")
-        if not isinstance(baseline, ShipProfile):
-            return None
-        if baseline_local_signature != local_signature:
-            return None
-        if baseline_command_signature != booster_signature:
-            return None
-        impacts = self._formula_impacts_from_projected_snapshots(projected_snapshots)
-        if impacts is None:
-            return None
-        started = time.perf_counter()
-        profile = self._apply_runtime_projected_impacts(replace(baseline), impacts)
-        self._log_hotspot(
-            "combat.projected_formula_profile",
-            started,
-            tick=tick,
-            ship=ship_id,
-            projected_sources=len(projected_snapshots),
-        )
-        return profile
+    def _pyfa_projection_snapshot_params(self, module, target_snapshot: CycleTargetSnapshot) -> tuple[str, float]:
+        projected_effects = [
+            effect
+            for effect_index, effect in enumerate(module.effects)
+            if effect.effect_class == EffectClass.PROJECTED and effect_index in target_snapshot.active_effect_indices
+        ]
+        if not projected_effects:
+            projected_effects = [effect for effect in module.effects if effect.effect_class == EffectClass.PROJECTED]
+        falloff_effects = [
+            effect
+            for effect in projected_effects
+            if max(0.0, float(getattr(effect, "falloff_m", 0.0) or 0.0)) > 0.0
+        ]
+        if not falloff_effects:
+            return "in_range", 0.0
+        if all(target_snapshot.distance <= max(0.0, float(getattr(effect, "range_m", 0.0) or 0.0)) for effect in falloff_effects):
+            return "in_range", 0.0
+        return "exact_range", self._quantize_pyfa_projection_range(target_snapshot.distance)
 
     @staticmethod
     def _copy_runtime_dynamic_state(source_runtime, target_runtime) -> None:
@@ -1418,6 +1280,23 @@ class CombatSystem:
             if module is None or module.state != module.state.ACTIVE:
                 self._module_cycle_target_snapshots.pop(key, None)
 
+    @staticmethod
+    def _effect_uses_cached_strength(effect) -> bool:
+        return any(str(key).startswith("damage_") for key in effect.projected_add.keys())
+
+    def _cycle_effect_strength(
+        self,
+        effect,
+        effect_index: int,
+        target_snapshot: CycleTargetSnapshot,
+    ) -> float:
+        if effect_index not in target_snapshot.active_effect_indices:
+            return 0.0
+        cached = target_snapshot.effect_strengths.get(effect_index)
+        if cached is not None:
+            return max(0.0, min(1.0, float(cached)))
+        return max(0.0, min(1.0, self._projected_strength(effect, target_snapshot.distance)))
+
     def _compute_projected_damage_factor(
         self,
         source,
@@ -1521,9 +1400,11 @@ class CombatSystem:
                     continue
                 strength = self._projected_strength(effect, distance)
                 if strength > 0.0:
-                    target_snapshot.effect_strengths[effect_index] = max(0.0, min(1.0, strength))
+                    target_snapshot.active_effect_indices.add(effect_index)
+                    if self._effect_uses_cached_strength(effect):
+                        target_snapshot.effect_strengths[effect_index] = max(0.0, min(1.0, strength))
 
-            if target_snapshot.effect_strengths:
+            if target_snapshot.active_effect_indices:
                 self._module_cycle_target_snapshots[snapshot_key] = {target.ship_id: target_snapshot}
             else:
                 self._module_cycle_target_snapshots.pop(snapshot_key, None)
@@ -1538,10 +1419,10 @@ class CombatSystem:
                 strength = self._projected_strength(effect, distance)
                 if strength <= 0.0:
                     continue
-                target_snapshots[target.ship_id] = CycleTargetSnapshot(
-                    distance=distance,
-                    effect_strengths={effect_index: max(0.0, min(1.0, strength))},
-                )
+                target_snapshot = CycleTargetSnapshot(distance=distance, active_effect_indices={effect_index})
+                if self._effect_uses_cached_strength(effect):
+                    target_snapshot.effect_strengths[effect_index] = max(0.0, min(1.0, strength))
+                target_snapshots[target.ship_id] = target_snapshot
 
             if target_snapshots:
                 self._module_cycle_target_snapshots[snapshot_key] = target_snapshots
@@ -1569,12 +1450,14 @@ class CombatSystem:
                     continue
                 strength = self._projected_strength(effect, target_snapshot.distance)
                 if strength > 0.0:
-                    target_snapshot.effect_strengths[effect_index] = max(0.0, min(1.0, strength))
+                    target_snapshot.active_effect_indices.add(effect_index)
+                    if self._effect_uses_cached_strength(effect):
+                        target_snapshot.effect_strengths[effect_index] = max(0.0, min(1.0, strength))
 
         filtered = {
             target_id: snapshot
             for target_id, snapshot in target_snapshots.items()
-            if snapshot.effect_strengths
+            if snapshot.active_effect_indices
         }
         if filtered:
             self._module_cycle_target_snapshots[snapshot_key] = filtered
@@ -1734,7 +1617,7 @@ class CombatSystem:
                     target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, module.module_id, target_id)
                     if target_snapshot is None:
                         continue
-                    strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
+                    strength = self._cycle_effect_strength(effect, effect_index, target_snapshot)
                     if strength <= 0:
                         continue
                     if self.detailed_logging and self.logger is not None:
@@ -1948,7 +1831,10 @@ class CombatSystem:
                 target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target_id)
                 if target_snapshot is None:
                     continue
-                distance_mode = self._projected_distance_mode(active_projected_module)
+                projection_key_mode, projection_range = self._pyfa_projection_snapshot_params(
+                    active_projected_module,
+                    target_snapshot,
+                )
 
                 state_by_module_id = dict(base_state_by_module_id)
                 state_by_module_id[active_projected_module.module_id] = active_state
@@ -1958,10 +1844,9 @@ class CombatSystem:
                         "blueprint": blueprint,
                         "state_by_module_id": state_by_module_id,
                         "command_booster_snapshots": source_command_snapshots,
-                        "distance_mode": distance_mode,
-                        "formula_effects": self._module_formula_effect_payloads(active_projected_module, target_snapshot),
-                        "pyfa_projection_range": target_snapshot.distance,
-                        "projection_range": target_snapshot.distance,
+                        "pyfa_projection_key_mode": projection_key_mode,
+                        "pyfa_projection_range": projection_range,
+                        "projection_range": projection_range,
                     }
                 )
 
@@ -1981,56 +1866,13 @@ class CombatSystem:
 
             booster_snapshots = command_boosters_by_ship.get(ship.ship_id, [])
             projected_snapshots = projected_sources_by_ship.get(ship.ship_id, [])
+            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots, projected_snapshots)
             local_signature = self._local_runtime_state_signature_from_metadata(ship.runtime)
             booster_signature = self._command_snapshot_list_signature(booster_snapshots)
             projected_signature = self._projected_snapshot_list_signature(projected_snapshots)
             projected_structure_signature = self._projected_snapshot_structure_signature(projected_snapshots)
             cached_signature = ship.runtime.diagnostics.get("pyfa_resolve_signature")
             cached_base_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
-            cached_local_signature = ship.runtime.diagnostics.get("pyfa_local_state_signature")
-            cached_command_signature = ship.runtime.diagnostics.get("pyfa_command_booster_signature")
-            cached_projected_signature = ship.runtime.diagnostics.get("pyfa_projected_sources_signature")
-            cached_projected_structure_signature = ship.runtime.diagnostics.get("pyfa_projected_sources_structure_signature")
-            if (
-                local_signature is not None
-                and cached_local_signature == local_signature
-                and cached_command_signature == booster_signature
-                and cached_projected_signature == projected_signature
-                and isinstance(cached_base_profile, ShipProfile)
-            ):
-                ship.runtime.diagnostics["pyfa_command_boosters"] = booster_snapshots
-                ship.runtime.diagnostics["pyfa_projected_sources"] = projected_snapshots
-                ship.runtime.diagnostics["pyfa_command_booster_signature"] = booster_signature
-                ship.runtime.diagnostics["pyfa_projected_sources_signature"] = projected_signature
-                ship.runtime.diagnostics["pyfa_projected_sources_structure_signature"] = projected_structure_signature
-                ship.profile = cached_base_profile
-                self._remember_projection_formula_base(ship.runtime, ship.profile, local_signature, booster_signature, projected_snapshots)
-                continue
-
-            formula_profile = None
-            if projected_snapshots:
-                formula_profile = self._recompute_profile_from_formula_base(
-                    ship.runtime,
-                    local_signature,
-                    booster_signature,
-                    projected_snapshots,
-                    tick=int(world.tick),
-                    ship_id=ship.ship_id,
-                )
-            if formula_profile is not None:
-                ship.runtime.diagnostics.pop("pyfa_resolve_signature", None)
-                if local_signature is not None:
-                    ship.runtime.diagnostics["pyfa_local_state_signature"] = local_signature
-                ship.runtime.diagnostics["pyfa_command_boosters"] = booster_snapshots
-                ship.runtime.diagnostics["pyfa_projected_sources"] = projected_snapshots
-                ship.runtime.diagnostics["pyfa_command_booster_signature"] = booster_signature
-                ship.runtime.diagnostics["pyfa_projected_sources_signature"] = projected_signature
-                ship.runtime.diagnostics["pyfa_projected_sources_structure_signature"] = projected_structure_signature
-                ship.runtime.diagnostics["pyfa_base_profile"] = formula_profile
-                ship.profile = formula_profile
-                continue
-
-            cache_key = get_runtime_resolve_cache_key(ship.runtime, booster_snapshots, projected_snapshots)
             if cache_key is not None and cached_signature == cache_key and isinstance(cached_base_profile, ShipProfile):
                 if local_signature is not None:
                     ship.runtime.diagnostics["pyfa_local_state_signature"] = local_signature
@@ -2040,7 +1882,6 @@ class CombatSystem:
                 ship.runtime.diagnostics["pyfa_projected_sources_signature"] = projected_signature
                 ship.runtime.diagnostics["pyfa_projected_sources_structure_signature"] = projected_structure_signature
                 ship.profile = cached_base_profile
-                self._remember_projection_formula_base(ship.runtime, ship.profile, local_signature, booster_signature, projected_snapshots)
                 continue
 
             batch_key = cache_key if cache_key is not None else ("ship", ship.ship_id)
@@ -2126,13 +1967,6 @@ class CombatSystem:
                 target_runtime.diagnostics["pyfa_base_profile"] = resolved_profile
 
                 self._copy_runtime_dynamic_state(source_runtime, target_runtime)
-                self._remember_projection_formula_base(
-                    target_runtime,
-                    resolved_profile,
-                    pending["local_signature"],
-                    pending["booster_signature"],
-                    pending["projected_snapshots"],
-                )
                 ship.runtime = target_runtime
                 ship.profile = resolved_profile
 
@@ -3055,7 +2889,8 @@ class CombatSystem:
 
         cap_drain = float(effect.projected_add.get("cap_drain", 0.0) or 0.0)
         if cap_drain > 0.0:
-            amount = cap_drain * strength
+            resistance = max(0.0, float(getattr(target_profile, "energy_warfare_resistance", 1.0) or 1.0))
+            amount = cap_drain * strength * resistance
             before_cap = target.vital.cap
             target.vital.cap = max(0.0, target.vital.cap - amount)
             cap_drained = max(0.0, before_cap - target.vital.cap)
@@ -3355,7 +3190,7 @@ class CombatSystem:
                             target = world.ships.get(target_id)
                             if target is None or not target.vital.alive:
                                 continue
-                            strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
+                            strength = self._cycle_effect_strength(effect, effect_index, target_snapshot)
                             if strength > 0.0:
                                 targets.append((target, target_snapshot, strength))
                     else:
@@ -3371,7 +3206,7 @@ class CombatSystem:
                         target_snapshot = got_snapshot
                         if False:
                             continue
-                        strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
+                        strength = self._cycle_effect_strength(effect, effect_index, target_snapshot)
                         if strength <= 0.0:
                             continue
                         targets.append((target, target_snapshot, strength))

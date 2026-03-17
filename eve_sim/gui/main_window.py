@@ -1743,6 +1743,7 @@ class MainWindow(QMainWindow):
             structure_hp=float(data.get("profile_structure_hp", getattr(existing_fit, "structure_hp", 4000.0))),
             rep_amount=float(data.get("profile_rep_amount", getattr(existing_fit, "rep_amount", 0.0))),
             rep_cycle=float(data.get("profile_rep_cycle", getattr(existing_fit, "rep_cycle", 5.0))),
+            energy_warfare_resistance=float(data.get("profile_energy_warfare_resistance", getattr(existing_fit, "energy_warfare_resistance", 1.0))),
         )
         profile = ShipProfile(
             dps=float(data.get("profile_dps", getattr(existing_profile, "dps", 0.0))),
@@ -1766,6 +1767,7 @@ class MainWindow(QMainWindow):
             structure_hp=float(data.get("profile_structure_hp", getattr(existing_profile, "structure_hp", 4000.0))),
             rep_amount=float(data.get("profile_rep_amount", getattr(existing_profile, "rep_amount", 0.0))),
             rep_cycle=float(data.get("profile_rep_cycle", getattr(existing_profile, "rep_cycle", 5.0))),
+            energy_warfare_resistance=float(data.get("profile_energy_warfare_resistance", getattr(existing_profile, "energy_warfare_resistance", 1.0))),
         )
         runtime = existing.runtime if existing is not None else None
         return fit, profile, runtime
@@ -1868,6 +1870,7 @@ class MainWindow(QMainWindow):
                     "profile_structure_hp": ship.profile.structure_hp,
                     "profile_rep_amount": ship.profile.rep_amount,
                     "profile_rep_cycle": ship.profile.rep_cycle,
+                    "profile_energy_warfare_resistance": ship.profile.energy_warfare_resistance,
                     "position": {"x": ship.nav.position.x, "y": ship.nav.position.y},
                     "velocity": {"x": ship.nav.velocity.x, "y": ship.nav.velocity.y},
                     "facing_deg": ship.nav.facing_deg,
