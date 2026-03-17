@@ -137,6 +137,7 @@ class CombatSystem:
         self._cached_projected_source_snapshots: dict[str, list[dict[str, Any]]] | None = None
         self._module_static_metadata_by_object_id: dict[int, ModuleStaticMetadata] = {}
         self._timing_wheel = TimingWheel()
+        self._decision_reference_time: float | None = None
 
     def attach_logger(
         self,
@@ -510,14 +511,16 @@ class CombatSystem:
         runtime,
         *,
         focus_changed: bool,
+        now: float | None = None,
     ) -> None:
+        now_value = self._decision_now(world, now)
         enqueue_control_signal_modules(
             ship,
             runtime_decision_rule_groups(runtime, self._runtime_module_buckets(runtime).controlled_entries),
             propulsion_active=bool(ship.nav.propulsion_command_active),
             recent_enemy_weapon_damage_active=(
                 (
-                    float(world.now)
+                    now_value
                     - float(
                         getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
                         if getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) is not None
@@ -920,6 +923,13 @@ class CombatSystem:
                 minimum = cycle_time
         return minimum
 
+    def _decision_now(self, world: WorldState, fallback: float | None = None) -> float:
+        if fallback is not None:
+            return float(fallback)
+        if self._decision_reference_time is not None:
+            return float(self._decision_reference_time)
+        return float(world.now)
+
     @staticmethod
     def _deadline_remaining(deadline: float | None, now: float) -> float | None:
         if deadline is None:
@@ -1118,8 +1128,9 @@ class CombatSystem:
                 continue
             return float(event.trigger_time)
 
-    def _process_due_timer_events(self, world: WorldState) -> None:
-        for event in self._timing_wheel.pop_due_events(float(world.now)):
+    def _process_due_timer_events(self, world: WorldState, current_time: float | None = None) -> None:
+        due_time = self._decision_now(world, current_time)
+        for event in self._timing_wheel.pop_due_events(due_time):
             if self._timer_event_is_stale(world, event):
                 continue
             ship = world.ships.get(str(event.ship_id))
@@ -1616,14 +1627,15 @@ class CombatSystem:
         *,
         lock_context: str,
         target_profile: ShipProfile | None = None,
+        now: float | None = None,
     ) -> bool:
         if not target_id or target is None or not target.vital.alive:
             if target_id:
                 ship.combat.lock_targets.discard(target_id)
                 self._clear_lock_timer(ship, target_id)
             return False
-        now = float(world.now)
-        if not self._can_target_under_ecm(ship, target_id, now):
+        now_value = self._decision_now(world, now)
+        if not self._can_target_under_ecm(ship, target_id, now_value):
             ship.combat.lock_targets.discard(target_id)
             self._clear_lock_timer(ship, target_id)
             return False
@@ -1635,7 +1647,7 @@ class CombatSystem:
                 ship,
                 target_id,
                 duration=self._cached_lock_time(ship.profile, profile_for_lock),
-                now=now,
+                now=now_value,
             )
             if self.detailed_logging and self.logger is not None:
                 self.logger.debug(
@@ -1644,18 +1656,18 @@ class CombatSystem:
         elif target_id not in ship.combat.lock_deadlines:
             remaining = max(0.0, float(ship.combat.lock_timers.get(target_id, 0.0) or 0.0))
             if remaining > 0.0:
-                self._schedule_lock_deadline(ship, target_id, duration=remaining, now=now)
+                self._schedule_lock_deadline(ship, target_id, duration=remaining, now=now_value)
         return False
 
-    def _advance_target_locks(self, world: WorldState, dt: float) -> None:
-        now = float(world.now)
+    def _advance_target_locks(self, world: WorldState, dt: float, now: float | None = None) -> None:
+        now_value = self._decision_now(world, now)
         for ship in world.ships.values():
             if not ship.vital.alive:
                 continue
-            self._prepare_ship_timer_views(ship, now)
+            self._prepare_ship_timer_views(ship, now_value)
             for target_id, left in list(ship.combat.lock_timers.items()):
                 target = world.ships.get(target_id)
-                if target is None or not target.vital.alive or not self._can_target_under_ecm(ship, target_id, now):
+                if target is None or not target.vital.alive or not self._can_target_under_ecm(ship, target_id, now_value):
                     self._clear_lock_timer(ship, target_id)
                     ship.combat.lock_targets.discard(target_id)
                     continue
@@ -2175,7 +2187,7 @@ class CombatSystem:
             return False
         if not self._module_in_projected_range(source, target, module):
             return False
-        if not self._can_target_under_ecm(source, target_id, float(world.now)):
+        if not self._can_target_under_ecm(source, target_id, self._decision_now(world)):
             return False
 
         if rule.target_mode == "weapon_focus_prefocus":
@@ -2283,13 +2295,13 @@ class CombatSystem:
         if rule.activation_mode == "recent_enemy_weapon_damage":
             raw_last_hit_at = getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
             last_hit_at = float(raw_last_hit_at if raw_last_hit_at is not None else -1e9)
-            return (float(world.now) - last_hit_at) <= 30.0
+            return (self._decision_now(world) - last_hit_at) <= 30.0
         if rule.activation_mode == "enemy_in_area":
             return self._module_has_area_enemies_in_range(world, ship, module)
         if rule.activation_mode == "weapon_focus_only":
             if not target_id:
                 return False
-            return self._weapon_fire_delay_ready(ship, target_id, float(world.now))
+            return self._weapon_fire_delay_ready(ship, target_id, self._decision_now(world))
         return True
 
     @staticmethod
@@ -2415,13 +2427,13 @@ class CombatSystem:
         if ship.combat.current_target and ship.combat.current_target not in active_sources:
             ship.combat.current_target = None
 
-    def _update_ecm_restrictions(self, world: WorldState) -> None:
-        now = float(world.now)
+    def _update_ecm_restrictions(self, world: WorldState, now: float | None = None) -> None:
+        now_value = self._decision_now(world, now)
         for ship in world.ships.values():
             if not ship.vital.alive:
                 ship.combat.ecm_jam_sources.clear()
                 continue
-            self._enforce_ecm_restrictions(ship, now)
+            self._enforce_ecm_restrictions(ship, now_value)
 
     @staticmethod
     def _break_all_locks(ship) -> None:
@@ -2571,7 +2583,7 @@ class CombatSystem:
                     },
                 )
 
-    def _update_module_states(self, world: WorldState, dt: float) -> bool:
+    def _update_module_states(self, world: WorldState, dt: float, now: float | None = None) -> bool:
         alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
         alive_ids_by_team: dict[Team, set[str]] = {Team.BLUE: set(), Team.RED: set()}
         for candidate in world.ships.values():
@@ -2581,21 +2593,21 @@ class CombatSystem:
 
         changed_focus_keys = self._changed_focus_queues(world)
         pyfa_remote_inputs_dirty = False
-        now = float(world.now)
+        now_value = self._decision_now(world, now)
 
         for ship in world.ships.values():
             if not ship.vital.alive or ship.runtime is None:
                 continue
 
             runtime = ship.runtime
-            self._prepare_ship_timer_views(ship, now)
+            self._prepare_ship_timer_views(ship, now_value)
             focus_key = self._focus_key(ship.team, ship.squad_id)
             focus_queue = tuple(str(target_id) for target_id in world.squad_focus_queues.get(focus_key, []))
             has_focus_queue = bool(focus_queue)
             propulsion_active = bool(ship.nav.propulsion_command_active)
             recent_enemy_weapon_damage_active = (
                 (
-                    now
+                    now_value
                     - float(
                         getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
                         if getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) is not None
@@ -2609,7 +2621,7 @@ class CombatSystem:
             ally_ids = alive_ids_by_team.get(ship.team, set())
             enemy_ids = alive_ids_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, set())
             force_target_reselect = focus_key in changed_focus_keys
-            self._enqueue_ship_control_signal_modules(world, ship, runtime, focus_changed=force_target_reselect)
+            self._enqueue_ship_control_signal_modules(world, ship, runtime, focus_changed=force_target_reselect, now=now_value)
             local_signature_dirty = False
             active_pyfa_remote_inputs_dirty = False
             synced_weapon_fire_delay_pairs: set[tuple[str | None, str | None]] = set()
@@ -2681,7 +2693,7 @@ class CombatSystem:
                                 ship,
                                 module_id,
                                 duration=reactivation_delay,
-                                now=now,
+                                now=now_value,
                             )
                         pending_ammo_reload = max(
                             0.0,
@@ -2699,7 +2711,7 @@ class CombatSystem:
                                             ship,
                                             module_id,
                                             duration=auto_reload_time,
-                                            now=now,
+                                            now=now_value,
                                         )
                                         ammo_reload_started_this_tick = True
                                     else:
@@ -2710,7 +2722,7 @@ class CombatSystem:
                                 ship,
                                 module_id,
                                 duration=pending_ammo_reload,
-                                now=now,
+                                now=now_value,
                             )
                             ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
                             ammo_reload_started_this_tick = True
@@ -2751,7 +2763,7 @@ class CombatSystem:
                                 ship,
                                 previous_target_id=previous_projected_target,
                                 new_target_id=projected_target_id,
-                                now=float(world.now),
+                                now=now_value,
                             )
                             synced_weapon_fire_delay_pairs.add(delay_pair)
 
@@ -2808,7 +2820,7 @@ class CombatSystem:
                         ship,
                         module_id,
                         duration=pending_ammo_reload_left,
-                        now=now,
+                        now=now_value,
                     )
                     ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
                     desired_active = False
@@ -2821,7 +2833,7 @@ class CombatSystem:
                                 ship,
                                 module_id,
                                 duration=auto_reload_time,
-                                now=now,
+                                now=now_value,
                             )
                         else:
                             module.charge_remaining = float(module.charge_capacity)
@@ -2857,6 +2869,7 @@ class CombatSystem:
                         activation_target_id,
                         activation_target,
                         lock_context="module_lock",
+                        now=now_value,
                     ):
                         desired_active = False
 
@@ -2874,7 +2887,7 @@ class CombatSystem:
                                 ship,
                                 module_id,
                                 duration=cycle_time,
-                                now=now,
+                                now=now_value,
                             )
                             cycle_started = True
                     else:
@@ -2980,7 +2993,7 @@ class CombatSystem:
                     next_pending_modules.add(module_id)
 
             ship.combat.module_decision_pending = next_pending_modules
-            self._sync_timer_views_for_ship(ship, now)
+            self._sync_timer_views_for_ship(ship, now_value)
 
             if local_signature_dirty:
                 runtime.diagnostics.pop("runtime_local_state_signature", None)
@@ -3226,6 +3239,9 @@ class CombatSystem:
         self._projected_cycle_starts_this_tick.clear()
         self._prune_cycle_effect_snapshots(world)
         self._refresh_alive_runtime_ship_ids(world)
+        step_end = float(world.now)
+        step_start = max(0.0, step_end - max(0.0, float(dt)))
+        self._decision_reference_time = step_start
         if self.event_logging_enabled:
             self._advance_merge_window(world.now)
         else:
@@ -3234,19 +3250,19 @@ class CombatSystem:
             self._merge_window_end_time = None
 
         started = time.perf_counter()
-        self._update_ecm_restrictions(world)
+        self._update_ecm_restrictions(world, now=step_start)
         self._log_hotspot("combat.update_ecm_restrictions", started, tick=int(world.tick), dt=dt)
 
         started = time.perf_counter()
-        self._process_due_timer_events(world)
+        self._process_due_timer_events(world, current_time=step_start)
         self._log_hotspot("combat.process_due_timer_events", started, tick=int(world.tick), dt=dt)
 
         started = time.perf_counter()
-        self._advance_target_locks(world, dt)
+        self._advance_target_locks(world, dt, now=step_start)
         self._log_hotspot("combat.advance_target_locks", started, tick=int(world.tick), dt=dt)
 
         started = time.perf_counter()
-        if self._update_module_states(world, dt):
+        if self._update_module_states(world, dt, now=step_start):
             self._mark_pyfa_remote_inputs_dirty()
         self._log_hotspot("combat.update_module_states", started, tick=int(world.tick), dt=dt)
 
@@ -3473,6 +3489,11 @@ class CombatSystem:
                         continue
                     ship.combat.current_target = candidate_id
                     break
+
+        started = time.perf_counter()
+        self._process_due_timer_events(world, current_time=step_end)
+        self._log_hotspot("combat.commit_due_timer_events", started, tick=int(world.tick), dt=dt)
+        self._decision_reference_time = None
 
         if self.event_logging_enabled:
             self._advance_merge_window(world.now)

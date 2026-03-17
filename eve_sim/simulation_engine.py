@@ -74,16 +74,18 @@ class SimulationEngine:
             agent.think(self.world)
         self._log_hotspot("engine.ship_agents", perf_started, tick=self.world.tick, agents=len(self.ship_agents))
 
-        remaining_dt = self._dt
-        base_slice_dt = self._dt / max(1, self.config.physics_substeps)
+        substep_count = max(1, int(self.config.physics_substeps))
+        base_slice_dt = self._dt / substep_count
         self.world.now = step_start
-        slice_index = 0
 
-        while remaining_dt > 1e-9:
-            slice_budget = min(base_slice_dt, remaining_dt)
-            slice_dt = self.combat.recommended_time_slice(self.world, slice_budget)
-            slice_dt = max(1e-6, min(slice_budget, slice_dt))
-            self.world.now = min(step_end, float(self.world.now) + slice_dt)
+        for slice_index in range(substep_count):
+            substep_start = step_start + (base_slice_dt * slice_index)
+            if slice_index + 1 >= substep_count:
+                substep_end = step_end
+            else:
+                substep_end = substep_start + base_slice_dt
+            slice_dt = max(1e-6, float(substep_end) - float(substep_start))
+            self.world.now = substep_end
 
             perf_started = time.perf_counter()
             self.movement.run(self.world, slice_dt)
@@ -97,11 +99,8 @@ class SimulationEngine:
             self.logistics.run(self.world, slice_dt)
             self._log_hotspot("engine.logistics", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
 
-            remaining_dt = max(0.0, remaining_dt - slice_dt)
-            slice_index += 1
-
         self.world.now = step_end
-        self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=slice_index)
+        self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=substep_count)
 
     def snapshot(self) -> dict:
         ships = {}
