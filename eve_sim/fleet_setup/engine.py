@@ -664,6 +664,8 @@ class RuntimeFromEftFactory:
     def _collect_pyfa_weapon_stats(modules: list[Any], ship: Any, *, require_volley: bool) -> dict[str, float]:
         turret_dps = 0.0
         missile_dps = 0.0
+        turret_volley = 0.0
+        missile_volley = 0.0
         weighted_optimal_sig = 0.0
         turret_cycle_weighted = 0.0
         turret_cycle_weight = 0.0
@@ -697,14 +699,14 @@ class RuntimeFromEftFactory:
 
             try:
                 dps_obj = module.getDps()
-                if require_volley:
-                    _ = module.getVolley()
+                volley_obj = module.getVolley() if require_volley else None
             except Exception:
                 continue
 
             dps_total = float(getattr(dps_obj, "total", 0.0) or 0.0)
             if dps_total <= 0.0:
                 continue
+            volley_total = float(getattr(volley_obj, "total", 0.0) or 0.0) if volley_obj is not None else 0.0
 
             cycle = float(module.getModifiedItemAttr("speed") or 0.0) / 1000.0
             cycle = max(0.1, cycle)
@@ -720,6 +722,7 @@ class RuntimeFromEftFactory:
 
             if is_launcher:
                 missile_dps += dps_total
+                missile_volley += volley_total
                 missile_cycle_weighted += cycle * dps_total
                 missile_cycle_weight += dps_total
                 missile_weighted_optimal += optimal * dps_total
@@ -747,6 +750,7 @@ class RuntimeFromEftFactory:
                 missile_max_range = max(missile_max_range, charge_range, optimal)
             else:
                 turret_dps += dps_total
+                turret_volley += volley_total
                 turret_cycle_weighted += cycle * dps_total
                 turret_cycle_weight += dps_total
                 turret_weighted_optimal += optimal * dps_total
@@ -772,6 +776,8 @@ class RuntimeFromEftFactory:
             tracking = max(0.0001, weighted_tracking / total_weapon_dps)
 
         return {
+            "dps": total_weapon_dps,
+            "volley": turret_volley + missile_volley,
             "turret_dps": turret_dps,
             "missile_dps": missile_dps,
             "turret_cycle": (turret_cycle_weighted / max(1e-6, turret_cycle_weight)) if turret_dps > 0 else 0.0,
@@ -871,9 +877,11 @@ class RuntimeFromEftFactory:
         ship = fit.ship
         weapon_stats = self._collect_pyfa_weapon_stats(cast(list[Any], fit.modules), ship, require_volley=True)
         warp_scramble_status = float(ship.getModifiedItemAttr("warpScrambleStatus") or 0.0)
+        total_dps = max(float(fit.getTotalDps().total), float(weapon_stats.get("dps", 0.0) or 0.0))
+        total_volley = max(float(fit.getTotalVolley().total), float(weapon_stats.get("volley", 0.0) or 0.0))
         return {
-            "dps": float(fit.getTotalDps().total),
-            "volley": float(fit.getTotalVolley().total),
+            "dps": total_dps,
+            "volley": total_volley,
             "turret_dps": weapon_stats["turret_dps"],
             "missile_dps": weapon_stats["missile_dps"],
             "turret_cycle": weapon_stats["turret_cycle"],
@@ -948,188 +956,210 @@ class RuntimeFromEftFactory:
         state_by_module_id: dict[str, str] | None = None,
         command_booster_snapshots: list[dict[str, Any]] | None = None,
     ) -> tuple[FitRuntime, FitDescriptor, ShipProfile]:
-        pyfa_final = self._compute_pyfa_final_stats(fit_ctx)
+        temporary_weapon_states: list[tuple[Any, Any]] = []
+        for idx, (spec, fitted_module, _effective_charge_name) in enumerate(fitted_modules, start=1):
+            module_id = f"mod-{idx}"
+            if bool(spec.offline):
+                continue
+            requested_state = str((state_by_module_id or {}).get(module_id, "ONLINE") or "ONLINE").upper()
+            if requested_state == "OFFLINE":
+                continue
+            group_name = str(getattr(getattr(fitted_module, "item", None), "group", None).name or "")
+            if not self._is_weapon_like_group(group_name):
+                continue
+            active_state = _pyfa_module_state_from_runtime_state(self, fitted_module, "ACTIVE")
+            if active_state is None or active_state == fitted_module.state:
+                continue
+            temporary_weapon_states.append((fitted_module, fitted_module.state))
+            fitted_module.state = active_state
 
-        ship_item = getattr(getattr(fit_ctx, "ship", None), "item", None)
-        ship_name = str(getattr(ship_item, "typeName", parsed.ship_name) or parsed.ship_name)
-        role = "DPS"
-        ship_group_name = str(getattr(getattr(ship_item, "group", None), "name", "") or "").lower()
-        if "logistics" in ship_group_name:
-            role = "LOGI"
-        elif any(x in ship_group_name for x in ("electronic", "force recon", "combat recon")):
-            role = "EWAR"
+        try:
+            pyfa_final = self._compute_pyfa_final_stats(fit_ctx)
 
-        modules: list[ModuleRuntime] = []
-        pyfa_blueprint_modules: list[dict[str, Any]] = []
-        for idx, (spec, fitted_module, effective_charge_name) in enumerate(fitted_modules, start=1):
-            module = self._module_effect_pyfa(fitted_module, idx)
-            if module is not None:
-                if spec.offline:
-                    module.state = ModuleState.OFFLINE
-                elif state_by_module_id is not None:
-                    module.state = self._module_state_text(state_by_module_id.get(module.module_id, module.state.value))
-                modules.append(module)
-                pyfa_blueprint_modules.append(
-                    {
-                        "module_id": module.module_id,
-                        "module_name": spec.module_name,
-                        "charge_name": effective_charge_name,
-                        "offline": bool(spec.offline),
-                        "effect_names": sorted(self._module_effect_names(fitted_module)),
-                    }
-                )
+            ship_item = getattr(getattr(fit_ctx, "ship", None), "item", None)
+            ship_name = str(getattr(ship_item, "typeName", parsed.ship_name) or parsed.ship_name)
+            role = "DPS"
+            ship_group_name = str(getattr(getattr(ship_item, "group", None), "name", "") or "").lower()
+            if "logistics" in ship_group_name:
+                role = "LOGI"
+            elif any(x in ship_group_name for x in ("electronic", "force recon", "combat recon")):
+                role = "EWAR"
 
-        turret_dps = max(0.0, float(pyfa_final.get("turret_dps", 0.0) or 0.0))
-        missile_dps = max(0.0, float(pyfa_final.get("missile_dps", 0.0) or 0.0))
+            modules: list[ModuleRuntime] = []
+            pyfa_blueprint_modules: list[dict[str, Any]] = []
+            for idx, (spec, fitted_module, effective_charge_name) in enumerate(fitted_modules, start=1):
+                module = self._module_effect_pyfa(fitted_module, idx)
+                if module is not None:
+                    if spec.offline:
+                        module.state = ModuleState.OFFLINE
+                    elif state_by_module_id is not None:
+                        module.state = self._module_state_text(state_by_module_id.get(module.module_id, module.state.value))
+                    modules.append(module)
+                    pyfa_blueprint_modules.append(
+                        {
+                            "module_id": module.module_id,
+                            "module_name": spec.module_name,
+                            "charge_name": effective_charge_name,
+                            "offline": bool(spec.offline),
+                            "effect_names": sorted(self._module_effect_names(fitted_module)),
+                        }
+                    )
 
-        profile = ShipProfile(
-            dps=max(0.0, float(pyfa_final.get("dps", 0.0) or 0.0)),
-            volley=max(0.0, float(pyfa_final.get("volley", 0.0) or 0.0)),
-            optimal=max(1.0, float(pyfa_final.get("optimal", 0.0) or 0.0)),
-            falloff=max(1.0, float(pyfa_final.get("falloff", 0.0) or 0.0)),
-            tracking=max(0.0001, float(pyfa_final.get("tracking", 0.0) or 0.0)),
-            optimal_sig=max(1.0, float(pyfa_final.get("optimal_sig", 40_000.0) or 40_000.0)),
-            sig_radius=max(1.0, float(pyfa_final.get("sig_radius", 0.0) or 0.0)),
-            scan_resolution=max(1.0, float(pyfa_final.get("scan_resolution", 0.0) or 0.0)),
-            max_target_range=max(1000.0, float(pyfa_final.get("max_target_range", 0.0) or 0.0)),
-            max_locked_targets=max(0, int(pyfa_final.get("max_locked_targets", 0) or 0)),
-            scan_strength=max(0.0, float(pyfa_final.get("scan_strength", 0.0) or 0.0)),
-            ecm_jam_chance=max(0.0, min(1.0, float(pyfa_final.get("ecm_jam_chance", 0.0) or 0.0))),
-            sensor_strength_gravimetric=max(0.0, float(pyfa_final.get("sensor_strength_gravimetric", 0.0) or 0.0)),
-            sensor_strength_ladar=max(0.0, float(pyfa_final.get("sensor_strength_ladar", 0.0) or 0.0)),
-            sensor_strength_magnetometric=max(0.0, float(pyfa_final.get("sensor_strength_magnetometric", 0.0) or 0.0)),
-            sensor_strength_radar=max(0.0, float(pyfa_final.get("sensor_strength_radar", 0.0) or 0.0)),
-            warp_scramble_status=float(pyfa_final.get("warp_scramble_status", 0.0) or 0.0),
-            warp_stability=float(pyfa_final.get("warp_stability", 0.0) or 0.0),
-            energy_warfare_resistance=max(0.0, float(pyfa_final.get("energy_warfare_resistance", 1.0) or 1.0)),
-            max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
-            max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
-            cap_recharge_time=max(1.0, float(pyfa_final.get("cap_recharge_time", 0.0) or 0.0)),
-            shield_hp=max(1.0, float(pyfa_final.get("shield_hp", 0.0) or 0.0)),
-            armor_hp=max(1.0, float(pyfa_final.get("armor_hp", 0.0) or 0.0)),
-            structure_hp=max(1.0, float(pyfa_final.get("structure_hp", 0.0) or 0.0)),
-            rep_amount=0.0,
-            rep_cycle=5.0,
-            weapon_system=(
-                "mixed"
-                if turret_dps > 0.0 and missile_dps > 0.0
-                else ("missile" if missile_dps > 0.0 else "turret")
-            ),
-            turret_dps=turret_dps,
-            missile_dps=missile_dps,
-            turret_cycle=max(0.0, float(pyfa_final.get("turret_cycle", 0.0) or 0.0)),
-            missile_cycle=max(0.0, float(pyfa_final.get("missile_cycle", 0.0) or 0.0)),
-            damage_em=max(0.0, float(pyfa_final.get("damage_em", 0.0) or 0.0)),
-            damage_thermal=max(0.0, float(pyfa_final.get("damage_thermal", 0.0) or 0.0)),
-            damage_kinetic=max(0.0, float(pyfa_final.get("damage_kinetic", 0.0) or 0.0)),
-            damage_explosive=max(0.0, float(pyfa_final.get("damage_explosive", 0.0) or 0.0)),
-            turret_em_dps=max(0.0, float(pyfa_final.get("turret_em_dps", 0.0) or 0.0)),
-            turret_thermal_dps=max(0.0, float(pyfa_final.get("turret_thermal_dps", 0.0) or 0.0)),
-            turret_kinetic_dps=max(0.0, float(pyfa_final.get("turret_kinetic_dps", 0.0) or 0.0)),
-            turret_explosive_dps=max(0.0, float(pyfa_final.get("turret_explosive_dps", 0.0) or 0.0)),
-            missile_em_dps=max(0.0, float(pyfa_final.get("missile_em_dps", 0.0) or 0.0)),
-            missile_thermal_dps=max(0.0, float(pyfa_final.get("missile_thermal_dps", 0.0) or 0.0)),
-            missile_kinetic_dps=max(0.0, float(pyfa_final.get("missile_kinetic_dps", 0.0) or 0.0)),
-            missile_explosive_dps=max(0.0, float(pyfa_final.get("missile_explosive_dps", 0.0) or 0.0)),
-            missile_explosion_radius=max(0.0, float(pyfa_final.get("missile_explosion_radius", 0.0) or 0.0)),
-            missile_explosion_velocity=max(0.0, float(pyfa_final.get("missile_explosion_velocity", 0.0) or 0.0)),
-            missile_max_range=max(0.0, float(pyfa_final.get("missile_max_range", 0.0) or 0.0)),
-            missile_damage_reduction_factor=max(0.1, min(2.0, float(pyfa_final.get("missile_damage_reduction_factor", 0.5) or 0.5))),
-            shield_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_em", 1.0) or 1.0))),
-            shield_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_thermal", 1.0) or 1.0))),
-            shield_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_kinetic", 1.0) or 1.0))),
-            shield_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_explosive", 1.0) or 1.0))),
-            armor_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_em", 1.0) or 1.0))),
-            armor_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_thermal", 1.0) or 1.0))),
-            armor_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_kinetic", 1.0) or 1.0))),
-            armor_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_explosive", 1.0) or 1.0))),
-            structure_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_em", 1.0) or 1.0))),
-            structure_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_thermal", 1.0) or 1.0))),
-            structure_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_kinetic", 1.0) or 1.0))),
-            structure_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_explosive", 1.0) or 1.0))),
-            mass=max(0.0, float(pyfa_final.get("mass", 0.0) or 0.0)),
-            agility=max(0.0, float(pyfa_final.get("agility", 0.0) or 0.0)),
-        )
+            turret_dps = max(0.0, float(pyfa_final.get("turret_dps", 0.0) or 0.0))
+            missile_dps = max(0.0, float(pyfa_final.get("missile_dps", 0.0) or 0.0))
 
-        hull = HullProfile(
-            ship_name=ship_name,
-            role=role,
-            base_dps=profile.dps,
-            volley=profile.volley,
-            optimal=profile.optimal,
-            falloff=profile.falloff,
-            tracking=profile.tracking,
-            sig_radius=profile.sig_radius,
-            scan_resolution=profile.scan_resolution,
-            max_target_range=profile.max_target_range,
-            max_speed=profile.max_speed,
-            cap_max=profile.max_cap,
-            cap_recharge_time=profile.cap_recharge_time,
-            shield_hp=profile.shield_hp,
-            armor_hp=profile.armor_hp,
-            structure_hp=profile.structure_hp,
-            rep_amount=profile.rep_amount,
-            rep_cycle=profile.rep_cycle,
-            energy_warfare_resistance=profile.energy_warfare_resistance,
-            mass=profile.mass,
-            agility=profile.agility,
-        )
+            profile = ShipProfile(
+                dps=max(0.0, float(pyfa_final.get("dps", 0.0) or 0.0)),
+                volley=max(0.0, float(pyfa_final.get("volley", 0.0) or 0.0)),
+                optimal=max(1.0, float(pyfa_final.get("optimal", 0.0) or 0.0)),
+                falloff=max(1.0, float(pyfa_final.get("falloff", 0.0) or 0.0)),
+                tracking=max(0.0001, float(pyfa_final.get("tracking", 0.0) or 0.0)),
+                optimal_sig=max(1.0, float(pyfa_final.get("optimal_sig", 40_000.0) or 40_000.0)),
+                sig_radius=max(1.0, float(pyfa_final.get("sig_radius", 0.0) or 0.0)),
+                scan_resolution=max(1.0, float(pyfa_final.get("scan_resolution", 0.0) or 0.0)),
+                max_target_range=max(1000.0, float(pyfa_final.get("max_target_range", 0.0) or 0.0)),
+                max_locked_targets=max(0, int(pyfa_final.get("max_locked_targets", 0) or 0)),
+                scan_strength=max(0.0, float(pyfa_final.get("scan_strength", 0.0) or 0.0)),
+                ecm_jam_chance=max(0.0, min(1.0, float(pyfa_final.get("ecm_jam_chance", 0.0) or 0.0))),
+                sensor_strength_gravimetric=max(0.0, float(pyfa_final.get("sensor_strength_gravimetric", 0.0) or 0.0)),
+                sensor_strength_ladar=max(0.0, float(pyfa_final.get("sensor_strength_ladar", 0.0) or 0.0)),
+                sensor_strength_magnetometric=max(0.0, float(pyfa_final.get("sensor_strength_magnetometric", 0.0) or 0.0)),
+                sensor_strength_radar=max(0.0, float(pyfa_final.get("sensor_strength_radar", 0.0) or 0.0)),
+                warp_scramble_status=float(pyfa_final.get("warp_scramble_status", 0.0) or 0.0),
+                warp_stability=float(pyfa_final.get("warp_stability", 0.0) or 0.0),
+                energy_warfare_resistance=max(0.0, float(pyfa_final.get("energy_warfare_resistance", 1.0) or 1.0)),
+                max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
+                max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
+                cap_recharge_time=max(1.0, float(pyfa_final.get("cap_recharge_time", 0.0) or 0.0)),
+                shield_hp=max(1.0, float(pyfa_final.get("shield_hp", 0.0) or 0.0)),
+                armor_hp=max(1.0, float(pyfa_final.get("armor_hp", 0.0) or 0.0)),
+                structure_hp=max(1.0, float(pyfa_final.get("structure_hp", 0.0) or 0.0)),
+                rep_amount=0.0,
+                rep_cycle=5.0,
+                weapon_system=(
+                    "mixed"
+                    if turret_dps > 0.0 and missile_dps > 0.0
+                    else ("missile" if missile_dps > 0.0 else "turret")
+                ),
+                turret_dps=turret_dps,
+                missile_dps=missile_dps,
+                turret_cycle=max(0.0, float(pyfa_final.get("turret_cycle", 0.0) or 0.0)),
+                missile_cycle=max(0.0, float(pyfa_final.get("missile_cycle", 0.0) or 0.0)),
+                damage_em=max(0.0, float(pyfa_final.get("damage_em", 0.0) or 0.0)),
+                damage_thermal=max(0.0, float(pyfa_final.get("damage_thermal", 0.0) or 0.0)),
+                damage_kinetic=max(0.0, float(pyfa_final.get("damage_kinetic", 0.0) or 0.0)),
+                damage_explosive=max(0.0, float(pyfa_final.get("damage_explosive", 0.0) or 0.0)),
+                turret_em_dps=max(0.0, float(pyfa_final.get("turret_em_dps", 0.0) or 0.0)),
+                turret_thermal_dps=max(0.0, float(pyfa_final.get("turret_thermal_dps", 0.0) or 0.0)),
+                turret_kinetic_dps=max(0.0, float(pyfa_final.get("turret_kinetic_dps", 0.0) or 0.0)),
+                turret_explosive_dps=max(0.0, float(pyfa_final.get("turret_explosive_dps", 0.0) or 0.0)),
+                missile_em_dps=max(0.0, float(pyfa_final.get("missile_em_dps", 0.0) or 0.0)),
+                missile_thermal_dps=max(0.0, float(pyfa_final.get("missile_thermal_dps", 0.0) or 0.0)),
+                missile_kinetic_dps=max(0.0, float(pyfa_final.get("missile_kinetic_dps", 0.0) or 0.0)),
+                missile_explosive_dps=max(0.0, float(pyfa_final.get("missile_explosive_dps", 0.0) or 0.0)),
+                missile_explosion_radius=max(0.0, float(pyfa_final.get("missile_explosion_radius", 0.0) or 0.0)),
+                missile_explosion_velocity=max(0.0, float(pyfa_final.get("missile_explosion_velocity", 0.0) or 0.0)),
+                missile_max_range=max(0.0, float(pyfa_final.get("missile_max_range", 0.0) or 0.0)),
+                missile_damage_reduction_factor=max(0.1, min(2.0, float(pyfa_final.get("missile_damage_reduction_factor", 0.5) or 0.5))),
+                shield_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_em", 1.0) or 1.0))),
+                shield_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_thermal", 1.0) or 1.0))),
+                shield_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_kinetic", 1.0) or 1.0))),
+                shield_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("shield_resonance_explosive", 1.0) or 1.0))),
+                armor_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_em", 1.0) or 1.0))),
+                armor_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_thermal", 1.0) or 1.0))),
+                armor_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_kinetic", 1.0) or 1.0))),
+                armor_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("armor_resonance_explosive", 1.0) or 1.0))),
+                structure_resonance_em=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_em", 1.0) or 1.0))),
+                structure_resonance_thermal=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_thermal", 1.0) or 1.0))),
+                structure_resonance_kinetic=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_kinetic", 1.0) or 1.0))),
+                structure_resonance_explosive=max(0.01, min(1.0, float(pyfa_final.get("structure_resonance_explosive", 1.0) or 1.0))),
+                mass=max(0.0, float(pyfa_final.get("mass", 0.0) or 0.0)),
+                agility=max(0.0, float(pyfa_final.get("agility", 0.0) or 0.0)),
+            )
 
-        runtime = FitRuntime(
-            fit_key=parsed.fit_key,
-            hull=hull,
-            skills=self._skills_default(),
-            modules=modules,
-        )
-        runtime.diagnostics["runtime_controlled_module_ids"] = tuple(
-            str(module.module_id)
-            for module in modules
-            if _module_requires_control_state(module)
-        )
-        runtime.diagnostics["runtime_local_stateful_module_ids"] = tuple(
-            str(module.module_id)
-            for module in modules
-            if _module_affects_local_pyfa_profile(module)
-        )
-        runtime.diagnostics["pyfa_blueprint"] = {
-            "ship_name": parsed.ship_name,
-            "fit_name": parsed.fit_name,
-            "modules": pyfa_blueprint_modules,
-        }
-        runtime.diagnostics["pyfa_command_boosters"] = deepcopy(command_booster_snapshots or [])
-        runtime.diagnostics["motion_params"] = {
-            "mass": float(pyfa_final.get("mass", 0.0) or 0.0),
-            "agility": float(pyfa_final.get("agility", 0.0) or 0.0),
-        }
-        fit = FitDescriptor(
-            fit_key=parsed.fit_key,
-            ship_name=hull.ship_name,
-            role=hull.role,
-            base_dps=profile.dps,
-            volley=profile.volley,
-            optimal_range=profile.optimal,
-            falloff=profile.falloff,
-            tracking=profile.tracking,
-            signature_radius=profile.sig_radius,
-            scan_resolution=profile.scan_resolution,
-            max_target_range=profile.max_target_range,
-            sensor_strength_gravimetric=profile.sensor_strength_gravimetric,
-            sensor_strength_ladar=profile.sensor_strength_ladar,
-            sensor_strength_magnetometric=profile.sensor_strength_magnetometric,
-            sensor_strength_radar=profile.sensor_strength_radar,
-            max_speed=profile.max_speed,
-            max_cap=profile.max_cap,
-            cap_recharge_time=profile.cap_recharge_time,
-            shield_hp=profile.shield_hp,
-            armor_hp=profile.armor_hp,
-            structure_hp=profile.structure_hp,
-            rep_amount=profile.rep_amount,
-            rep_cycle=profile.rep_cycle,
-            energy_warfare_resistance=profile.energy_warfare_resistance,
-            mass=profile.mass,
-            agility=profile.agility,
-        )
-        return runtime, fit, profile
+            hull = HullProfile(
+                ship_name=ship_name,
+                role=role,
+                base_dps=profile.dps,
+                volley=profile.volley,
+                optimal=profile.optimal,
+                falloff=profile.falloff,
+                tracking=profile.tracking,
+                sig_radius=profile.sig_radius,
+                scan_resolution=profile.scan_resolution,
+                max_target_range=profile.max_target_range,
+                max_speed=profile.max_speed,
+                cap_max=profile.max_cap,
+                cap_recharge_time=profile.cap_recharge_time,
+                shield_hp=profile.shield_hp,
+                armor_hp=profile.armor_hp,
+                structure_hp=profile.structure_hp,
+                rep_amount=profile.rep_amount,
+                rep_cycle=profile.rep_cycle,
+                energy_warfare_resistance=profile.energy_warfare_resistance,
+                mass=profile.mass,
+                agility=profile.agility,
+            )
+
+            runtime = FitRuntime(
+                fit_key=parsed.fit_key,
+                hull=hull,
+                skills=self._skills_default(),
+                modules=modules,
+            )
+            runtime.diagnostics["runtime_controlled_module_ids"] = tuple(
+                str(module.module_id)
+                for module in modules
+                if _module_requires_control_state(module)
+            )
+            runtime.diagnostics["runtime_local_stateful_module_ids"] = tuple(
+                str(module.module_id)
+                for module in modules
+                if _module_affects_local_pyfa_profile(module)
+            )
+            runtime.diagnostics["pyfa_blueprint"] = {
+                "ship_name": parsed.ship_name,
+                "fit_name": parsed.fit_name,
+                "modules": pyfa_blueprint_modules,
+            }
+            runtime.diagnostics["pyfa_command_boosters"] = deepcopy(command_booster_snapshots or [])
+            runtime.diagnostics["motion_params"] = {
+                "mass": float(pyfa_final.get("mass", 0.0) or 0.0),
+                "agility": float(pyfa_final.get("agility", 0.0) or 0.0),
+            }
+            fit = FitDescriptor(
+                fit_key=parsed.fit_key,
+                ship_name=hull.ship_name,
+                role=hull.role,
+                base_dps=profile.dps,
+                volley=profile.volley,
+                optimal_range=profile.optimal,
+                falloff=profile.falloff,
+                tracking=profile.tracking,
+                signature_radius=profile.sig_radius,
+                scan_resolution=profile.scan_resolution,
+                max_target_range=profile.max_target_range,
+                sensor_strength_gravimetric=profile.sensor_strength_gravimetric,
+                sensor_strength_ladar=profile.sensor_strength_ladar,
+                sensor_strength_magnetometric=profile.sensor_strength_magnetometric,
+                sensor_strength_radar=profile.sensor_strength_radar,
+                max_speed=profile.max_speed,
+                max_cap=profile.max_cap,
+                cap_recharge_time=profile.cap_recharge_time,
+                shield_hp=profile.shield_hp,
+                armor_hp=profile.armor_hp,
+                structure_hp=profile.structure_hp,
+                rep_amount=profile.rep_amount,
+                rep_cycle=profile.rep_cycle,
+                energy_warfare_resistance=profile.energy_warfare_resistance,
+                mass=profile.mass,
+                agility=profile.agility,
+            )
+            return runtime, fit, profile
+        finally:
+            if temporary_weapon_states:
+                for fitted_module, original_state in temporary_weapon_states:
+                    fitted_module.state = original_state
 
     def build(self, parsed: ParsedEftFit) -> tuple[FitRuntime, FitDescriptor]:
         if not self._pyfa.available:
