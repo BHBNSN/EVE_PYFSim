@@ -257,6 +257,19 @@ class RuntimeFromEftFactory:
             prev = float(store.get(key, 1.0) or 1.0)
             store[key] = max(0.01, prev * mult)
 
+        supports_active_state = False
+        active_state = getattr(self._pyfa, "_fitting_module_state_active", None)
+        if active_state is not None and hasattr(fitted_module, "isValidState"):
+            try:
+                supports_active_state = bool(fitted_module.isValidState(active_state))
+            except Exception:
+                supports_active_state = False
+        if not supports_active_state:
+            try:
+                supports_active_state = bool(item.isType("active"))
+            except Exception:
+                supports_active_state = False
+
         duration_ms = attr("duration", 0.0)
         speed_ms = attr("speed", 0.0)
         cycle_ms = duration_ms if duration_ms > 0 else speed_ms
@@ -559,7 +572,7 @@ class RuntimeFromEftFactory:
                 local_mult["dps"] = max(0.01, damage_scale)
 
         has_projected = bool(projected_mult or projected_add) or (is_command_burst and range_m > 0.0)
-        is_active_module = (cap_need > 0.0) or (cycle_ms > 0.0) or has_projected
+        is_active_module = supports_active_state and ((cap_need > 0.0) or (cycle_ms > 0.0) or has_projected)
         if self._is_weapon_like_group(group_name) and cycle_ms > 0.0:
             is_active_module = True
 
@@ -838,14 +851,9 @@ class RuntimeFromEftFactory:
 
             default_runtime_state = "ACTIVE" if self._is_weapon_like_group(group_name) else "ONLINE"
             runtime_state = str((state_by_module_id or {}).get(module_id, default_runtime_state) or default_runtime_state).upper()
-            if spec.offline or runtime_state == "OFFLINE":
-                module.state = offline_state
-            elif runtime_state == "OVERHEATED":
-                module.state = overheated_state if overheated_state is not None else active_state
-            elif runtime_state == "ONLINE":
-                module.state = online_state
-            else:
-                module.state = active_state
+            if spec.offline:
+                runtime_state = "OFFLINE"
+            module.state = _pyfa_module_state_from_runtime_state(self, module, runtime_state)
 
             fit.modules.append(module)
             fitted_modules.append((spec, module, charge_name))
@@ -1064,6 +1072,16 @@ class RuntimeFromEftFactory:
             hull=hull,
             skills=self._skills_default(),
             modules=modules,
+        )
+        runtime.diagnostics["runtime_controlled_module_ids"] = tuple(
+            str(module.module_id)
+            for module in modules
+            if _module_requires_control_state(module)
+        )
+        runtime.diagnostics["runtime_local_stateful_module_ids"] = tuple(
+            str(module.module_id)
+            for module in modules
+            if _module_affects_local_pyfa_profile(module)
         )
         runtime.diagnostics["pyfa_blueprint"] = {
             "ship_name": parsed.ship_name,
@@ -1654,16 +1672,32 @@ def _iter_precalculated_local_base_fit_candidates(
 
 def _pyfa_module_state_from_runtime_state(
     factory: RuntimeFromEftFactory,
+    fitted_module: Any,
     runtime_state: str,
 ) -> Any:
     state_name = str(runtime_state or "ACTIVE").upper()
+    offline_state = factory._pyfa._fitting_module_state_offline
+    online_state = factory._pyfa._fitting_module_state_online
+    active_state = factory._pyfa._fitting_module_state_active
+    overheated_state = factory._pyfa._fitting_module_state_overheated or active_state
     if state_name == "OFFLINE":
-        return factory._pyfa._fitting_module_state_offline
-    if state_name == "ONLINE":
-        return factory._pyfa._fitting_module_state_online
-    if state_name == "OVERHEATED":
-        return factory._pyfa._fitting_module_state_overheated or factory._pyfa._fitting_module_state_active
-    return factory._pyfa._fitting_module_state_active
+        candidates = [offline_state]
+    elif state_name == "ONLINE":
+        candidates = [online_state, offline_state]
+    elif state_name == "OVERHEATED":
+        candidates = [overheated_state, active_state, online_state, offline_state]
+    else:
+        candidates = [active_state, online_state, offline_state]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            if not hasattr(fitted_module, "isValidState") or fitted_module.isValidState(candidate):
+                return candidate
+        except Exception:
+            return candidate
+    return online_state if online_state is not None else offline_state
 
 
 def _apply_pyfa_local_state_map(
@@ -1676,7 +1710,7 @@ def _apply_pyfa_local_state_map(
         module_id = f"mod-{idx}"
         if module_id not in state_map:
             continue
-        fitted_module.state = _pyfa_module_state_from_runtime_state(factory, state_map[module_id])
+        fitted_module.state = _pyfa_module_state_from_runtime_state(factory, fitted_module, state_map[module_id])
 
 
 def _local_state_signature_distance(
@@ -1898,6 +1932,10 @@ def _module_group_has_any(module: ModuleRuntime, tokens: tuple[str, ...]) -> boo
     return any(token in group_name for token in tokens)
 
 
+def _module_requires_control_state(module: ModuleRuntime) -> bool:
+    return module.can_be_active()
+
+
 def _module_has_projected(module: ModuleRuntime) -> bool:
     return any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects)
 
@@ -2101,18 +2139,32 @@ def _precalculated_projected_source_fit_from_snapshot(
 
 
 def _runtime_module_state_map(runtime: FitRuntime) -> dict[str, str]:
-    return {str(module.module_id): str(module.state.value) for module in runtime.modules}
+    return {
+        str(module.module_id): str(module.normalized_state().value)
+        for module in runtime.modules
+    }
 
 
 def _module_affects_local_pyfa_profile(module: ModuleRuntime) -> bool:
     if _module_is_command_burst_module(module):
         return True
-    return any(effect.effect_class == EffectClass.LOCAL for effect in module.effects)
+    return any(
+        effect.effect_class == EffectClass.LOCAL and effect.state_required == ModuleState.ACTIVE
+        for effect in module.effects
+    )
 
 
 def _runtime_local_profile_state_map(runtime: FitRuntime) -> dict[str, str]:
+    cached_ids = runtime.diagnostics.get("runtime_local_stateful_module_ids")
+    if isinstance(cached_ids, tuple):
+        tracked_ids = {str(module_id) for module_id in cached_ids}
+        return {
+            str(module.module_id): str(module.normalized_state().value)
+            for module in runtime.modules
+            if str(module.module_id) in tracked_ids
+        }
     return {
-        str(module.module_id): str(module.state.value)
+        str(module.module_id): str(module.normalized_state().value)
         for module in runtime.modules
         if _module_affects_local_pyfa_profile(module)
     }
@@ -2253,7 +2305,7 @@ def _copy_dynamic_runtime_state(source: FitRuntime, target: FitRuntime) -> None:
         src = source_by_id.get(module.module_id)
         if src is None:
             continue
-        module.state = src.state
+        module.state = module.normalized_state(src.state)
         if module.charge_capacity > 0:
             module.charge_remaining = max(0.0, min(float(src.charge_remaining), float(module.charge_capacity)))
 

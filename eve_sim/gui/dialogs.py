@@ -682,12 +682,28 @@ class ShipStatusDialog(QDialog):
     def _module_has_projected_effects(module: ModuleRuntime) -> bool:
         return any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects)
 
-    def _module_requires_target(self, module: ModuleRuntime) -> bool:
-        if self._is_weapon_group(module.group):
+    @staticmethod
+    def _display_module_state(module: ModuleRuntime, raw_state: str, current_target_id: str | None) -> str:
+        try:
+            normalized = module.normalized_state(ModuleState[str(raw_state or "ONLINE").upper()])
+        except Exception:
+            normalized = module.normalized_state(ModuleState.ONLINE)
+        effective_state = normalized.value
+        if effective_state == "ACTIVE":
+            has_projected = ShipStatusDialog._module_has_projected_effects(module)
+            is_area_effect = ShipStatusDialog._is_area_effect_group(module.group)
+            target_required = ShipStatusDialog._module_requires_target(module)
+            if target_required and not current_target_id and (ShipStatusDialog._is_weapon_group(module.group) or (has_projected and not is_area_effect)):
+                effective_state = "ONLINE"
+        return effective_state
+
+    @staticmethod
+    def _module_requires_target(module: ModuleRuntime) -> bool:
+        if ShipStatusDialog._is_weapon_group(module.group):
             return True
-        if self._is_area_effect_group(module.group):
+        if ShipStatusDialog._is_area_effect_group(module.group):
             return False
-        return self._module_has_projected_effects(module)
+        return ShipStatusDialog._module_has_projected_effects(module)
 
     @staticmethod
     def _fmt_charge_amount(value: float) -> str:
@@ -897,7 +913,7 @@ class ShipStatusDialog(QDialog):
             for module in ship.runtime.modules:
                 parts = module.module_id.rsplit("-", 1)
                 if len(parts) == 2 and parts[1].isdigit():
-                    runtime_by_slot[int(parts[1])] = module.state.value
+                    runtime_by_slot[int(parts[1])] = module.normalized_state().value
                     runtime_module_by_slot[int(parts[1])] = module
             reactivation_by_module = {
                 str(mid): float(left)
@@ -920,18 +936,16 @@ class ShipStatusDialog(QDialog):
                 lines.append(f"  {tr(lang, 'status_module_none')}")
             else:
                 for module in ship.runtime.modules:
-                    effective_state = module.state.value
+                    effective_state = module.normalized_state().value
                     has_projected = self._module_has_projected_effects(module)
                     is_area_effect = self._is_area_effect_group(module.group)
-                    target_required = self._module_requires_target(module)
                     if self._is_weapon_group(module.group):
                         current_target_id = ship.combat.current_target
                     elif has_projected and not is_area_effect:
                         current_target_id = projected_by_module.get(module.module_id)
                     else:
                         current_target_id = None
-                    if effective_state == "ACTIVE" and target_required and not current_target_id:
-                        effective_state = "ONLINE"
+                    effective_state = self._display_module_state(module, effective_state, current_target_id)
                     cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
                     if cooldown_left > 0.0:
                         state_label = tr(lang, "state_REACTIVATING")
@@ -962,15 +976,13 @@ class ShipStatusDialog(QDialog):
                 if runtime_module is not None:
                     has_projected = self._module_has_projected_effects(runtime_module)
                     is_area_effect = self._is_area_effect_group(runtime_module.group)
-                    target_required = self._module_requires_target(runtime_module)
                     if self._is_weapon_group(runtime_module.group):
                         current_target_id = ship.combat.current_target
                     elif has_projected and not is_area_effect:
                         current_target_id = projected_by_slot.get(idx)
                     else:
                         current_target_id = None
-                    if state_key == "ACTIVE" and target_required and not current_target_id:
-                        state_key = "ONLINE"
+                    state_key = self._display_module_state(runtime_module, state_key, current_target_id)
                 cooldown_left = 0.0
                 if runtime_module is not None:
                     cooldown_left = reactivation_by_module.get(runtime_module.module_id, 0.0)

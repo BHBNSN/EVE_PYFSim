@@ -2054,7 +2054,7 @@ class MainWindow(QMainWindow):
                     if not state_name:
                         continue
                     if state_name in ModuleState.__members__:
-                        module.state = ModuleState[state_name]
+                        module.state = module.normalized_state(ModuleState[state_name])
 
     @staticmethod
     def _ship_signature(raw: dict) -> tuple:

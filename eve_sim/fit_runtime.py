@@ -87,6 +87,15 @@ class ModuleRuntime:
         }
         return rank[self.state] >= rank[required]
 
+    def can_be_active(self) -> bool:
+        return any(effect.state_required in {ModuleState.ACTIVE, ModuleState.OVERHEATED} for effect in self.effects)
+
+    def normalized_state(self, state: ModuleState | None = None) -> ModuleState:
+        candidate = self.state if state is None else state
+        if candidate in {ModuleState.ACTIVE, ModuleState.OVERHEATED} and not self.can_be_active():
+            return ModuleState.ONLINE
+        return candidate
+
 
 @dataclass(slots=True)
 class FitRuntime:

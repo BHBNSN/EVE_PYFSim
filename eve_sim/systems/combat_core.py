@@ -192,11 +192,20 @@ class CombatSystem:
         cached = runtime.diagnostics.get("runtime_local_state_signature")
         if isinstance(cached, tuple):
             return cached
-        signature = tuple(
-            (str(module.module_id), str(module.state.value or "ONLINE").upper())
-            for module in runtime.modules
-            if self._module_static_metadata(module).affects_local_pyfa_profile
-        )
+        tracked_ids = runtime.diagnostics.get("runtime_local_stateful_module_ids")
+        if isinstance(tracked_ids, tuple):
+            tracked_id_set = {str(module_id) for module_id in tracked_ids}
+            signature = tuple(
+                (str(module.module_id), str(module.state.value or "ONLINE").upper())
+                for module in runtime.modules
+                if str(module.module_id) in tracked_id_set
+            )
+        else:
+            signature = tuple(
+                (str(module.module_id), str(module.state.value or "ONLINE").upper())
+                for module in runtime.modules
+                if self._module_static_metadata(module).affects_local_pyfa_profile
+            )
         runtime.diagnostics["runtime_local_state_signature"] = signature
         return signature
 
@@ -441,13 +450,23 @@ class CombatSystem:
         if isinstance(cached, RuntimeModuleBuckets) and cached.module_count == len(runtime.modules):
             return cached
 
+        controlled_ids = runtime.diagnostics.get("runtime_controlled_module_ids")
+        controlled_id_set = {str(module_id) for module_id in controlled_ids} if isinstance(controlled_ids, tuple) else None
         controlled_entries: list[tuple[Any, ModuleStaticMetadata]] = []
         command_entries: list[tuple[Any, ModuleStaticMetadata]] = []
         runtime_projected_entries: list[tuple[Any, ModuleStaticMetadata]] = []
         pyfa_projected_entries: list[tuple[Any, ModuleStaticMetadata]] = []
 
-        for module, metadata in zip(runtime.modules, self._runtime_module_metadata_list(runtime)):
-            if metadata.active_effects:
+        for module in runtime.modules:
+            module_id = str(module.module_id)
+            if controlled_id_set is not None and module_id not in controlled_id_set:
+                if not any(effect.effect_class == EffectClass.PROJECTED for effect in module.effects):
+                    continue
+            metadata = self._module_static_metadata(module)
+            if controlled_id_set is not None:
+                if module_id in controlled_id_set:
+                    controlled_entries.append((module, metadata))
+            elif metadata.active_effects:
                 controlled_entries.append((module, metadata))
             if metadata.is_command_burst:
                 command_entries.append((module, metadata))
@@ -2642,11 +2661,20 @@ class CombatSystem:
 
             if local_signature_dirty:
                 runtime.diagnostics.pop("runtime_local_state_signature", None)
-                runtime.diagnostics["runtime_local_state_signature"] = tuple(
-                    (str(module.module_id), str(module.state.value or "ONLINE").upper())
-                    for module in runtime.modules
-                    if self._module_static_metadata(module).affects_local_pyfa_profile
-                )
+                tracked_ids = runtime.diagnostics.get("runtime_local_stateful_module_ids")
+                if isinstance(tracked_ids, tuple):
+                    tracked_id_set = {str(module_id) for module_id in tracked_ids}
+                    runtime.diagnostics["runtime_local_state_signature"] = tuple(
+                        (str(module.module_id), str(module.state.value or "ONLINE").upper())
+                        for module in runtime.modules
+                        if str(module.module_id) in tracked_id_set
+                    )
+                else:
+                    runtime.diagnostics["runtime_local_state_signature"] = tuple(
+                        (str(module.module_id), str(module.state.value or "ONLINE").upper())
+                        for module in runtime.modules
+                        if self._module_static_metadata(module).affects_local_pyfa_profile
+                    )
             if active_pyfa_remote_inputs_dirty:
                 runtime.diagnostics.pop("runtime_has_active_pyfa_remote_inputs", None)
                 runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = self._runtime_has_active_pyfa_remote_inputs(runtime)

@@ -108,7 +108,10 @@ class SimulationEngine:
         for ship_id, ship in self.world.ships.items():
             module_states: dict[str, str] = {}
             if ship.runtime is not None:
-                module_states = {module.module_id: module.state.value for module in ship.runtime.modules}
+                module_states = {
+                    module.module_id: module.normalized_state().value
+                    for module in ship.runtime.modules
+                }
             ships[ship_id] = {
                 "ship_id": ship_id,
                 "team": ship.team.value,
