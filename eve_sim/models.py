@@ -151,6 +151,10 @@ class CombatState:
     last_enemy_weapon_damaged_at: float = -1e9
     module_cycle_timers: dict[str, float] = field(default_factory=dict)
     module_reactivation_timers: dict[str, float] = field(default_factory=dict)
+    module_decision_pending: set[str] = field(default_factory=set)
+    module_decision_pending_signature: tuple[str, ...] = field(default_factory=tuple)
+    module_decision_propulsion_active: bool | None = None
+    module_decision_recent_enemy_damage_active: bool | None = None
 
 
 @dataclass(slots=True)

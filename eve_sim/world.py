@@ -16,8 +16,8 @@ class WorldState:
     squad_propulsion_commands: dict[str, bool] = field(default_factory=dict)
     squad_leader_speed_limits: dict[str, float] = field(default_factory=dict)
     squad_focus_queues: dict[str, list[str]] = field(default_factory=dict)
-    squad_prelocked_targets: dict[str, set[str]] = field(default_factory=dict)
-    squad_prelock_timers: dict[str, dict[str, float]] = field(default_factory=dict)
+    squad_prelocked_targets: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    squad_prelock_timers: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
 
     def by_team(self, team: Team) -> list[ShipEntity]:
         return [s for s in self.ships.values() if s.team == team and s.vital.alive]

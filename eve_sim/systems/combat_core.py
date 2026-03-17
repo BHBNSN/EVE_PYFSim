@@ -10,18 +10,27 @@ from typing import Any
 
 import numpy as np
 
-from .fleet_setup import (
+from ..combat_control_workset import (
+    enqueue_control_signal_modules,
+    ensure_ship_module_decision_pending,
+    module_keeps_decision_pending,
+    runtime_decision_rule_groups,
+    runtime_controlled_entry_lookup,
+    runtime_controlled_module_ids,
+    ship_candidate_module_ids,
+)
+from ..fleet_setup import (
     _module_affects_local_pyfa_profile,
     _runtime_local_profile_state_signature,
     get_runtime_resolve_cache_key,
     resolve_runtime_from_pyfa_runtime,
 )
-from .fit_runtime import EffectClass, ModuleEffect, ModuleState, ProjectedImpact, RuntimeStatEngine
-from .math2d import Vector2
-from .models import ShipProfile, Team
-from .pyfa_bridge import PyfaBridge
-from .sim_logging import log_sim_event
-from .world import WorldState
+from ..fit_runtime import EffectClass, FitRuntime, ModuleEffect, ModuleRuntime, ModuleState, ProjectedImpact, RuntimeStatEngine
+from ..math2d import Vector2
+from ..models import ShipProfile, Team
+from ..pyfa_bridge import PyfaBridge
+from ..sim_logging import log_sim_event
+from ..world import WorldState
 
 
 DamageTuple = tuple[float, float, float, float]
@@ -86,307 +95,18 @@ _FORMULA_PROJECTED_KEYS = frozenset(
     }
 )
 
+_RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "runtime_module_static_metadata",
+        "runtime_module_buckets",
+        "runtime_controlled_module_ids",
+        "runtime_controlled_entry_lookup",
+        "runtime_decision_rule_groups",
+    }
+)
 
-@dataclass(frozen=True, slots=True)
-class ModuleDecisionRule:
-    rule_id: str
-    activation_mode: str
-    target_mode: str
-    cap_threshold: float = 0.0
-
-
-@dataclass(slots=True)
-class CycleTargetSnapshot:
-    distance: float
-    effect_strengths: dict[int, float] = field(default_factory=dict)
-    effect_damage_factors: dict[int, float] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class ModuleStaticMetadata:
-    active_effects: tuple[ModuleEffect, ...]
-    projected_effects: tuple[tuple[int, ModuleEffect], ...]
-    cycle_cost: float
-    cycle_time: float
-    reactivation_delay: float
-    has_projected: bool
-    target_side: str
-    is_command_burst: bool
-    is_smart_bomb: bool
-    is_burst_jammer: bool
-    is_area_effect: bool
-    is_weapon: bool
-    has_projected_rep: bool
-    is_cap_warfare: bool
-    is_target_ewar: bool
-    is_ecm: bool
-    uses_pyfa_projected_profile: bool
-    is_hardener: bool
-    is_cap_booster: bool
-    is_propulsion: bool
-    is_damage_control: bool
-    affects_local_pyfa_profile: bool
-    decision_rule: ModuleDecisionRule
-
-
-def _scale_damage(dmg: DamageTuple, factor: float) -> DamageTuple:
-    return dmg[0] * factor, dmg[1] * factor, dmg[2] * factor, dmg[3] * factor
-
-
-def _sum_damage(dmg: DamageTuple) -> float:
-    return dmg[0] + dmg[1] + dmg[2] + dmg[3]
-
-
-def _layer_effective_damage(dmg: DamageTuple, resonances: DamageTuple) -> float:
-    return (
-        dmg[0] * resonances[0]
-        + dmg[1] * resonances[1]
-        + dmg[2] * resonances[2]
-        + dmg[3] * resonances[3]
-    )
-
-
-def _apply_damage_sequence(shield: float, armor: float, structure: float, dmg: DamageTuple, target_profile) -> tuple[float, float, float]:
-    remaining = dmg
-    layers = [
-        ("shield", shield, (target_profile.shield_resonance_em, target_profile.shield_resonance_thermal, target_profile.shield_resonance_kinetic, target_profile.shield_resonance_explosive)),
-        ("armor", armor, (target_profile.armor_resonance_em, target_profile.armor_resonance_thermal, target_profile.armor_resonance_kinetic, target_profile.armor_resonance_explosive)),
-        ("structure", structure, (target_profile.structure_resonance_em, target_profile.structure_resonance_thermal, target_profile.structure_resonance_kinetic, target_profile.structure_resonance_explosive)),
-    ]
-
-    new_vals = {"shield": shield, "armor": armor, "structure": structure}
-    for layer_name, layer_hp, layer_res in layers:
-        if layer_hp <= 0:
-            continue
-        eff = _layer_effective_damage(remaining, layer_res)
-        if eff <= 0:
-            continue
-        if eff <= layer_hp:
-            new_vals[layer_name] = layer_hp - eff
-            return new_vals["shield"], new_vals["armor"], new_vals["structure"]
-
-        consumed_ratio = layer_hp / eff
-        consumed_ratio = max(0.0, min(1.0, consumed_ratio))
-        new_vals[layer_name] = 0.0
-        remaining = _scale_damage(remaining, 1.0 - consumed_ratio)
-
-    return new_vals["shield"], new_vals["armor"], new_vals["structure"]
-
-
-class PerceptionSystem:
-    def __init__(self, sensor_range: float = 250_000.0) -> None:
-        self.sensor_range = sensor_range
-
-    def run(self, world: WorldState) -> None:
-        alive = [s for s in world.ships.values() if s.vital.alive]
-        if not alive:
-            return
-        if len(alive) <= 24:
-            sensor = self.sensor_range
-            for source in alive:
-                source.perception = [
-                    target.ship_id
-                    for target in alive
-                    if target.ship_id != source.ship_id
-                    and source.nav.position.distance_to(target.nav.position) <= sensor
-                ]
-            return
-
-        min_x = max_x = float(alive[0].nav.position.x)
-        min_y = max_y = float(alive[0].nav.position.y)
-        for ship in alive[1:]:
-            pos = ship.nav.position
-            min_x = min(min_x, float(pos.x))
-            max_x = max(max_x, float(pos.x))
-            min_y = min(min_y, float(pos.y))
-            max_y = max(max_y, float(pos.y))
-        if math.hypot(max_x - min_x, max_y - min_y) <= self.sensor_range:
-            alive_ids = [ship.ship_id for ship in alive]
-            for index, ship in enumerate(alive):
-                ship.perception = alive_ids[:index] + alive_ids[index + 1:]
-            return
-
-        pos = np.array([(s.nav.position.x, s.nav.position.y) for s in alive], dtype=np.float64)
-        delta = pos[:, None, :] - pos[None, :, :]
-        dist = np.sqrt(np.sum(delta * delta, axis=-1))
-        for i, ship in enumerate(alive):
-            mask = (dist[i] <= self.sensor_range) & (dist[i] > 0)
-            ship.perception = [alive[j].ship_id for j in np.where(mask)[0].tolist()]
-
-
-class MovementSystem:
-    def __init__(self, battlefield_radius: float) -> None:
-        self.battlefield_radius = battlefield_radius
-        self._large_angle_threshold_deg = 45.0
-
-    @staticmethod
-    def _wrap_angle_deg(angle: float) -> float:
-        while angle <= -180.0:
-            angle += 360.0
-        while angle > 180.0:
-            angle -= 360.0
-        return angle
-
-    @staticmethod
-    def _align_time_for(max_speed: float) -> float:
-        speed = max(150.0, float(max_speed))
-        return max(2.5, min(14.0, 14_000.0 / speed))
-
-    @staticmethod
-    def _heading_vector(angle_deg: float) -> Vector2:
-        facing_rad = math.radians(angle_deg)
-        return Vector2(math.cos(facing_rad), math.sin(facing_rad))
-
-    @staticmethod
-    def _motion_params(ship) -> tuple[float, float]:
-        profile = getattr(ship, "profile", None)
-        if profile is not None:
-            try:
-                mass = float(getattr(profile, "mass", 0.0) or 0.0)
-                agility = float(getattr(profile, "agility", 0.0) or 0.0)
-            except Exception:
-                mass = 0.0
-                agility = 0.0
-            if mass > 0.0 and agility > 0.0:
-                return mass, agility
-
-        runtime = getattr(ship, "runtime", None)
-        if runtime is not None:
-            diagnostics = getattr(runtime, "diagnostics", None)
-            if isinstance(diagnostics, dict):
-                raw = diagnostics.get("motion_params")
-                if isinstance(raw, dict):
-                    mass_raw = raw.get("mass")
-                    agility_raw = raw.get("agility")
-                    try:
-                        mass = float(mass_raw) if mass_raw is not None else 0.0
-                        agility = float(agility_raw) if agility_raw is not None else 0.0
-                    except Exception:
-                        mass = 0.0
-                        agility = 0.0
-                    if mass > 0.0 and agility > 0.0:
-                        return mass, agility
-        return 0.0, 0.0
-
-    @classmethod
-    def _motion_tau(cls, ship, speed_cap: float) -> float:
-        mass, agility = cls._motion_params(ship)
-        if mass > 0.0 and agility > 0.0:
-            return max(0.25, (mass * agility) / 1_000_000.0)
-        return max(0.25, cls._align_time_for(speed_cap))
-
-    @staticmethod
-    def _exponential_velocity_step(current_velocity: Vector2, desired_velocity: Vector2, tau: float, dt: float) -> tuple[Vector2, Vector2]:
-        tau = max(1e-6, float(tau))
-        decay = math.exp(-float(dt) / tau)
-        new_velocity = current_velocity * decay + desired_velocity * (1.0 - decay)
-        displacement = desired_velocity * float(dt) + (current_velocity - desired_velocity) * (tau * (1.0 - decay))
-        return new_velocity, displacement
-
-    @staticmethod
-    def _stable_turn_radius(speed: float, speed_cap: float, tau: float) -> float:
-        orbit_speed = max(0.0, min(float(speed), float(speed_cap) * 0.999999))
-        if orbit_speed <= 1e-6:
-            return 0.0
-        turn_budget = max(0.0, float(speed_cap) ** 2 - orbit_speed ** 2)
-        if turn_budget <= 1e-9:
-            return float("inf")
-        return max(0.0, float(tau)) * orbit_speed * orbit_speed / math.sqrt(turn_budget)
-
-    @classmethod
-    def _stable_angular_velocity(cls, speed: float, speed_cap: float, tau: float) -> float:
-        radius = cls._stable_turn_radius(speed, speed_cap, tau)
-        if radius == 0.0:
-            return float("inf")
-        if math.isinf(radius):
-            return 0.0
-        return max(0.0, float(speed)) / radius
-
-    def _effective_speed_cap(self, world: WorldState, ship) -> float:
-        base_cap = max(1.0, float(ship.nav.max_speed))
-        squad_key = f"{ship.team.value}:{ship.squad_id}"
-        leader_id = world.squad_leaders.get(squad_key)
-        if leader_id != ship.ship_id:
-            return base_cap
-        cap = float(world.squad_leader_speed_limits.get(squad_key, 0.0) or 0.0)
-        if cap <= 0.0:
-            return base_cap
-        return max(1.0, min(base_cap, cap))
-
-    def _update_velocity_with_inertia(self, world: WorldState, ship, dt: float) -> Vector2:
-        target = ship.nav.command_target
-        speed_cap = self._effective_speed_cap(world, ship)
-        desired_angle = ship.nav.facing_deg
-        target_speed = 0.0
-        current_velocity = ship.nav.velocity
-        current_speed = current_velocity.length()
-
-        if target is not None:
-            to_target = target - ship.nav.position
-            distance = to_target.length()
-            if distance > max(120.0, ship.nav.radius * 1.5):
-                desired_angle = to_target.angle_deg()
-                target_speed = speed_cap
-        elif bool(ship.nav.propulsion_command_active):
-            if current_speed > 1e-6:
-                # Keep burning along the existing travel vector when propulsion toggles on mid-flight.
-                desired_angle = current_velocity.angle_deg()
-                target_speed = speed_cap
-
-        tau = self._motion_tau(ship, speed_cap)
-        desired_velocity = self._heading_vector(desired_angle) * target_speed
-        new_velocity, displacement = self._exponential_velocity_step(current_velocity, desired_velocity, tau, dt)
-
-        if target_speed > 1e-6 and current_speed > 1e-6:
-            current_heading = current_velocity.angle_deg()
-            desired_turn = abs(self._wrap_angle_deg(desired_angle - current_heading))
-            if desired_turn <= self._large_angle_threshold_deg:
-                new_speed = new_velocity.length()
-                raw_heading = new_velocity.angle_deg() if new_speed > 1e-6 else desired_angle
-                angular_velocity = self._stable_angular_velocity(max(current_speed, new_speed), speed_cap, tau)
-                max_turn_step_deg = 180.0 if math.isinf(angular_velocity) else math.degrees(angular_velocity * dt)
-                heading_delta = self._wrap_angle_deg(raw_heading - current_heading)
-                if abs(heading_delta) > max_turn_step_deg:
-                    capped_heading = self._wrap_angle_deg(
-                        current_heading + max(-max_turn_step_deg, min(max_turn_step_deg, heading_delta))
-                    )
-                    new_velocity = self._heading_vector(capped_heading) * new_speed
-                    displacement = (current_velocity + new_velocity) * (0.5 * dt)
-
-        new_speed = new_velocity.length()
-        if new_speed > speed_cap:
-            new_velocity = new_velocity.normalized() * speed_cap
-            displacement = (current_velocity + new_velocity) * (0.5 * dt)
-            new_speed = speed_cap
-
-        ship.nav.velocity = new_velocity
-        ship.nav.facing_deg = new_velocity.angle_deg() if new_speed > 1e-6 else desired_angle
-        return displacement
-
-    def run(self, world: WorldState, dt: float) -> None:
-        for ship in world.ships.values():
-            if not ship.vital.alive:
-                continue
-            profile_speed = float(getattr(ship.profile, "max_speed", ship.nav.max_speed) or ship.nav.max_speed)
-            if profile_speed > 0.0:
-                ship.nav.max_speed = profile_speed
-
-            displacement = self._update_velocity_with_inertia(world, ship, dt)
-            next_pos = ship.nav.position + displacement
-            if next_pos.length() > self.battlefield_radius:
-                n = next_pos.normalized()
-                next_pos = n * self.battlefield_radius
-                ship.nav.velocity = Vector2(0.0, 0.0)
-
-            for beacon in world.beacons.values():
-                dist = next_pos.distance_to(beacon.position)
-                if dist < beacon.radius + ship.nav.radius:
-                    push_dir = (next_pos - beacon.position).normalized()
-                    if push_dir.length() == 0:
-                        push_dir = Vector2(1.0, 0.0)
-                    next_pos = beacon.position + push_dir * (beacon.radius + ship.nav.radius)
-
-            ship.nav.position = next_pos
+from .models import *
+from .models import _sum_damage, _scale_damage, _layer_effective_damage, _apply_damage_sequence
 
 
 class CombatSystem:
@@ -425,7 +145,7 @@ class CombatSystem:
     ) -> None:
         self.logger = logger
         self.event_logging_enabled = bool(detailed_logging)
-        self.detailed_logging = False
+        self.detailed_logging = bool(detailed_logging)
         self.hotspot_logging_enabled = bool(hotspot_logging)
         try:
             self.event_merge_window_sec = max(0.1, float(merge_window_sec))
@@ -716,6 +436,131 @@ class CombatSystem:
         runtime.diagnostics["runtime_module_static_metadata"] = metadata_list
         return metadata_list
 
+    def _runtime_module_buckets(self, runtime) -> RuntimeModuleBuckets:
+        cached = runtime.diagnostics.get("runtime_module_buckets")
+        if isinstance(cached, RuntimeModuleBuckets) and cached.module_count == len(runtime.modules):
+            return cached
+
+        controlled_entries: list[tuple[Any, ModuleStaticMetadata]] = []
+        command_entries: list[tuple[Any, ModuleStaticMetadata]] = []
+        runtime_projected_entries: list[tuple[Any, ModuleStaticMetadata]] = []
+        pyfa_projected_entries: list[tuple[Any, ModuleStaticMetadata]] = []
+
+        for module, metadata in zip(runtime.modules, self._runtime_module_metadata_list(runtime)):
+            if metadata.active_effects:
+                controlled_entries.append((module, metadata))
+            if metadata.is_command_burst:
+                command_entries.append((module, metadata))
+            if metadata.projected_effects:
+                if metadata.uses_pyfa_projected_profile:
+                    pyfa_projected_entries.append((module, metadata))
+                else:
+                    runtime_projected_entries.append((module, metadata))
+
+        buckets = RuntimeModuleBuckets(
+            module_count=len(runtime.modules),
+            controlled_entries=tuple(controlled_entries),
+            command_entries=tuple(command_entries),
+            runtime_projected_entries=tuple(runtime_projected_entries),
+            pyfa_projected_entries=tuple(pyfa_projected_entries),
+        )
+        runtime.diagnostics["runtime_module_buckets"] = buckets
+        return buckets
+
+    def _runtime_controlled_module_ids(self, runtime) -> tuple[str, ...]:
+        return runtime_controlled_module_ids(runtime, self._runtime_module_buckets(runtime).controlled_entries)
+
+    def _runtime_controlled_entry_lookup(self, runtime) -> dict[str, tuple[Any, ModuleStaticMetadata]]:
+        controlled_entries = self._runtime_module_buckets(runtime).controlled_entries
+        controlled_ids = self._runtime_controlled_module_ids(runtime)
+        return runtime_controlled_entry_lookup(runtime, controlled_entries, controlled_ids)
+
+    def _runtime_decision_rule_groups(self, runtime) -> dict[str, dict[str, tuple[str, ...]]]:
+        return runtime_decision_rule_groups(runtime, self._runtime_module_buckets(runtime).controlled_entries)
+
+    def _ensure_ship_module_decision_pending(self, ship, runtime) -> None:
+        controlled_ids = self._runtime_controlled_module_ids(runtime)
+        ensure_ship_module_decision_pending(ship, controlled_ids)
+
+    def _enqueue_ship_control_signal_modules(
+        self,
+        world: WorldState,
+        ship,
+        runtime,
+        *,
+        focus_changed: bool,
+    ) -> None:
+        enqueue_control_signal_modules(
+            ship,
+            runtime_decision_rule_groups(runtime, self._runtime_module_buckets(runtime).controlled_entries),
+            propulsion_active=bool(ship.nav.propulsion_command_active),
+            recent_enemy_weapon_damage_active=(
+                (
+                    float(world.now)
+                    - float(
+                        getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
+                        if getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) is not None
+                        else -1e9
+                    )
+                )
+                <= 30.0
+            ),
+            focus_changed=focus_changed,
+        )
+
+    def _ship_candidate_control_entries(self, ship, runtime) -> tuple[tuple[Any, ModuleStaticMetadata], ...]:
+        # Keep candidate selection outside the main control loop so the staged active-set refactor
+        # can evolve independently from activation semantics.
+        controlled_entries = self._runtime_module_buckets(runtime).controlled_entries
+        controlled_ids = runtime_controlled_module_ids(runtime, controlled_entries)
+        ensure_ship_module_decision_pending(ship, controlled_ids)
+        candidate_ids = ship_candidate_module_ids(ship)
+
+        if not candidate_ids:
+            return ()
+
+        lookup = runtime_controlled_entry_lookup(runtime, controlled_entries, controlled_ids)
+        ordered_entries: list[tuple[Any, ModuleStaticMetadata]] = []
+        for module_id in controlled_ids:
+            if module_id not in candidate_ids:
+                continue
+            entry = lookup.get(module_id)
+            if entry is not None:
+                ordered_entries.append(entry)
+        return tuple(ordered_entries)
+
+    def _module_keeps_decision_pending(self, ship, module, metadata: ModuleStaticMetadata) -> bool:
+        return self._module_keeps_decision_pending_with_context(
+            ship,
+            module,
+            metadata,
+            propulsion_active=bool(ship.nav.propulsion_command_active),
+            recent_enemy_weapon_damage_active=False,
+            has_focus_queue=False,
+        )
+
+    def _module_keeps_decision_pending_with_context(
+        self,
+        ship,
+        module,
+        metadata: ModuleStaticMetadata,
+        *,
+        propulsion_active: bool,
+        recent_enemy_weapon_damage_active: bool,
+        has_focus_queue: bool,
+    ) -> bool:
+        decision_rule = metadata.decision_rule
+        return module_keeps_decision_pending(
+            ship,
+            module,
+            cycle_time=metadata.cycle_time,
+            activation_mode=decision_rule.activation_mode,
+            target_mode=decision_rule.target_mode,
+            propulsion_active=propulsion_active,
+            recent_enemy_weapon_damage_active=recent_enemy_weapon_damage_active,
+            has_focus_queue=has_focus_queue,
+        )
+
     def _validate_cached_pyfa_base_profiles(
         self,
         world: WorldState,
@@ -755,7 +600,7 @@ class CombatSystem:
             signature.append(
                 (
                     str(snapshot.get("fit_key", "") or ""),
-                    tuple(sorted((str(module_id), str(state)) for module_id, state in state_by_module_id.items())),
+                    tuple((str(module_id), str(state)) for module_id, state in state_by_module_id.items()),
                 )
             )
         return tuple(signature)
@@ -797,7 +642,7 @@ class CombatSystem:
             signature.append(
                 (
                     str(snapshot.get("fit_key", "") or ""),
-                    tuple(sorted((str(module_id), str(state)) for module_id, state in state_by_module_id.items())),
+                    tuple((str(module_id), str(state)) for module_id, state in state_by_module_id.items()),
                     cls._command_snapshot_list_signature(command_snapshots),
                     distance_mode,
                     tuple(cls._formula_effect_signature(raw) for raw in formula_effects),
@@ -814,12 +659,17 @@ class CombatSystem:
         cached = runtime.diagnostics.get("runtime_has_active_pyfa_remote_inputs")
         if isinstance(cached, bool):
             return cached
-        for module in runtime.modules:
+        buckets = self._runtime_module_buckets(runtime)
+        for module, _metadata in buckets.command_entries:
             if str(module.state.value or "ONLINE").upper() not in {"ACTIVE", "OVERHEATED"}:
                 continue
-            if self._module_affects_pyfa_remote_inputs(module):
-                runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = True
-                return True
+            runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = True
+            return True
+        for module, _metadata in buckets.pyfa_projected_entries:
+            if str(module.state.value or "ONLINE").upper() not in {"ACTIVE", "OVERHEATED"}:
+                continue
+            runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = True
+            return True
         runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = False
         return False
 
@@ -970,6 +820,43 @@ class CombatSystem:
                 module.charge_remaining = max(0.0, min(float(source_module.charge_remaining), float(module.charge_capacity)))
 
     @staticmethod
+    def _clone_resolved_runtime_for_ship(source_runtime, resolved_runtime) -> FitRuntime:
+        # Clone only the mutable runtime shell. Avoid generic deepcopy so batched Pyfa refresh
+        # does not recursively copy cached metadata and immutable fit graph fragments.
+        diagnostics = {
+            key: value
+            for key, value in source_runtime.diagnostics.items()
+            if key not in _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS
+        }
+        diagnostics.update(
+            {
+                key: value
+                for key, value in resolved_runtime.diagnostics.items()
+                if key not in _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS
+            }
+        )
+        modules = [
+            ModuleRuntime(
+                module_id=str(module.module_id),
+                group=str(module.group),
+                state=module.state,
+                effects=list(module.effects),
+                charge_capacity=int(module.charge_capacity),
+                charge_rate=float(module.charge_rate),
+                charge_remaining=float(module.charge_remaining),
+                charge_reload_time=float(module.charge_reload_time),
+            )
+            for module in resolved_runtime.modules
+        ]
+        return FitRuntime(
+            fit_key=str(source_runtime.fit_key),
+            hull=resolved_runtime.hull,
+            skills=resolved_runtime.skills,
+            modules=modules,
+            diagnostics=diagnostics,
+        )
+
+    @staticmethod
     def _runtime_offline_module_signature(runtime) -> int:
         signature = 0
         for index, module in enumerate(runtime.modules):
@@ -987,7 +874,7 @@ class CombatSystem:
             return float(cached_minimum)
 
         minimum: float | None = None
-        for module, metadata in zip(runtime.modules, self._runtime_module_metadata_list(runtime)):
+        for module, metadata in self._runtime_module_buckets(runtime).controlled_entries:
             if module.state == module.state.OFFLINE:
                 continue
             cycle_time = metadata.cycle_time
@@ -1048,12 +935,9 @@ class CombatSystem:
             for jam_until in ship.combat.ecm_jam_sources.values():
                 note_duration(float(jam_until) - now)
 
-            last_enemy_damage = float(getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) or -1e9)
+            raw_last_enemy_damage = getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
+            last_enemy_damage = float(raw_last_enemy_damage if raw_last_enemy_damage is not None else -1e9)
             note_duration(30.0 - (now - last_enemy_damage))
-
-        for timers in world.squad_prelock_timers.values():
-            for remaining in timers.values():
-                note_duration(remaining)
 
         if abs(slice_dt - float(max_dt)) <= epsilon:
             note_duration(self._minimum_potential_cycle_time(world))
@@ -1323,6 +1207,8 @@ class CombatSystem:
         source,
         module,
         projected_target_id: str | None,
+        *,
+        area_candidates: list | None = None,
     ) -> None:
         metadata = self._module_static_metadata(module)
         snapshot_key = self._module_cycle_snapshot_key(source.ship_id, module.module_id)
@@ -1358,8 +1244,26 @@ class CombatSystem:
 
         target_snapshots: dict[str, CycleTargetSnapshot] = {}
 
+        if len(projected_effects) == 1:
+            effect_index, effect = projected_effects[0]
+            for target in self._iter_area_targets_in_range(world, source, module, effect, candidates=area_candidates):
+                distance = source.nav.position.distance_to(target.nav.position)
+                strength = self._projected_strength(effect, distance)
+                if strength <= 0.0:
+                    continue
+                target_snapshots[target.ship_id] = CycleTargetSnapshot(
+                    distance=distance,
+                    effect_strengths={effect_index: max(0.0, min(1.0, strength))},
+                )
+
+            if target_snapshots:
+                self._module_cycle_target_snapshots[snapshot_key] = target_snapshots
+            else:
+                self._module_cycle_target_snapshots.pop(snapshot_key, None)
+            return
+
         for _effect_index, effect in projected_effects:
-            for target in self._iter_area_targets_in_range(world, source, module, effect):
+            for target in self._iter_area_targets_in_range(world, source, module, effect, candidates=area_candidates):
                 distance = source.nav.position.distance_to(target.nav.position)
                 existing = target_snapshots.get(target.ship_id)
                 if existing is None:
@@ -1499,9 +1403,7 @@ class CombatSystem:
         for source in world.ships.values():
             if not source.vital.alive or source.runtime is None:
                 continue
-            for module, metadata in zip(source.runtime.modules, self._runtime_module_metadata_list(source.runtime)):
-                if metadata.uses_pyfa_projected_profile:
-                    continue
+            for module, metadata in self._runtime_module_buckets(source.runtime).runtime_projected_entries:
                 for effect_index, effect in metadata.projected_effects:
                     if not module.is_active_for(effect.state_required):
                         continue
@@ -1613,14 +1515,15 @@ class CombatSystem:
     def _candidates_in_projected_range(self, source, module, candidates: list) -> list:
         return [candidate for candidate in candidates if candidate.vital.alive and self._module_in_projected_range(source, candidate, module)]
 
-    def _iter_area_targets_in_range(self, world: WorldState, source, module, effect) -> list:
+    def _iter_area_targets_in_range(self, world: WorldState, source, module, effect, *, candidates: list | None = None) -> list:
         targets: list = []
         metadata = self._module_static_metadata(module)
         include_self = metadata.is_command_burst
         same_team_only = metadata.is_command_burst
         max_range = self._projected_max_range(effect)
 
-        for candidate in world.ships.values():
+        candidate_iterable = candidates if candidates is not None else world.ships.values()
+        for candidate in candidate_iterable:
             if not candidate.vital.alive:
                 continue
             if candidate.ship_id == source.ship_id and not include_self:
@@ -1644,12 +1547,8 @@ class CombatSystem:
             if not isinstance(blueprint, dict):
                 continue
 
-            command_modules = [
-                module
-                for module in source.runtime.modules
-                if self._module_static_metadata(module).is_command_burst
-            ]
-            if not command_modules:
+            command_entries = self._runtime_module_buckets(source.runtime).command_entries
+            if not command_entries:
                 continue
 
             base_state_by_module_id: dict[str, str] = {}
@@ -1657,7 +1556,7 @@ class CombatSystem:
             active_targets_by_module_id: dict[str, set[str]] = {}
             covered_targets: set[str] = set()
 
-            for module in command_modules:
+            for module, _metadata in command_entries:
                 state_value = str(module.state.value or "ONLINE").upper()
                 base_state_by_module_id[module.module_id] = "ONLINE" if state_value in {"ACTIVE", "OVERHEATED"} else state_value
                 if state_value not in {"ACTIVE", "OVERHEATED"}:
@@ -1890,7 +1789,7 @@ class CombatSystem:
             for index, pending in enumerate(pending_group):
                 source_runtime = pending["runtime"]
                 ship = pending["ship"]
-                target_runtime = resolved_runtime if index == 0 else deepcopy(resolved_runtime)
+                target_runtime = resolved_runtime if index == 0 else self._clone_resolved_runtime_for_ship(source_runtime, resolved_runtime)
                 target_runtime.fit_key = source_runtime.fit_key
                 minimum_potential_cycle_time = self._runtime_minimum_potential_cycle_time(source_runtime)
 
@@ -2087,7 +1986,8 @@ class CombatSystem:
         if rule.activation_mode == "cap_or_low_hp":
             return cap_ratio >= max(0.0, float(rule.cap_threshold)) or hp_ratio < 0.5
         if rule.activation_mode == "recent_enemy_weapon_damage":
-            last_hit_at = float(getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) or -1e9)
+            raw_last_hit_at = getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
+            last_hit_at = float(raw_last_hit_at if raw_last_hit_at is not None else -1e9)
             return (float(world.now) - last_hit_at) <= 30.0
         if rule.activation_mode == "enemy_in_area":
             return self._module_has_area_enemies_in_range(world, ship, module)
@@ -2391,53 +2291,73 @@ class CombatSystem:
                 continue
 
             runtime = ship.runtime
+            focus_key = self._focus_key(ship.team, ship.squad_id)
+            focus_queue = tuple(str(target_id) for target_id in world.squad_focus_queues.get(focus_key, []))
+            has_focus_queue = bool(focus_queue)
+            propulsion_active = bool(ship.nav.propulsion_command_active)
+            recent_enemy_weapon_damage_active = (
+                (
+                    float(world.now)
+                    - float(
+                        getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9)
+                        if getattr(ship.combat, "last_enemy_weapon_damaged_at", -1e9) is not None
+                        else -1e9
+                    )
+                )
+                <= 30.0
+            )
             allies_pool = alive_by_team.get(ship.team, [])
             enemies_alive = alive_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, [])
             ally_ids = alive_ids_by_team.get(ship.team, set())
             enemy_ids = alive_ids_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, set())
-            force_target_reselect = self._focus_key(ship.team, ship.squad_id) in changed_focus_keys
+            force_target_reselect = focus_key in changed_focus_keys
+            self._enqueue_ship_control_signal_modules(world, ship, runtime, focus_changed=force_target_reselect)
             local_signature_dirty = False
             active_pyfa_remote_inputs_dirty = False
             synced_weapon_fire_delay_pairs: set[tuple[str | None, str | None]] = set()
-            module_metadata_list = self._runtime_module_metadata_list(runtime)
+            controlled_entries = self._ship_candidate_control_entries(ship, runtime)
+            if not controlled_entries:
+                continue
+            next_pending_modules: set[str] = set()
 
-            for module, metadata in zip(runtime.modules, module_metadata_list):
+            for module, metadata in controlled_entries:
+                module_id = str(module.module_id)
                 if module.state == module.state.ACTIVE:
-                    active_timer = ship.combat.module_cycle_timers.get(module.module_id)
+                    active_timer = ship.combat.module_cycle_timers.get(module_id)
                     if active_timer is not None:
                         timer_left = active_timer - dt
                         if timer_left > 0:
-                            ship.combat.module_cycle_timers[module.module_id] = timer_left
+                            ship.combat.module_cycle_timers[module_id] = timer_left
                             continue
 
                 if module.state == module.state.OFFLINE:
                     if self._module_affects_pyfa_remote_inputs(module) and (
-                        module.module_id in ship.combat.projected_targets
-                        or module.module_id in ship.combat.module_cycle_timers
-                        or bool(self._module_cycle_snapshots_for(ship.ship_id, module.module_id))
+                        module_id in ship.combat.projected_targets
+                        or module_id in ship.combat.module_cycle_timers
+                        or bool(self._module_cycle_snapshots_for(ship.ship_id, module_id))
                     ):
                         pyfa_remote_inputs_dirty = True
-                    self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
-                    ship.combat.module_reactivation_timers.pop(module.module_id, None)
-                    ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
-                    ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                    self._clear_module_cycle_snapshots(ship.ship_id, module_id)
+                    ship.combat.module_reactivation_timers.pop(module_id, None)
+                    ship.combat.module_ammo_reload_timers.pop(module_id, None)
+                    ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
                     continue
 
                 previous_state = module.state
-                previous_projected_target = ship.combat.projected_targets.get(module.module_id)
-                active_timer = ship.combat.module_cycle_timers.get(module.module_id) if module.state == module.state.ACTIVE else None
+                previous_projected_target = ship.combat.projected_targets.get(module_id)
+                active_timer = ship.combat.module_cycle_timers.get(module_id) if module.state == module.state.ACTIVE else None
 
                 active_effects = metadata.active_effects
                 if not active_effects:
                     if previous_state == module.state.ACTIVE:
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
-                    self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
+                    self._clear_module_cycle_snapshots(ship.ship_id, module_id)
                     module.state = module.state.ONLINE
-                    ship.combat.module_cycle_timers.pop(module.module_id, None)
-                    ship.combat.module_reactivation_timers.pop(module.module_id, None)
-                    ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
-                    ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
-                    ship.combat.projected_targets.pop(module.module_id, None)
+                    ship.combat.module_cycle_timers.pop(module_id, None)
+                    ship.combat.module_reactivation_timers.pop(module_id, None)
+                    ship.combat.module_ammo_reload_timers.pop(module_id, None)
+                    ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
+                    ship.combat.projected_targets.pop(module_id, None)
                     continue
 
                 cycle_cost = metadata.cycle_cost
@@ -2450,20 +2370,20 @@ class CombatSystem:
                     if active_timer is not None:
                         timer_left = active_timer - dt
                         if timer_left > 0:
-                            ship.combat.module_cycle_timers[module.module_id] = timer_left
+                            ship.combat.module_cycle_timers[module_id] = timer_left
                             continue
-                        ship.combat.module_cycle_timers.pop(module.module_id, None)
+                        ship.combat.module_cycle_timers.pop(module_id, None)
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
-                        self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
+                        self._clear_module_cycle_snapshots(ship.ship_id, module_id)
                         cycle_just_completed = True
                         if reactivation_delay > 0.0:
-                            ship.combat.module_reactivation_timers[module.module_id] = max(
-                                ship.combat.module_reactivation_timers.get(module.module_id, 0.0),
+                            ship.combat.module_reactivation_timers[module_id] = max(
+                                ship.combat.module_reactivation_timers.get(module_id, 0.0),
                                 reactivation_delay,
                             )
                         pending_ammo_reload = max(
                             0.0,
-                            float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                            float(ship.combat.module_pending_ammo_reload_timers.get(module_id, 0.0) or 0.0),
                         )
 
                         if module.charge_capacity > 0 and module.charge_rate > 0.0:
@@ -2473,17 +2393,17 @@ class CombatSystem:
                                 if pending_ammo_reload <= 0.0:
                                     auto_reload_time = max(0.0, float(module.charge_reload_time))
                                     if auto_reload_time > 0.0:
-                                        ship.combat.module_ammo_reload_timers[module.module_id] = max(
+                                        ship.combat.module_ammo_reload_timers[module_id] = max(
                                             auto_reload_time,
-                                            float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                                            float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
                                         )
                                         ammo_reload_started_this_tick = True
                                     else:
                                         module.charge_remaining = float(module.charge_capacity)
 
                         if pending_ammo_reload > 0.0:
-                            ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload
-                            ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                            ship.combat.module_ammo_reload_timers[module_id] = pending_ammo_reload
+                            ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
                             ammo_reload_started_this_tick = True
 
                 decision_rule = metadata.decision_rule
@@ -2538,54 +2458,54 @@ class CombatSystem:
 
                 ammo_reload_left = max(
                     0.0,
-                    float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                    float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
                 )
                 if ammo_reload_left > 0.0:
                     if not ammo_reload_started_this_tick:
                         ammo_reload_left = max(0.0, ammo_reload_left - dt)
                     if ammo_reload_left > 0.0:
-                        ship.combat.module_ammo_reload_timers[module.module_id] = ammo_reload_left
+                        ship.combat.module_ammo_reload_timers[module_id] = ammo_reload_left
                         desired_active = False
                     else:
-                        ship.combat.module_ammo_reload_timers.pop(module.module_id, None)
+                        ship.combat.module_ammo_reload_timers.pop(module_id, None)
                         if module.charge_capacity > 0:
                             module.charge_remaining = float(module.charge_capacity)
 
                 pending_ammo_reload_left = max(
                     0.0,
-                    float(ship.combat.module_pending_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                    float(ship.combat.module_pending_ammo_reload_timers.get(module_id, 0.0) or 0.0),
                 )
                 active_ammo_reload_left = max(
                     0.0,
-                    float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+                    float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
                 )
                 current_cycle_left = max(
                     0.0,
-                    float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0),
+                    float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0),
                 )
                 if active_ammo_reload_left <= 0.0 and pending_ammo_reload_left > 0.0 and current_cycle_left <= 0.0:
-                    ship.combat.module_ammo_reload_timers[module.module_id] = pending_ammo_reload_left
-                    ship.combat.module_pending_ammo_reload_timers.pop(module.module_id, None)
+                    ship.combat.module_ammo_reload_timers[module_id] = pending_ammo_reload_left
+                    ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
                     desired_active = False
 
                 if module.charge_capacity > 0 and module.charge_rate > 0.0 and module.charge_remaining <= 0.0:
-                    if module.module_id not in ship.combat.module_ammo_reload_timers:
+                    if module_id not in ship.combat.module_ammo_reload_timers:
                         auto_reload_time = max(0.0, float(module.charge_reload_time))
                         if auto_reload_time > 0.0:
-                            ship.combat.module_ammo_reload_timers[module.module_id] = auto_reload_time
+                            ship.combat.module_ammo_reload_timers[module_id] = auto_reload_time
                         else:
                             module.charge_remaining = float(module.charge_capacity)
                     desired_active = False
 
-                cooldown_left = ship.combat.module_reactivation_timers.get(module.module_id)
+                cooldown_left = ship.combat.module_reactivation_timers.get(module_id)
                 if cooldown_left is not None:
                     if not cycle_just_completed:
                         cooldown_left -= dt
                     if cooldown_left > 0.0:
-                        ship.combat.module_reactivation_timers[module.module_id] = cooldown_left
+                        ship.combat.module_reactivation_timers[module_id] = cooldown_left
                         desired_active = False
                     else:
-                        ship.combat.module_reactivation_timers.pop(module.module_id, None)
+                        ship.combat.module_reactivation_timers.pop(module_id, None)
 
                 activation_target_id: str | None = (
                     projected_target_id
@@ -2614,19 +2534,19 @@ class CombatSystem:
                         else:
                             if cycle_cost > 0:
                                 ship.vital.cap = max(0.0, ship.vital.cap - cycle_cost)
-                            ship.combat.module_cycle_timers[module.module_id] = cycle_time
+                            ship.combat.module_cycle_timers[module_id] = cycle_time
                             cycle_started = True
                     else:
-                        ship.combat.module_cycle_timers.pop(module.module_id, None)
+                        ship.combat.module_cycle_timers.pop(module_id, None)
                 else:
-                    self._clear_module_cycle_snapshots(ship.ship_id, module.module_id)
-                    ship.combat.module_cycle_timers.pop(module.module_id, None)
+                    self._clear_module_cycle_snapshots(ship.ship_id, module_id)
+                    ship.combat.module_cycle_timers.pop(module_id, None)
 
                 module.state = module.state.ACTIVE if desired_active else module.state.ONLINE
                 if projected_target_id is not None:
-                    ship.combat.projected_targets[module.module_id] = projected_target_id
-                elif module.module_id in ship.combat.projected_targets:
-                    ship.combat.projected_targets.pop(module.module_id, None)
+                    ship.combat.projected_targets[module_id] = projected_target_id
+                elif module_id in ship.combat.projected_targets:
+                    ship.combat.projected_targets.pop(module_id, None)
 
                 # ECM is resolved once at cycle start so first activation round shows immediate result.
                 if cycle_started:
@@ -2640,10 +2560,16 @@ class CombatSystem:
                     or previous_state != module.state.ACTIVE
                     or previous_projected_target != projected_target_id
                 ):
-                    self._capture_module_cycle_snapshots(world, ship, module, projected_target_id)
+                    self._capture_module_cycle_snapshots(
+                        world,
+                        ship,
+                        module,
+                        projected_target_id,
+                        area_candidates=allies_pool if metadata.is_command_burst else None,
+                    )
 
                 if cycle_started and self._uses_cycle_start_projected_application(metadata):
-                    self._mark_projected_cycle_started(ship.ship_id, module.module_id)
+                    self._mark_projected_cycle_started(ship.ship_id, module_id)
 
                 if previous_projected_target and (
                     module.state != module.state.ACTIVE or previous_projected_target != projected_target_id
@@ -2663,7 +2589,7 @@ class CombatSystem:
                             "team": ship.team.value,
                             "squad": ship.squad_id,
                             "ship_type": ship.fit.ship_name,
-                            "module": module.module_id,
+                            "module": module_id,
                             "group": module.group,
                             "from_state": previous_state.value,
                             "to_state": module.state.value,
@@ -2680,7 +2606,7 @@ class CombatSystem:
                             "team": ship.team.value,
                             "squad": ship.squad_id,
                             "ship_type": ship.fit.ship_name,
-                            "module": module.module_id,
+                            "module": module_id,
                             "group": module.group,
                             "effects": effects,
                             "cycle_time": cycle_time,
@@ -2702,18 +2628,28 @@ class CombatSystem:
                 ):
                     pyfa_remote_inputs_dirty = True
 
+                if self._module_keeps_decision_pending_with_context(
+                    ship,
+                    module,
+                    metadata,
+                    propulsion_active=propulsion_active,
+                    recent_enemy_weapon_damage_active=recent_enemy_weapon_damage_active,
+                    has_focus_queue=has_focus_queue,
+                ):
+                    next_pending_modules.add(module_id)
+
+            ship.combat.module_decision_pending = next_pending_modules
+
             if local_signature_dirty:
+                runtime.diagnostics.pop("runtime_local_state_signature", None)
                 runtime.diagnostics["runtime_local_state_signature"] = tuple(
                     (str(module.module_id), str(module.state.value or "ONLINE").upper())
                     for module in runtime.modules
                     if self._module_static_metadata(module).affects_local_pyfa_profile
                 )
             if active_pyfa_remote_inputs_dirty:
-                runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = any(
-                    str(module.state.value or "ONLINE").upper() in {"ACTIVE", "OVERHEATED"}
-                    and self._module_affects_pyfa_remote_inputs(module)
-                    for module in runtime.modules
-                )
+                runtime.diagnostics.pop("runtime_has_active_pyfa_remote_inputs", None)
+                runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = self._runtime_has_active_pyfa_remote_inputs(runtime)
 
         return pyfa_remote_inputs_dirty
 
@@ -2872,37 +2808,61 @@ class CombatSystem:
             pre_targets = cleaned[1:] if len(cleaned) > 1 else []
             valid_pre = set(pre_targets)
 
-            prelocked = world.squad_prelocked_targets.setdefault(focus_key, set())
-            timers = world.squad_prelock_timers.setdefault(focus_key, {})
-            for target_id in list(prelocked):
-                if target_id not in valid_pre:
-                    prelocked.discard(target_id)
-            for target_id in list(timers.keys()):
-                if target_id not in valid_pre:
-                    timers.pop(target_id, None)
+            prelocked_by_ship = world.squad_prelocked_targets.setdefault(focus_key, {})
+            timers_by_ship = world.squad_prelock_timers.setdefault(focus_key, {})
+            member_ids = {ship.ship_id for ship in members}
+            for ship_id in list(prelocked_by_ship.keys()):
+                if ship_id not in member_ids:
+                    prelocked_by_ship.pop(ship_id, None)
+            for ship_id in list(timers_by_ship.keys()):
+                if ship_id not in member_ids:
+                    timers_by_ship.pop(ship_id, None)
 
-            if not pre_targets:
-                continue
+            for ship in members:
+                ship_prelocked = prelocked_by_ship.setdefault(ship.ship_id, set())
+                ship_timers = timers_by_ship.setdefault(ship.ship_id, {})
+                for target_id in list(ship_prelocked):
+                    if target_id not in valid_pre:
+                        ship_prelocked.discard(target_id)
+                for target_id in list(ship_timers.keys()):
+                    if target_id not in valid_pre:
+                        ship_timers.pop(target_id, None)
 
-            leader = members[0]
-            attacker_profile = effective_profiles.get(leader.ship_id) or leader.profile
-            for target_id in pre_targets:
-                if target_id in prelocked:
+                if not pre_targets:
+                    if not ship_prelocked:
+                        prelocked_by_ship.pop(ship.ship_id, None)
+                    if not ship_timers:
+                        timers_by_ship.pop(ship.ship_id, None)
                     continue
-                target = world.ships.get(target_id)
-                if target is None or not target.vital.alive:
-                    continue
-                target_profile = effective_profiles.get(target_id) or target.profile
-                left = timers.get(target_id)
-                if left is None:
-                    timers[target_id] = self._cached_lock_time(attacker_profile, target_profile)
-                    continue
-                left -= dt
-                if left <= 0:
-                    prelocked.add(target_id)
-                    timers.pop(target_id, None)
-                else:
-                    timers[target_id] = left
+
+                attacker_profile = effective_profiles.get(ship.ship_id) or ship.profile
+                for target_id in pre_targets:
+                    if target_id in ship_prelocked:
+                        continue
+                    target = world.ships.get(target_id)
+                    if target is None or not target.vital.alive:
+                        continue
+                    target_profile = effective_profiles.get(target_id) or target.profile
+                    left = ship_timers.get(target_id)
+                    if left is None:
+                        ship_timers[target_id] = self._cached_lock_time(attacker_profile, target_profile)
+                        continue
+                    left -= dt
+                    if left <= 0:
+                        ship_prelocked.add(target_id)
+                        ship_timers.pop(target_id, None)
+                    else:
+                        ship_timers[target_id] = left
+
+                if not ship_prelocked:
+                    prelocked_by_ship.pop(ship.ship_id, None)
+                if not ship_timers:
+                    timers_by_ship.pop(ship.ship_id, None)
+
+            if not prelocked_by_ship:
+                world.squad_prelocked_targets.pop(focus_key, None)
+            if not timers_by_ship:
+                world.squad_prelock_timers.pop(focus_key, None)
 
         for focus_key in list(world.squad_prelocked_targets.keys()):
             if focus_key not in world.squad_focus_queues:
@@ -3034,8 +2994,11 @@ class CombatSystem:
                         target = world.ships.get(tgt_id)
                         if target is None or not target.vital.alive:
                             continue
-                        target_snapshot = cycle_target_snapshots.get(tgt_id)
-                        if target_snapshot is None:
+                        got_snapshot = cycle_target_snapshots.get(tgt_id)
+                        if got_snapshot is None:
+                            continue
+                        target_snapshot = got_snapshot
+                        if False:
                             continue
                         strength = max(0.0, float(target_snapshot.effect_strengths.get(effect_index, 0.0) or 0.0))
                         if strength <= 0.0:
@@ -3160,36 +3123,6 @@ class CombatSystem:
             self._advance_merge_window(world.now)
 
 
-class LogisticsSystem:
-    def run(self, world: WorldState, dt: float) -> None:
-        alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
-        for ship in world.ships.values():
-            if ship.vital.alive:
-                alive_by_team[ship.team].append(ship)
 
-        weakest_by_team: dict[Team, Any | None] = {Team.BLUE: None, Team.RED: None}
-        for team, members in alive_by_team.items():
-            if not members:
-                weakest_by_team[team] = None
-                continue
-            weakest_by_team[team] = min(members, key=lambda a: (a.vital.shield + a.vital.armor + a.vital.structure))
 
-        for ship in world.ships.values():
-            if not ship.vital.alive:
-                continue
-            if ship.profile.rep_amount <= 0 or ship.profile.rep_cycle <= 0:
-                continue
 
-            target = weakest_by_team.get(ship.team)
-            if target is None or target.ship_id == ship.ship_id:
-                allies = [a for a in alive_by_team.get(ship.team, []) if a.ship_id != ship.ship_id]
-                if not allies:
-                    continue
-                target = min(allies, key=lambda a: (a.vital.shield + a.vital.armor + a.vital.structure))
-
-            dist = ship.nav.position.distance_to(target.nav.position)
-            if dist > ship.profile.max_target_range:
-                continue
-
-            repair = ship.profile.rep_amount * (dt / ship.profile.rep_cycle)
-            target.vital.shield = min(target.vital.shield_max, target.vital.shield + repair)

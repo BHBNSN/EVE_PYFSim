@@ -92,14 +92,14 @@ class ShipAgent(BaseAgent):
             ship.nav.propulsion_command_active = bool(self.current_order.payload.get("active", False))
 
         if self.current_order and self.current_order.kind == "MOVE" and is_leader:
-            target = Vector2(self.current_order.payload["x"], self.current_order.payload["y"])
+            move_target = Vector2(self.current_order.payload["x"], self.current_order.payload["y"])
             arrive_radius = max(120.0, ship.nav.radius * 1.5)
-            if ship.nav.position.distance_to(target) <= arrive_radius and ship.nav.velocity.length() <= 50.0:
+            if ship.nav.position.distance_to(move_target) <= arrive_radius and ship.nav.velocity.length() <= 50.0:
                 ship.nav.command_target = None
                 ship.nav.velocity = Vector2(0.0, 0.0)
                 self.current_order = None
             else:
-                ship.nav.command_target = target
+                ship.nav.command_target = move_target
 
         if not is_leader and leader is not None:
             to_leader = leader.nav.position - ship.nav.position
@@ -259,16 +259,18 @@ class CommanderAgent(BaseAgent):
             world.squad_focus_queues[focus_key] = []
             return
 
-        prelocked = world.squad_prelocked_targets.get(focus_key, set())
-        prelock_timers = world.squad_prelock_timers.get(focus_key, {})
+        prelocked_by_ship = world.squad_prelocked_targets.get(focus_key, {})
+        prelock_timers_by_ship = world.squad_prelock_timers.get(focus_key, {})
         fallback_target = queue[0]
         next_target = queue[1] if len(queue) > 1 else None
-        next_available = bool(next_target) and (
-            (next_target in prelocked) or (next_target in prelock_timers)
-        )
 
         updates: dict[str, str] = {}
         for ship in members:
+            ship_prelocked = prelocked_by_ship.get(ship.ship_id, set())
+            ship_prelock_timers = prelock_timers_by_ship.get(ship.ship_id, {})
+            next_available = bool(next_target) and (
+                (next_target in ship_prelocked) or (next_target in ship_prelock_timers)
+            )
             current_target = ship.combat.current_target
             current_valid = False
             if current_target:
@@ -295,11 +297,13 @@ class CommanderAgent(BaseAgent):
                 assigned = updates.get(ship.ship_id)
                 if not assigned:
                     continue
-                if assigned in prelocked:
+                ship_prelocked = prelocked_by_ship.get(ship.ship_id, set())
+                ship_prelock_timers = prelock_timers_by_ship.get(ship.ship_id, {})
+                if assigned in ship_prelocked:
                     ship.combat.lock_targets.add(assigned)
                     ship.combat.lock_timers.pop(assigned, None)
                 else:
-                    remaining = prelock_timers.get(assigned)
+                    remaining = ship_prelock_timers.get(assigned)
                     if remaining is not None and remaining > 0:
                         ship.combat.lock_targets.discard(assigned)
                         ship.combat.lock_timers[assigned] = float(remaining)

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import sys
+from typing import Callable
 
 from .config import resolve_pyfa_source_dir
 from .models import FitDescriptor, ShipProfile
@@ -11,8 +12,8 @@ from .models import FitDescriptor, ShipProfile
 
 @dataclass(slots=True)
 class PyfaMath:
-    calculate_range_factor: callable
-    calculate_lock_time: callable
+    calculate_range_factor: Callable
+    calculate_lock_time: Callable
 
 
 class PyfaBridge:

@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from eve_sim.gui_app import run_gui
+from eve_sim.gui import run_gui
 
 def main() -> None:
     run_gui()
