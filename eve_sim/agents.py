@@ -302,11 +302,13 @@ class CommanderAgent(BaseAgent):
                 if assigned in ship_prelocked:
                     ship.combat.lock_targets.add(assigned)
                     ship.combat.lock_timers.pop(assigned, None)
+                    ship.combat.lock_deadlines.pop(assigned, None)
                 else:
                     remaining = ship_prelock_timers.get(assigned)
                     if remaining is not None and remaining > 0:
                         ship.combat.lock_targets.discard(assigned)
                         ship.combat.lock_timers[assigned] = float(remaining)
+                        ship.combat.lock_deadlines.pop(assigned, None)
 
         world.squad_focus_queues[focus_key] = queue
 

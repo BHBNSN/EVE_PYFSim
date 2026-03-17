@@ -63,16 +63,7 @@ def ensure_ship_module_decision_pending(ship, controlled_ids: tuple[str, ...]) -
 
 
 def ship_candidate_module_ids(ship) -> set[str]:
-    candidate_ids = set(ship.combat.module_decision_pending)
-    for timers in (
-        ship.combat.module_cycle_timers,
-        ship.combat.module_reactivation_timers,
-        ship.combat.module_ammo_reload_timers,
-        ship.combat.module_pending_ammo_reload_timers,
-    ):
-        candidate_ids.update(str(module_id) for module_id in timers.keys())
-    candidate_ids.update(str(module_id) for module_id in ship.combat.projected_targets.keys())
-    return candidate_ids
+    return set(ship.combat.module_decision_pending)
 
 
 def enqueue_control_signal_modules(

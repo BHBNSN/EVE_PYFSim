@@ -523,13 +523,12 @@ class MainWindow(QMainWindow):
         changed_module_ids = self._changed_module_ids_between_parsed(parsed_old, parsed_new)
         reload_sec = max(0.0, get_module_reload_time_sec(spec.module_name))
         if reload_sec > 0.0 and module_id in changed_module_ids:
-            cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
-            active_reload_left = max(0.0, float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0))
-            if cycle_left > 0.0 or active_reload_left > 0.0:
-                ship.combat.module_pending_ammo_reload_timers[module_id] = reload_sec
-            else:
-                ship.combat.module_ammo_reload_timers[module_id] = reload_sec
-                ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
+            self.engine.combat.request_module_reload(
+                ship,
+                module_id,
+                reload_sec,
+                now=float(self.engine.world.now),
+            )
 
         module_name = get_type_display_name(spec.module_name, language=lang)
         ammo_display = get_type_display_name(canonical_ammo, language=lang)
@@ -847,13 +846,12 @@ class MainWindow(QMainWindow):
                     changed_module_ids = self._changed_module_ids_between_parsed(parsed_old, parsed_new)
 
                 for module_id in changed_module_ids:
-                    cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0))
-                    active_reload_left = max(0.0, float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0))
-                    if cycle_left > 0.0 or active_reload_left > 0.0:
-                        ship.combat.module_pending_ammo_reload_timers[module_id] = reload_sec
-                    else:
-                        ship.combat.module_ammo_reload_timers[module_id] = reload_sec
-                        ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
+                    self.engine.combat.request_module_reload(
+                        ship,
+                        module_id,
+                        reload_sec,
+                        now=float(self.engine.world.now),
+                    )
             updated_ships += 1
 
         self.request_overview_refresh(force=True)
@@ -1092,6 +1090,7 @@ class MainWindow(QMainWindow):
             ship.combat.last_attack_target = None
             ship.combat.lock_targets.clear()
             ship.combat.lock_timers.clear()
+            ship.combat.lock_deadlines.clear()
             ship.combat.fire_delay_timers.clear()
             self._undeployed_ship_ids.discard(ship.ship_id)
         for squad in affected_squads:
@@ -1350,6 +1349,7 @@ class MainWindow(QMainWindow):
                     continue
                 ship.combat.lock_targets.discard(target_id)
                 ship.combat.lock_timers.pop(target_id, None)
+                ship.combat.lock_deadlines.pop(target_id, None)
                 ship.combat.fire_delay_timers.pop(target_id, None)
 
         self._enqueue_tick_op(apply)
@@ -1388,6 +1388,7 @@ class MainWindow(QMainWindow):
                 ship.combat.last_attack_target = None
                 ship.combat.lock_targets.clear()
                 ship.combat.lock_timers.clear()
+                ship.combat.lock_deadlines.clear()
                 ship.combat.fire_delay_timers.clear()
 
         self._enqueue_tick_op(apply)
@@ -1652,6 +1653,7 @@ class MainWindow(QMainWindow):
                         continue
                     ship.combat.lock_targets.discard(target_id)
                     ship.combat.lock_timers.pop(target_id, None)
+                    ship.combat.lock_deadlines.pop(target_id, None)
                     ship.combat.fire_delay_timers.pop(target_id, None)
             elif kind == CMD_SQUAD_CLEAR_FOCUS:
                 self.engine.world.squad_focus_queues.pop(focus_key, None)
@@ -1673,6 +1675,7 @@ class MainWindow(QMainWindow):
                     ship.combat.last_attack_target = None
                     ship.combat.lock_targets.clear()
                     ship.combat.lock_timers.clear()
+                    ship.combat.lock_deadlines.clear()
                     ship.combat.fire_delay_timers.clear()
 
     def _discard_squad_prelock_target(self, focus_key: str, target_id: str) -> None:
@@ -1975,8 +1978,10 @@ class MainWindow(QMainWindow):
                     except Exception:
                         continue
                 ship.combat.module_cycle_timers = parsed_cycle_timers
+                ship.combat.module_cycle_deadlines.clear()
             else:
                 ship.combat.module_cycle_timers.clear()
+                ship.combat.module_cycle_deadlines.clear()
 
             ecm_sources = raw.get("ecm_jam_sources")
             if isinstance(ecm_sources, dict):

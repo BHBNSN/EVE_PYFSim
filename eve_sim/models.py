@@ -134,7 +134,9 @@ class CombatState:
     current_target: str | None = None
     last_attack_target: str | None = None
     lock_timers: dict[str, float] = field(default_factory=dict)
+    lock_deadlines: dict[str, float] = field(default_factory=dict)
     module_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
+    module_ammo_reload_deadlines: dict[str, float] = field(default_factory=dict)
     module_pending_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
     fire_delay_timers: dict[str, float] = field(default_factory=dict)
     projected_targets: dict[str, str] = field(default_factory=dict)
@@ -150,7 +152,9 @@ class CombatState:
     last_damaged_at: float = -1e9
     last_enemy_weapon_damaged_at: float = -1e9
     module_cycle_timers: dict[str, float] = field(default_factory=dict)
+    module_cycle_deadlines: dict[str, float] = field(default_factory=dict)
     module_reactivation_timers: dict[str, float] = field(default_factory=dict)
+    module_reactivation_deadlines: dict[str, float] = field(default_factory=dict)
     module_decision_pending: set[str] = field(default_factory=set)
     module_decision_pending_signature: tuple[str, ...] = field(default_factory=tuple)
     module_decision_propulsion_active: bool | None = None

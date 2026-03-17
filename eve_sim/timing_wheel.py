@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any, Callable
 
 class EventType(Enum):
+    LOCK_COMPLETE = 0
     CYCLE_END = 1
     RELOAD_END = 2
     REACTIVATION_END = 3
@@ -44,6 +45,21 @@ class TimingWheel:
         while self._heap and self._heap[0].trigger_time <= current_time:
             due.append(heapq.heappop(self._heap))
         return due
+
+    def peek_next_event(self) -> WheelEvent | None:
+        if not self._heap:
+            return None
+        return self._heap[0]
+
+    def peek_next_trigger_time(self) -> float | None:
+        if not self._heap:
+            return None
+        return float(self._heap[0].trigger_time)
+
+    def pop_next_event(self) -> WheelEvent | None:
+        if not self._heap:
+            return None
+        return heapq.heappop(self._heap)
         
     def clear(self) -> None:
         self._heap.clear()
