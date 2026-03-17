@@ -90,6 +90,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "setup_col_leader": {"zh_CN": "队长", "en_US": "Leader"},
     "setup_col_fit": {"zh_CN": "配装名", "en_US": "Fit Name"},
     "lang_label": {"zh_CN": "语言", "en_US": "Language"},
+    "controlled_side": {"zh_CN": "当前持方", "en_US": "Controlled Side"},
+    "btn_switch_controlled_team": {"zh_CN": "切换到 {team}", "en_US": "Switch to {team}"},
     "yes_short": {"zh_CN": "是", "en_US": "Y"},
     "no_short": {"zh_CN": "否", "en_US": "N"},
     "selected_squad": {"zh_CN": "当前己方小队", "en_US": "Selected Squad"},

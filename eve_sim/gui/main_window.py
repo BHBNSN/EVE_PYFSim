@@ -583,6 +583,13 @@ class MainWindow(QMainWindow):
         self.squad_combo.setEditable(False)
         self.squad_combo.currentTextChanged.connect(self.on_selected_squad_changed)
         header.addWidget(self.squad_combo, 1)
+        self.lbl_controlled_side = QLabel("")
+        header.addWidget(self.lbl_controlled_side)
+        self.lbl_controlled_team_value = QLabel("")
+        header.addWidget(self.lbl_controlled_team_value)
+        self.btn_switch_controlled_team = QPushButton("")
+        self.btn_switch_controlled_team.clicked.connect(self.toggle_local_controlled_team)
+        header.addWidget(self.btn_switch_controlled_team)
         self.lbl_language = QLabel(tr(self.current_language(), "lang_label"))
         header.addWidget(self.lbl_language)
         self.lang_combo = QComboBox()
@@ -647,10 +654,60 @@ class MainWindow(QMainWindow):
         self._refresh_common_charge_modules()
         self._refresh_selected_squad_leader_speed_limit()
         self._refresh_propulsion_button_text()
+        self._refresh_controlled_team_widgets()
         return side
 
     def _get_squad_propulsion_state(self, squad_id: str) -> bool:
         return self._get_team_propulsion_state(self.controlled_team, squad_id)
+
+    def _team_display_text(self, team: Team) -> str:
+        return tr(self.current_language(), "status_blue" if team == Team.BLUE else "status_red")
+
+    def _refresh_controlled_team_widgets(self) -> None:
+        if not hasattr(self, "lbl_controlled_side"):
+            return
+        is_local_mode = self.network_mode == "local"
+        self.lbl_controlled_side.setVisible(is_local_mode)
+        self.lbl_controlled_team_value.setVisible(is_local_mode)
+        self.btn_switch_controlled_team.setVisible(is_local_mode)
+        if not is_local_mode:
+            return
+        self.lbl_controlled_side.setText(tr(self.current_language(), "controlled_side"))
+        self.lbl_controlled_team_value.setText(self._team_display_text(self.controlled_team))
+        next_team = Team.RED if self.controlled_team == Team.BLUE else Team.BLUE
+        self.btn_switch_controlled_team.setText(
+            tr(
+                self.current_language(),
+                "btn_switch_controlled_team",
+                team=self._team_display_text(next_team),
+            )
+        )
+
+    def _clear_selected_enemy_if_not_enemy(self) -> None:
+        target_id = str(self.ui_state.selected_enemy_target or "").strip()
+        if not target_id:
+            return
+        target = self.engine.world.ships.get(target_id)
+        if target is not None and target.team != self.controlled_team and target.ship_id not in self._undeployed_ship_ids:
+            return
+        self.ui_state.selected_enemy_target = None
+        self.canvas.selected_enemy_target = None
+
+    def toggle_local_controlled_team(self) -> None:
+        if self.network_mode != "local":
+            return
+        self.controlled_team = Team.RED if self.controlled_team == Team.BLUE else Team.BLUE
+        self._log_user_action("switch_controlled_team", team=self.controlled_team.value)
+        self._refresh_controlled_team_widgets()
+        self._clear_selected_enemy_if_not_enemy()
+        self._sync_blue_squads()
+        self.refresh_blue_roster()
+        self._refresh_common_charge_modules()
+        self.overview.clearSelection()
+        self.blue_roster.clearSelection()
+        self.overview_model.notify_visual_state_changed()
+        self.request_overview_refresh(force=True)
+        self.canvas.update()
 
     def _get_team_propulsion_state(self, team: Team, squad_id: str) -> bool:
         key = self._focus_key(team, squad_id)
@@ -705,6 +762,7 @@ class MainWindow(QMainWindow):
         self.overview_model.notify_headers_changed()
         self.blue_roster_model.notify_headers_changed()
         self._refresh_propulsion_button_text()
+        self._refresh_controlled_team_widgets()
 
     def _refresh_propulsion_button_text(self) -> None:
         active = self._get_squad_propulsion_state(self.ui_state.selected_squad)
@@ -992,7 +1050,18 @@ class MainWindow(QMainWindow):
             self.squad_combo.setCurrentText(squads[0])
         self.squad_combo.blockSignals(False)
 
-        self.on_selected_squad_changed(self.squad_combo.currentText())
+        if squads:
+            self.on_selected_squad_changed(self.squad_combo.currentText())
+            return
+
+        self.ui_state.selected_squad = ""
+        self.canvas.selected_squad = ""
+        self.assign_squad_edit.setText("")
+        self.prefs.selected_squad = ""
+        self.store.save(self.prefs)
+        self._refresh_selected_squad_leader_speed_limit()
+        self._refresh_propulsion_button_text()
+        self.overview_model.notify_visual_state_changed()
 
     def on_selected_squad_changed(self, squad_id: str) -> None:
         squad = squad_id.strip()

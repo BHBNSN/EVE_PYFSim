@@ -528,6 +528,12 @@ class OverviewFilterProxyModel(QSortFilterProxyModel):
         return lv < rv
 
     def apply_preferences(self) -> None:
+        begin_filter_change = getattr(self, "beginFilterChange", None)
+        end_filter_change = getattr(self, "endFilterChange", None)
+        if callable(begin_filter_change) and callable(end_filter_change):
+            begin_filter_change()
+            end_filter_change()
+            return
         self.invalidateFilter()
 
     def get_row(self, proxy_row: int) -> dict | None:
