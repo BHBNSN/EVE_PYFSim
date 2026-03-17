@@ -853,7 +853,7 @@ class RuntimeFromEftFactory:
             group_name = (module_item.group.name or "").lower()
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
             if self._is_weapon_like_group(group_name) and not charge_name:
-                raise ValueError(f"姝﹀櫒缂哄皯鍙В鏋愬脊鑽細{spec.module_name}")
+                raise ValueError(f"武器缺少可解析弹药：{spec.module_name}")
             if charge_name:
                 charge_item = self._pyfa.get_item(self._pyfa.resolve_type_name(charge_name))
                 if charge_item is None:
