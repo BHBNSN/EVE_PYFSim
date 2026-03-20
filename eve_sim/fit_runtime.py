@@ -66,9 +66,11 @@ class ModuleEffect:
     local_add: dict[str, float] = field(default_factory=dict)
     projected_mult: dict[str, float] = field(default_factory=dict)
     projected_add: dict[str, float] = field(default_factory=dict)
+    projected_mult_groups: dict[str, str | None] = field(default_factory=dict)
+    projected_signature: tuple[Any, ...] = field(default_factory=tuple)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class ModuleRuntime:
     module_id: str
     group: str
@@ -78,6 +80,7 @@ class ModuleRuntime:
     charge_rate: float = 0.0
     charge_remaining: float = 0.0
     charge_reload_time: float = 0.0
+    tags: tuple[str, ...] = field(default_factory=tuple)
 
     def is_active_for(self, required: ModuleState) -> bool:
         rank = {
@@ -96,6 +99,9 @@ class ModuleRuntime:
         if candidate in {ModuleState.ACTIVE, ModuleState.OVERHEATED} and not self.can_be_active():
             return ModuleState.ONLINE
         return candidate
+
+    def has_tag(self, tag: str) -> bool:
+        return str(tag) in self.tags
 
 
 @dataclass(slots=True)
@@ -138,6 +144,47 @@ class RuntimeStatEngine:
             for i, mult in enumerate(group):
                 val *= 1 + (mult - 1) * RuntimeStatEngine._stacking_penalty_factor(i)
         return val
+
+    @classmethod
+    def _stacking_group_multiplier(cls, grouped_values: dict[str, list[float]]) -> float:
+        total = 1.0
+        for values in grouped_values.values():
+            total *= cls._stacking_multiplier(values)
+        return total
+
+    @classmethod
+    def _merged_stacking_groups(
+        cls,
+        base_groups: dict[str, list[float]] | None,
+        projected_groups: dict[str, list[float]],
+    ) -> dict[str, list[float]]:
+        merged: dict[str, list[float]] = {}
+        if isinstance(base_groups, dict):
+            for group_name, values in base_groups.items():
+                if not isinstance(values, list):
+                    continue
+                merged[str(group_name)] = [float(value or 1.0) for value in values]
+        for group_name, values in projected_groups.items():
+            merged.setdefault(str(group_name), []).extend(float(value or 1.0) for value in values)
+        return merged
+
+    @classmethod
+    def _apply_penalized_projection(
+        cls,
+        current_value: float,
+        add_value: float,
+        projected_groups: dict[str, list[float]],
+        penalty_context: dict[str, Any] | None,
+    ) -> float:
+        if isinstance(penalty_context, dict):
+            base_value = float(penalty_context.get("pre", current_value) or 0.0)
+            post_value = float(penalty_context.get("post", 0.0) or 0.0)
+            merged_groups = cls._merged_stacking_groups(
+                penalty_context.get("groups") if isinstance(penalty_context.get("groups"), dict) else None,
+                projected_groups,
+            )
+            return (base_value + add_value) * cls._stacking_group_multiplier(merged_groups) + post_value
+        return (current_value + add_value) * cls._stacking_group_multiplier(projected_groups)
 
     def compute_base_profile(self, runtime: FitRuntime) -> ShipProfile:
         key = self._cache_key(runtime)
@@ -199,8 +246,13 @@ class RuntimeStatEngine:
         self._cache[key] = profile
         return profile
 
-    def apply_projected_effects(self, target: ShipProfile, impacts: list[ProjectedImpact]) -> ShipProfile:
-        mul: dict[str, list[float]] = {
+    def apply_projected_effects(
+        self,
+        target: ShipProfile,
+        impacts: list[ProjectedImpact],
+        base_penalty_context: dict[str, dict[str, Any]] | None = None,
+    ) -> ShipProfile:
+        mul: dict[str, dict[str, list[float]]] = {
             "speed": [],
             "sig": [],
             "tracking": [],
@@ -237,84 +289,212 @@ class RuntimeStatEngine:
             "mass": [],
             "agility": [],
         }
+        mul = {key: {} for key in mul}
         add: dict[str, float] = {k: 0.0 for k in mul}
         for impact in impacts:
             eff = impact.effect
             strength = max(0.0, min(1.0, float(impact.strength)))
+            mult_groups = getattr(eff, "projected_mult_groups", {}) or {}
             for k, v in eff.projected_mult.items():
                 if k in mul:
-                    mul[k].append(1.0 + (v - 1.0) * strength)
+                    group_name = mult_groups.get(k, "default")
+                    if group_name is None:
+                        group_name = f"__unstacked__:{len(mul[k])}"
+                    mul[k].setdefault(str(group_name), []).append(1.0 + (v - 1.0) * strength)
             for k, v in eff.projected_add.items():
                 if k in add:
                     add[k] += v * strength
 
+        penalty_context = base_penalty_context or {}
+
         return ShipProfile(
-            dps=max(0.0, (target.dps + add["dps"]) * self._stacking_multiplier(mul["dps"])),
+            dps=max(0.0, (target.dps + add["dps"]) * self._stacking_group_multiplier(mul["dps"])),
             volley=target.volley,
-            optimal=max(1.0, (target.optimal + add["optimal"]) * self._stacking_multiplier(mul["optimal"])),
-            falloff=max(1.0, (target.falloff + add["falloff"]) * self._stacking_multiplier(mul["falloff"])),
-            tracking=max(0.0001, (target.tracking + add["tracking"]) * self._stacking_multiplier(mul["tracking"])),
-            sig_radius=max(1.0, (target.sig_radius + add["sig"]) * self._stacking_multiplier(mul["sig"])),
-            scan_resolution=max(1.0, (target.scan_resolution + add["scan"]) * self._stacking_multiplier(mul["scan"])),
-            max_target_range=max(1000.0, (target.max_target_range + add["range"]) * self._stacking_multiplier(mul["range"])),
-            max_speed=max(1.0, (target.max_speed + add["speed"]) * self._stacking_multiplier(mul["speed"])),
+            optimal=max(1.0, (target.optimal + add["optimal"]) * self._stacking_group_multiplier(mul["optimal"])),
+            falloff=max(1.0, (target.falloff + add["falloff"]) * self._stacking_group_multiplier(mul["falloff"])),
+            tracking=max(0.0001, (target.tracking + add["tracking"]) * self._stacking_group_multiplier(mul["tracking"])),
+            sig_radius=max(1.0, self._apply_penalized_projection(target.sig_radius, add["sig"], mul["sig"], penalty_context.get("sig"))),
+            scan_resolution=max(
+                1.0,
+                self._apply_penalized_projection(
+                    target.scan_resolution,
+                    add["scan"],
+                    mul["scan"],
+                    penalty_context.get("scan"),
+                ),
+            ),
+            max_target_range=max(
+                1000.0,
+                self._apply_penalized_projection(
+                    target.max_target_range,
+                    add["range"],
+                    mul["range"],
+                    penalty_context.get("range"),
+                ),
+            ),
+            max_speed=max(
+                1.0,
+                self._apply_penalized_projection(
+                    target.max_speed,
+                    add["speed"],
+                    mul["speed"],
+                    penalty_context.get("speed"),
+                ),
+            ),
             missile_explosion_radius=max(
                 0.0,
-                target.missile_explosion_radius * self._stacking_multiplier(mul["missile_explosion_radius"]),
+                target.missile_explosion_radius * self._stacking_group_multiplier(mul["missile_explosion_radius"]),
             ),
             missile_explosion_velocity=max(
                 0.0,
-                target.missile_explosion_velocity * self._stacking_multiplier(mul["missile_explosion_velocity"]),
+                target.missile_explosion_velocity * self._stacking_group_multiplier(mul["missile_explosion_velocity"]),
             ),
             missile_max_range=max(
                 0.0,
-                target.missile_max_range * self._stacking_multiplier(mul["missile_range"]),
+                target.missile_max_range * self._stacking_group_multiplier(mul["missile_range"]),
             ),
-            max_cap=max(1.0, (target.max_cap + add["cap_max"]) * self._stacking_multiplier(mul["cap_max"])),
+            max_cap=max(
+                1.0,
+                self._apply_penalized_projection(
+                    target.max_cap,
+                    add["cap_max"],
+                    mul["cap_max"],
+                    penalty_context.get("cap_max"),
+                ),
+            ),
             cap_recharge_time=max(
                 1.0,
-                (target.cap_recharge_time + add["cap_recharge"]) * self._stacking_multiplier(mul["cap_recharge"]),
+                self._apply_penalized_projection(
+                    target.cap_recharge_time,
+                    add["cap_recharge"],
+                    mul["cap_recharge"],
+                    penalty_context.get("cap_recharge"),
+                ),
             ),
-            shield_hp=max(1.0, (target.shield_hp + add["shield_hp"]) * self._stacking_multiplier(mul["shield_hp"])),
-            armor_hp=max(1.0, (target.armor_hp + add["armor_hp"]) * self._stacking_multiplier(mul["armor_hp"])),
-            structure_hp=max(1.0, (target.structure_hp + add["structure_hp"]) * self._stacking_multiplier(mul["structure_hp"])),
-            rep_amount=max(0.0, (target.rep_amount + add["rep"]) * self._stacking_multiplier(mul["rep"])),
+            shield_hp=max(
+                1.0,
+                self._apply_penalized_projection(
+                    target.shield_hp,
+                    add["shield_hp"],
+                    mul["shield_hp"],
+                    penalty_context.get("shield_hp"),
+                ),
+            ),
+            armor_hp=max(
+                1.0,
+                self._apply_penalized_projection(
+                    target.armor_hp,
+                    add["armor_hp"],
+                    mul["armor_hp"],
+                    penalty_context.get("armor_hp"),
+                ),
+            ),
+            structure_hp=max(
+                1.0,
+                self._apply_penalized_projection(
+                    target.structure_hp,
+                    add["structure_hp"],
+                    mul["structure_hp"],
+                    penalty_context.get("structure_hp"),
+                ),
+            ),
+            rep_amount=max(0.0, (target.rep_amount + add["rep"]) * self._stacking_group_multiplier(mul["rep"])),
             rep_cycle=target.rep_cycle,
             energy_warfare_resistance=max(0.0, float(getattr(target, "energy_warfare_resistance", 1.0) or 1.0)),
-            mass=max(0.0, (target.mass + add["mass"]) * self._stacking_multiplier(mul["mass"])),
-            agility=max(0.0, (target.agility + add["agility"]) * self._stacking_multiplier(mul["agility"])),
+            mass=max(0.0, self._apply_penalized_projection(target.mass, add["mass"], mul["mass"], penalty_context.get("mass"))),
+            agility=max(
+                0.0,
+                self._apply_penalized_projection(
+                    target.agility,
+                    add["agility"],
+                    mul["agility"],
+                    penalty_context.get("agility"),
+                ),
+            ),
             sensor_strength_gravimetric=max(
                 0.0,
-                (target.sensor_strength_gravimetric + add["sensor_strength_gravimetric"])
-                * self._stacking_multiplier(mul["sensor_strength_gravimetric"]),
+                self._apply_penalized_projection(
+                    target.sensor_strength_gravimetric,
+                    add["sensor_strength_gravimetric"],
+                    mul["sensor_strength_gravimetric"],
+                    penalty_context.get("sensor_strength_gravimetric"),
+                ),
             ),
             sensor_strength_ladar=max(
                 0.0,
-                (target.sensor_strength_ladar + add["sensor_strength_ladar"])
-                * self._stacking_multiplier(mul["sensor_strength_ladar"]),
+                self._apply_penalized_projection(
+                    target.sensor_strength_ladar,
+                    add["sensor_strength_ladar"],
+                    mul["sensor_strength_ladar"],
+                    penalty_context.get("sensor_strength_ladar"),
+                ),
             ),
             sensor_strength_magnetometric=max(
                 0.0,
-                (target.sensor_strength_magnetometric + add["sensor_strength_magnetometric"])
-                * self._stacking_multiplier(mul["sensor_strength_magnetometric"]),
+                self._apply_penalized_projection(
+                    target.sensor_strength_magnetometric,
+                    add["sensor_strength_magnetometric"],
+                    mul["sensor_strength_magnetometric"],
+                    penalty_context.get("sensor_strength_magnetometric"),
+                ),
             ),
             sensor_strength_radar=max(
                 0.0,
-                (target.sensor_strength_radar + add["sensor_strength_radar"])
-                * self._stacking_multiplier(mul["sensor_strength_radar"]),
+                self._apply_penalized_projection(
+                    target.sensor_strength_radar,
+                    add["sensor_strength_radar"],
+                    mul["sensor_strength_radar"],
+                    penalty_context.get("sensor_strength_radar"),
+                ),
             ),
-            shield_resonance_em=max(0.01, min(1.0, target.shield_resonance_em * self._stacking_multiplier(mul["shield_resonance_em"]))),
-            shield_resonance_thermal=max(0.01, min(1.0, target.shield_resonance_thermal * self._stacking_multiplier(mul["shield_resonance_thermal"]))),
-            shield_resonance_kinetic=max(0.01, min(1.0, target.shield_resonance_kinetic * self._stacking_multiplier(mul["shield_resonance_kinetic"]))),
-            shield_resonance_explosive=max(0.01, min(1.0, target.shield_resonance_explosive * self._stacking_multiplier(mul["shield_resonance_explosive"]))),
-            armor_resonance_em=max(0.01, min(1.0, target.armor_resonance_em * self._stacking_multiplier(mul["armor_resonance_em"]))),
-            armor_resonance_thermal=max(0.01, min(1.0, target.armor_resonance_thermal * self._stacking_multiplier(mul["armor_resonance_thermal"]))),
-            armor_resonance_kinetic=max(0.01, min(1.0, target.armor_resonance_kinetic * self._stacking_multiplier(mul["armor_resonance_kinetic"]))),
-            armor_resonance_explosive=max(0.01, min(1.0, target.armor_resonance_explosive * self._stacking_multiplier(mul["armor_resonance_explosive"]))),
-            structure_resonance_em=max(0.01, min(1.0, target.structure_resonance_em * self._stacking_multiplier(mul["structure_resonance_em"]))),
-            structure_resonance_thermal=max(0.01, min(1.0, target.structure_resonance_thermal * self._stacking_multiplier(mul["structure_resonance_thermal"]))),
-            structure_resonance_kinetic=max(0.01, min(1.0, target.structure_resonance_kinetic * self._stacking_multiplier(mul["structure_resonance_kinetic"]))),
-            structure_resonance_explosive=max(0.01, min(1.0, target.structure_resonance_explosive * self._stacking_multiplier(mul["structure_resonance_explosive"]))),
+            shield_resonance_em=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.shield_resonance_em, 0.0, mul["shield_resonance_em"], penalty_context.get("shield_resonance_em"))),
+            ),
+            shield_resonance_thermal=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.shield_resonance_thermal, 0.0, mul["shield_resonance_thermal"], penalty_context.get("shield_resonance_thermal"))),
+            ),
+            shield_resonance_kinetic=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.shield_resonance_kinetic, 0.0, mul["shield_resonance_kinetic"], penalty_context.get("shield_resonance_kinetic"))),
+            ),
+            shield_resonance_explosive=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.shield_resonance_explosive, 0.0, mul["shield_resonance_explosive"], penalty_context.get("shield_resonance_explosive"))),
+            ),
+            armor_resonance_em=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.armor_resonance_em, 0.0, mul["armor_resonance_em"], penalty_context.get("armor_resonance_em"))),
+            ),
+            armor_resonance_thermal=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.armor_resonance_thermal, 0.0, mul["armor_resonance_thermal"], penalty_context.get("armor_resonance_thermal"))),
+            ),
+            armor_resonance_kinetic=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.armor_resonance_kinetic, 0.0, mul["armor_resonance_kinetic"], penalty_context.get("armor_resonance_kinetic"))),
+            ),
+            armor_resonance_explosive=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.armor_resonance_explosive, 0.0, mul["armor_resonance_explosive"], penalty_context.get("armor_resonance_explosive"))),
+            ),
+            structure_resonance_em=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.structure_resonance_em, 0.0, mul["structure_resonance_em"], penalty_context.get("structure_resonance_em"))),
+            ),
+            structure_resonance_thermal=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.structure_resonance_thermal, 0.0, mul["structure_resonance_thermal"], penalty_context.get("structure_resonance_thermal"))),
+            ),
+            structure_resonance_kinetic=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.structure_resonance_kinetic, 0.0, mul["structure_resonance_kinetic"], penalty_context.get("structure_resonance_kinetic"))),
+            ),
+            structure_resonance_explosive=max(
+                0.01,
+                min(1.0, self._apply_penalized_projection(target.structure_resonance_explosive, 0.0, mul["structure_resonance_explosive"], penalty_context.get("structure_resonance_explosive"))),
+            ),
         )
 
     @staticmethod
@@ -348,6 +528,7 @@ class RuntimeStatEngine:
                 m.module_id,
                 m.group,
                 m.state.value,
+                tuple(sorted(str(tag) for tag in m.tags)),
                 tuple(
                     (
                         e.name,
@@ -362,6 +543,8 @@ class RuntimeStatEngine:
                         tuple(sorted(e.local_add.items())),
                         tuple(sorted(e.projected_mult.items())),
                         tuple(sorted(e.projected_add.items())),
+                        tuple(sorted(e.projected_mult_groups.items())),
+                        e.projected_signature,
                     )
                     for e in m.effects
                 ),

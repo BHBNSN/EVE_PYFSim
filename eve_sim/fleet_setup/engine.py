@@ -197,13 +197,433 @@ class RuntimeFromEftFactory:
         return names
 
     @staticmethod
-    def _effect_name_has_any(effect_names: set[str], tokens: tuple[str, ...]) -> bool:
-        if not effect_names:
+    def _item_flag(item: Any, flag_name: str) -> bool:
+        try:
+            return bool(getattr(item, flag_name, False))
+        except Exception:
             return False
-        normalized_tokens = tuple(RuntimeFromEftFactory._normalize_effect_name(t) for t in tokens)
-        return any(any(token and token in effect_name for token in normalized_tokens) for effect_name in effect_names)
 
-    def _module_effect_pyfa(self, fitted_module, idx: int) -> ModuleRuntime | None:
+    @classmethod
+    def _module_tags(
+        cls,
+        *,
+        item: Any,
+        has_projected: bool,
+        is_active_module: bool,
+        affects_local_pyfa_profile: bool,
+        is_command_burst: bool,
+        is_smart_bomb: bool,
+        is_burst_jammer: bool,
+        is_weapon: bool,
+        has_projected_rep: bool,
+        is_cap_warfare: bool,
+        is_offensive_ewar: bool,
+        is_target_ewar: bool,
+        is_ecm: bool,
+        is_propulsion: bool,
+        is_damage_control: bool,
+        is_hardener: bool,
+        is_cap_booster: bool,
+    ) -> tuple[str, ...]:
+        tags: set[str] = set()
+
+        if is_active_module:
+            tags.add("controlled")
+        if affects_local_pyfa_profile:
+            tags.add("affects_local_pyfa_profile")
+        if has_projected:
+            tags.add("projected")
+
+        if cls._item_flag(item, "assistive"):
+            tags.add("support")
+        if cls._item_flag(item, "offensive"):
+            tags.add("hostile")
+
+        if is_command_burst:
+            tags.update(("command_burst", "area_effect", "support"))
+        if is_smart_bomb:
+            tags.update(("smart_bomb", "area_effect", "weapon", "hostile"))
+        if is_burst_jammer:
+            tags.update(("burst_jammer", "area_effect", "ecm", "offensive_ewar", "hostile"))
+        if is_weapon:
+            tags.update(("weapon", "hostile"))
+        if has_projected_rep:
+            tags.update(("remote_repair", "support"))
+        if is_cap_warfare:
+            tags.update(("cap_warfare", "offensive_ewar", "hostile"))
+        if is_offensive_ewar:
+            tags.update(("offensive_ewar", "hostile"))
+        if is_target_ewar:
+            tags.update(("target_ewar", "hostile"))
+        if is_ecm:
+            tags.update(("ecm", "offensive_ewar", "hostile"))
+        if is_propulsion:
+            tags.add("propulsion")
+        if is_damage_control:
+            tags.add("damage_control")
+        if is_hardener:
+            tags.add("hardener")
+        if is_cap_booster:
+            tags.add("cap_booster")
+
+        return tuple(sorted(tags))
+
+    def _fitted_module_projected_range(self, fitted_module: Any) -> float:
+        def attr_opt(name: str) -> float | None:
+            try:
+                value = fitted_module.getModifiedItemAttr(name)
+            except Exception:
+                value = None
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        for attr_name in (
+            "maxRange",
+            "shieldTransferRange",
+            "powerTransferRange",
+            "energyDestabilizationRange",
+            "empFieldRange",
+            "ecmBurstRange",
+            "warpScrambleRange",
+            "cargoScanRange",
+            "shipScanRange",
+            "surveyScanRange",
+        ):
+            value = attr_opt(attr_name)
+            if value is not None and abs(value) > 1e-9:
+                return max(0.0, float(value))
+        return 0.0
+
+    @staticmethod
+    def _projection_filter_signature(filter_func: Any, target_kind: str) -> tuple[Any, ...]:
+        code = getattr(filter_func, "__code__", None)
+        closure = getattr(filter_func, "__closure__", None) or ()
+        closure_values: list[Any] = []
+        for cell in closure:
+            try:
+                value = cell.cell_contents
+            except Exception:
+                value = None
+            if isinstance(value, (str, int, float, bool, type(None))):
+                closure_values.append(value)
+            else:
+                closure_values.append(type(value).__name__)
+
+        class _ProbeReq:
+            def __init__(self, skills: tuple[str, ...]) -> None:
+                self._skills = set(skills)
+
+            def requiresSkill(self, name: str) -> bool:
+                return str(name) in self._skills
+
+        class _ProbeGroup:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class _ProbeMod:
+            def __init__(self, item_skills: tuple[str, ...], charge_skills: tuple[str, ...], group_name: str) -> None:
+                self.item = type("ProbeItem", (), {"requiresSkill": _ProbeReq(item_skills).requiresSkill, "group": _ProbeGroup(group_name)})()
+                self.charge = type("ProbeCharge", (), {"requiresSkill": _ProbeReq(charge_skills).requiresSkill})()
+
+        probes = (
+            ("module_item_gunnery", _ProbeMod(("Gunnery",), tuple(), "Hybrid Weapon")),
+            ("module_charge_missile", _ProbeMod(tuple(), ("Missile Launcher Operation",), "Missile Launcher Heavy")),
+            ("fighter_item", _ProbeMod(("Fighters",), tuple(), "Fighter")),
+        )
+        semantic_matches: list[str] = []
+        for probe_name, probe in probes:
+            try:
+                if bool(filter_func(probe)):
+                    semantic_matches.append(probe_name)
+            except Exception:
+                continue
+
+        return (
+            str(target_kind),
+            tuple(sorted(semantic_matches)),
+            getattr(code, "co_name", ""),
+            tuple(str(name) for name in (getattr(code, "co_names", None) or ())),
+            tuple(repr(value) for value in (getattr(code, "co_consts", None) or ())),
+            tuple(repr(value) for value in closure_values),
+        )
+
+    @staticmethod
+    def _projection_operation_multiplier(op_kind: str, value: float) -> float | None:
+        if op_kind == "boost":
+            return 1.0 + float(value) / 100.0
+        if op_kind == "multiply":
+            return float(value)
+        return None
+
+    @staticmethod
+    def _merge_projected_multiplier(
+        projected_mult: dict[str, float],
+        projected_mult_groups: dict[str, str | None],
+        key: str,
+        multiplier: float,
+        group_name: str | None,
+    ) -> bool:
+        existing_group = projected_mult_groups.get(key, group_name)
+        if key in projected_mult and existing_group != group_name:
+            return False
+        projected_mult[key] = float(projected_mult.get(key, 1.0) or 1.0) * float(multiplier)
+        projected_mult_groups[key] = group_name
+        return True
+
+    def _record_projected_effect_operations(self, fitted_module: Any) -> tuple[list[tuple[Any, ...]], tuple[Any, ...]]:
+        records: list[tuple[Any, ...]] = []
+
+        class _AttrRecorder:
+            def __init__(self, target_kind: str) -> None:
+                self._target_kind = target_kind
+
+            def _record(self, op_kind: str, attr_name: str, value: float, **kwargs) -> None:
+                try:
+                    numeric_value = float(value)
+                except Exception:
+                    return
+                records.append(
+                    (
+                        self._target_kind,
+                        (),
+                        op_kind,
+                        str(attr_name or ""),
+                        numeric_value,
+                        bool(kwargs.get("stackingPenalties", False)),
+                        str(kwargs.get("penaltyGroup", "default")) if kwargs.get("stackingPenalties", False) else None,
+                    )
+                )
+
+            def increaseItemAttr(self, attr_name: str, value: float, **kwargs) -> None:
+                self._record("increase", attr_name, value, **kwargs)
+
+            def multiplyItemAttr(self, attr_name: str, value: float, **kwargs) -> None:
+                self._record("multiply", attr_name, value, **kwargs)
+
+            def boostItemAttr(self, attr_name: str, value: float, **kwargs) -> None:
+                self._record("boost", attr_name, value, **kwargs)
+
+            def forceItemAttr(self, attr_name: str, value: float, **kwargs) -> None:
+                self._record("force", attr_name, value, **kwargs)
+
+            def getModifiedItemAttr(self, _name: str, default: float = 0.0) -> float:
+                return float(default or 0.0)
+
+        class _FilteredRecorder:
+            def __init__(self, target_kind: str, factory: "RuntimeFromEftFactory") -> None:
+                self._target_kind = target_kind
+                self._factory = factory
+
+            def _record(self, target_kind: str, filter_func: Any, op_kind: str, attr_name: str, value: float, **kwargs) -> None:
+                try:
+                    numeric_value = float(value)
+                except Exception:
+                    return
+                records.append(
+                    (
+                        target_kind,
+                        self._factory._projection_filter_signature(filter_func, target_kind),
+                        op_kind,
+                        str(attr_name or ""),
+                        numeric_value,
+                        bool(kwargs.get("stackingPenalties", False)),
+                        str(kwargs.get("penaltyGroup", "default")) if kwargs.get("stackingPenalties", False) else None,
+                    )
+                )
+
+            def filteredItemIncrease(self, filter_func: Any, attr_name: str, value: float, **kwargs) -> None:
+                self._record(f"{self._target_kind}_item", filter_func, "increase", attr_name, value, **kwargs)
+
+            def filteredItemMultiply(self, filter_func: Any, attr_name: str, value: float, **kwargs) -> None:
+                self._record(f"{self._target_kind}_item", filter_func, "multiply", attr_name, value, **kwargs)
+
+            def filteredItemBoost(self, filter_func: Any, attr_name: str, value: float, **kwargs) -> None:
+                self._record(f"{self._target_kind}_item", filter_func, "boost", attr_name, value, **kwargs)
+
+            def filteredChargeIncrease(self, filter_func: Any, attr_name: str, value: float, **kwargs) -> None:
+                self._record(f"{self._target_kind}_charge", filter_func, "increase", attr_name, value, **kwargs)
+
+            def filteredChargeMultiply(self, filter_func: Any, attr_name: str, value: float, **kwargs) -> None:
+                self._record(f"{self._target_kind}_charge", filter_func, "multiply", attr_name, value, **kwargs)
+
+            def filteredChargeBoost(self, filter_func: Any, attr_name: str, value: float, **kwargs) -> None:
+                self._record(f"{self._target_kind}_charge", filter_func, "boost", attr_name, value, **kwargs)
+
+            def __iter__(self):
+                return iter(())
+
+        class _FitRecorder:
+            def __init__(self, factory: "RuntimeFromEftFactory") -> None:
+                self.ship = _AttrRecorder("ship")
+                self.modules = _FilteredRecorder("module", factory)
+                self.drones = _FilteredRecorder("drone", factory)
+                self.fighters = _FilteredRecorder("fighter", factory)
+
+        recorder = _FitRecorder(self)
+        original_state = getattr(fitted_module, "state", None)
+        try:
+            active_state = _pyfa_module_state_from_runtime_state(self, fitted_module, "ACTIVE")
+            if active_state is not None:
+                fitted_module.state = active_state
+            for run_time in ("early", "normal", "late"):
+                fitted_module.calculateModifiedAttributes(recorder, run_time, forceProjected=True, forcedProjRange=0.0)
+        except Exception:
+            return [], tuple()
+        finally:
+            if original_state is not None:
+                fitted_module.state = original_state
+
+        signature = tuple(
+            sorted(
+                (
+                    str(target_kind),
+                    tuple(filter_signature),
+                    str(op_kind),
+                    str(attr_name),
+                    round(float(value or 0.0), 6),
+                    bool(stacking_penalties),
+                    None if penalty_group is None else str(penalty_group),
+                )
+                for target_kind, filter_signature, op_kind, attr_name, value, stacking_penalties, penalty_group in records
+            )
+        )
+        return records, signature
+
+    def _projected_effects_from_pyfa_handler(
+        self,
+        fitted_module: Any,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, str | None], tuple[Any, ...]]:
+        projected_mult: dict[str, float] = {}
+        projected_add: dict[str, float] = {}
+        projected_mult_groups: dict[str, str | None] = {}
+        records, signature = self._record_projected_effect_operations(fitted_module)
+
+        ship_mult_map = {
+            "maxVelocity": "speed",
+            "signatureRadius": "sig",
+            "scanResolution": "scan",
+            "maxTargetRange": "range",
+            "scanGravimetricStrength": "sensor_strength_gravimetric",
+            "scanLadarStrength": "sensor_strength_ladar",
+            "scanMagnetometricStrength": "sensor_strength_magnetometric",
+            "scanRadarStrength": "sensor_strength_radar",
+            "shieldCapacity": "shield_hp",
+            "armorHP": "armor_hp",
+            "hp": "structure_hp",
+            "capacitorCapacity": "cap_max",
+            "rechargeRate": "cap_recharge",
+            "agility": "agility",
+            "mass": "mass",
+            "shieldEmDamageResonance": "shield_resonance_em",
+            "shieldThermalDamageResonance": "shield_resonance_thermal",
+            "shieldKineticDamageResonance": "shield_resonance_kinetic",
+            "shieldExplosiveDamageResonance": "shield_resonance_explosive",
+            "armorEmDamageResonance": "armor_resonance_em",
+            "armorThermalDamageResonance": "armor_resonance_thermal",
+            "armorKineticDamageResonance": "armor_resonance_kinetic",
+            "armorExplosiveDamageResonance": "armor_resonance_explosive",
+            "structureEmDamageResonance": "structure_resonance_em",
+            "structureThermalDamageResonance": "structure_resonance_thermal",
+            "structureKineticDamageResonance": "structure_resonance_kinetic",
+            "structureExplosiveDamageResonance": "structure_resonance_explosive",
+        }
+        ship_add_map = {
+            "warpScrambleStatus": "warp_scramble_status",
+        }
+        turret_mult_map = {
+            "trackingSpeed": "tracking",
+            "maxRange": "optimal",
+            "falloff": "falloff",
+        }
+        missile_mult_map = {
+            "aoeCloudSize": "missile_explosion_radius",
+            "aoeVelocity": "missile_explosion_velocity",
+            "maxVelocity": "missile_range",
+            "explosionDelay": "missile_range",
+        }
+
+        for target_kind, filter_signature, op_kind, attr_name, value, stacking_penalties, penalty_group in records:
+            multiplier = self._projection_operation_multiplier(str(op_kind), float(value or 0.0))
+            semantic_tags = set(str(tag) for tag in (filter_signature[1] if len(filter_signature) > 1 and isinstance(filter_signature[1], tuple) else ()))
+            if target_kind == "ship":
+                mapped_mult = ship_mult_map.get(str(attr_name))
+                if mapped_mult and multiplier is not None:
+                    if not self._merge_projected_multiplier(
+                        projected_mult,
+                        projected_mult_groups,
+                        mapped_mult,
+                        multiplier,
+                        str(penalty_group) if stacking_penalties else None,
+                    ):
+                        return {}, {}, {}, signature
+                    continue
+                mapped_add = ship_add_map.get(str(attr_name))
+                if mapped_add and str(op_kind) == "increase":
+                    projected_add[mapped_add] = projected_add.get(mapped_add, 0.0) + float(value or 0.0)
+                    continue
+                if str(attr_name) in {"disallowAssistance", "disallowOffensiveModifiers"}:
+                    continue
+                return {}, {}, {}, signature
+
+            if target_kind == "module_item" and "module_item_gunnery" in semantic_tags:
+                mapped_mult = turret_mult_map.get(str(attr_name))
+                if mapped_mult and multiplier is not None:
+                    if not self._merge_projected_multiplier(
+                        projected_mult,
+                        projected_mult_groups,
+                        mapped_mult,
+                        multiplier,
+                        str(penalty_group) if stacking_penalties else None,
+                    ):
+                        return {}, {}, {}, signature
+                    continue
+                return {}, {}, {}, signature
+
+            if target_kind == "module_charge" and "module_charge_missile" in semantic_tags:
+                mapped_mult = missile_mult_map.get(str(attr_name))
+                if mapped_mult and multiplier is not None:
+                    if not self._merge_projected_multiplier(
+                        projected_mult,
+                        projected_mult_groups,
+                        mapped_mult,
+                        multiplier,
+                        str(penalty_group) if stacking_penalties else None,
+                    ):
+                        return {}, {}, {}, signature
+                    continue
+                return {}, {}, {}, signature
+
+            if str(target_kind).startswith("fighter_") or str(target_kind).startswith("drone_"):
+                continue
+            return {}, {}, {}, signature
+
+        return projected_mult, projected_add, projected_mult_groups, signature
+
+    def _module_effect_pyfa(
+        self,
+        parsed: ParsedEftFit | Any,
+        fit_ctx: Any = None,
+        fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]] | None = None,
+        fitted_module: Any | None = None,
+        idx: int | None = None,
+        state_by_module_id: dict[str, str] | None = None,
+        command_booster_snapshots: list[dict[str, Any]] | None = None,
+    ) -> ModuleRuntime | None:
+        if idx is None and fitted_module is None and isinstance(fit_ctx, int):
+            idx = int(fit_ctx)
+            fitted_module = parsed
+            parsed = ParsedEftFit(ship_name="", fit_name="", module_names=[], module_specs=[], cargo_item_names=[], fit_key="")
+            fit_ctx = None
+            fitted_modules = []
+        del fit_ctx
+        if fitted_module is None or idx is None:
+            return None
+        if fitted_modules is None:
+            fitted_modules = []
         item = getattr(fitted_module, "item", None)
         if item is None:
             return None
@@ -211,8 +631,6 @@ class RuntimeFromEftFactory:
         group_name = (item.group.name or "").lower()
         suffix = f"-{idx}"
         loaded_charge = getattr(fitted_module, "charge", None)
-        effect_names = self._module_effect_names(fitted_module)
-
         def attr_opt(name: str) -> float | None:
             try:
                 value = fitted_module.getModifiedItemAttr(name)
@@ -232,18 +650,6 @@ class RuntimeFromEftFactory:
         def pct_to_mult(value: float) -> float:
             return max(0.01, 1.0 + value / 100.0)
 
-        def charge_attr_opt(name: str) -> float | None:
-            try:
-                value = fitted_module.getModifiedChargeAttr(name)
-            except Exception:
-                value = None
-            if value is None:
-                return None
-            try:
-                return float(value)
-            except Exception:
-                return None
-
         def first_attr(*names: str) -> float:
             for attr_name in names:
                 value = attr_opt(attr_name)
@@ -252,10 +658,6 @@ class RuntimeFromEftFactory:
                 if abs(value) > 1e-9:
                     return float(value)
             return 0.0
-
-        def merge_mult(store: dict[str, float], key: str, mult: float) -> None:
-            prev = float(store.get(key, 1.0) or 1.0)
-            store[key] = max(0.01, prev * mult)
 
         supports_active_state = False
         active_state = getattr(self._pyfa, "_fitting_module_state_active", None)
@@ -301,124 +703,22 @@ class RuntimeFromEftFactory:
         projected_mult: dict[str, float] = {}
         projected_add: dict[str, float] = {}
 
-        has_tracking_attrs = any(
-            abs(attr_opt(name) or 0.0) > 1e-9
-            for name in ("trackingSpeedBonus", "maxRangeBonus", "falloffBonus")
-        )
-        has_guidance_attrs = any(
-            abs(attr_opt(name) or 0.0) > 1e-9
-            for name in ("aoeCloudSizeBonus", "aoeVelocityBonus", "missileVelocityBonus", "explosionDelayBonus")
-        )
-
-        is_web = self._effect_name_has_any(
-            effect_names,
-            (
-                "remoteWebifier",
-                "stasisWebifier",
-                "doomsdayAOEWeb",
-                "stasisGrappler",
-            ),
-        ) or ("stasis web" in group_name) or ("stasis grappler" in group_name)
-
-        is_target_painter = self._effect_name_has_any(
-            effect_names,
-            (
-                "remoteTargetPaint",
-                "targetPainter",
-                "doomsdayAOEPaint",
-            ),
-        ) or ("target painter" in group_name)
-
-        is_sensor_damp = self._effect_name_has_any(
-            effect_names,
-            (
-                "remoteSensorDamp",
-                "sensorDamp",
-                "doomsdayAOEDamp",
-            ),
-        ) or ("sensor dampener" in group_name)
-
-        is_weapon_disrupt = self._effect_name_has_any(
-            effect_names,
-            (
-                "weaponDisrupt",
-                "doomsdayAOETrack",
-            ),
-        ) or ("weapon disruptor" in group_name) or ("structure disruption battery" in group_name)
-
-        is_tracking_disrupt = self._effect_name_has_any(
-            effect_names,
-            (
-                "trackingDisrupt",
-            ),
-        ) or (is_weapon_disrupt and has_tracking_attrs)
-
-        is_guidance_disrupt = self._effect_name_has_any(
-            effect_names,
-            (
-                "guidanceDisrupt",
-            ),
-        ) or (is_weapon_disrupt and has_guidance_attrs)
-
-        is_ecm = self._effect_name_has_any(
-            effect_names,
-            (
-                "remoteECM",
-                "structureModuleEffectECM",
-                "entityECM",
-                "doomsdayAOEECM",
-            ),
-        ) or ("ecm" in group_name) or ("burst jammer" in group_name)
-
         is_command_burst = "command burst" in group_name
+        is_burst_jammer = "burst jammer" in group_name
         is_smart_bomb = ("smart bomb" in group_name) or ("structure area denial module" in group_name)
-
-        handled_projection_attrs: set[str] = set()
-
-        def map_projected_or_local(attr_name: str, key: str, force_projected: bool = False) -> None:
-            value = attr_opt(attr_name)
-            if value is None or abs(value) < 1e-9:
-                return
-            handled_projection_attrs.add(attr_name)
-            if force_projected and range_m > 0:
-                projected_mult[key] = pct_to_mult(value)
-            elif value < 0 and range_m > 0:
-                projected_mult[key] = pct_to_mult(value)
-            else:
-                local_mult[key] = pct_to_mult(value)
+        is_weapon_like = self._is_weapon_like_group(group_name)
 
         speed_factor = attr_opt("speedFactor")
-        if speed_factor is not None and abs(float(speed_factor) - 1.0) > 1e-6:
-            if is_web and range_m > 0 and abs(speed_factor) > 1e-9:
-                projected_mult["speed"] = pct_to_mult(speed_factor)
-                handled_projection_attrs.add("speedFactor")
-            elif speed_factor < 0 and range_m > 0:
-                projected_mult["speed"] = pct_to_mult(speed_factor)
-            elif speed_factor > 0:
-                local_mult["speed"] = max(local_mult.get("speed", 1.0), pct_to_mult(speed_factor))
+        if speed_factor is not None and abs(float(speed_factor) - 1.0) > 1e-6 and range_m <= 0.0 and speed_factor > 0:
+            local_mult["speed"] = max(local_mult.get("speed", 1.0), pct_to_mult(speed_factor))
 
         max_velocity_bonus = attr_opt("maxVelocityBonus")
-        if max_velocity_bonus is not None and max_velocity_bonus > 0:
+        if max_velocity_bonus is not None and max_velocity_bonus > 0 and range_m <= 0.0:
             local_mult["speed"] = max(local_mult.get("speed", 1.0), pct_to_mult(max_velocity_bonus))
 
         signature_radius_bonus = attr_opt("signatureRadiusBonus")
-        if signature_radius_bonus is not None:
-            if is_target_painter and range_m > 0 and abs(signature_radius_bonus) > 1e-9:
-                projected_mult["sig"] = pct_to_mult(signature_radius_bonus)
-                handled_projection_attrs.add("signatureRadiusBonus")
-            elif signature_radius_bonus > 0 and range_m > 0:
-                projected_mult["sig"] = pct_to_mult(signature_radius_bonus)
-            elif signature_radius_bonus != 0:
-                local_mult["sig"] = pct_to_mult(signature_radius_bonus)
-
-        if is_sensor_damp:
-            map_projected_or_local("scanResolutionBonus", "scan", force_projected=True)
-            map_projected_or_local("maxTargetRangeBonus", "range", force_projected=True)
-
-        if is_tracking_disrupt:
-            map_projected_or_local("trackingSpeedBonus", "tracking", force_projected=True)
-            map_projected_or_local("maxRangeBonus", "optimal", force_projected=True)
-            map_projected_or_local("falloffBonus", "falloff", force_projected=True)
+        if signature_radius_bonus is not None and signature_radius_bonus != 0 and range_m <= 0.0:
+            local_mult["sig"] = pct_to_mult(signature_radius_bonus)
 
         for attr_name, key in (
             ("scanResolutionBonus", "scan"),
@@ -427,33 +727,11 @@ class RuntimeFromEftFactory:
             ("maxRangeBonus", "optimal"),
             ("falloffBonus", "falloff"),
         ):
-            if attr_name in handled_projection_attrs:
-                continue
             value = attr_opt(attr_name)
             if value is None or abs(value) < 1e-9:
                 continue
-            if value < 0 and range_m > 0:
-                projected_mult[key] = pct_to_mult(value)
-            else:
+            if range_m <= 0.0 or value > 0.0:
                 local_mult[key] = pct_to_mult(value)
-
-        if range_m > 0.0 and (is_guidance_disrupt or has_guidance_attrs):
-            missile_explosion_radius_bonus = attr_opt("aoeCloudSizeBonus")
-            if missile_explosion_radius_bonus is not None and abs(missile_explosion_radius_bonus) > 1e-9:
-                projected_mult["missile_explosion_radius"] = pct_to_mult(missile_explosion_radius_bonus)
-
-            missile_explosion_velocity_bonus = attr_opt("aoeVelocityBonus")
-            if missile_explosion_velocity_bonus is not None and abs(missile_explosion_velocity_bonus) > 1e-9:
-                projected_mult["missile_explosion_velocity"] = pct_to_mult(missile_explosion_velocity_bonus)
-
-            missile_range_mult = 1.0
-            for attr_name in ("missileVelocityBonus", "explosionDelayBonus"):
-                value = attr_opt(attr_name)
-                if value is None or abs(value) < 1e-9:
-                    continue
-                missile_range_mult *= pct_to_mult(value)
-            if abs(missile_range_mult - 1.0) > 1e-9:
-                projected_mult["missile_range"] = max(0.01, missile_range_mult)
 
         ecm_strengths = {
             "ecm_gravimetric": max(0.0, attr("scanGravimetricStrengthBonus", 0.0)),
@@ -461,22 +739,23 @@ class RuntimeFromEftFactory:
             "ecm_magnetometric": max(0.0, attr("scanMagnetometricStrengthBonus", 0.0)),
             "ecm_radar": max(0.0, attr("scanRadarStrengthBonus", 0.0)),
         }
+        is_ecm = any(value > 0.0 for value in ecm_strengths.values()) or is_burst_jammer
+        shield_rep = abs(attr("shieldBonus", 0.0))
+        armor_rep = abs(attr("armorDamageAmount", 0.0))
+        cap_drain = abs(attr("energyNeutralizerAmount", 0.0))
+        nos_drain = abs(attr("powerTransferAmount", 0.0))
         if range_m > 0.0 and is_ecm:
             for key, value in ecm_strengths.items():
                 if value > 0.0:
                     projected_add[key] = value
 
         if range_m > 0.0:
-            shield_rep = abs(attr("shieldBonus", 0.0))
             if shield_rep > 0.0:
                 projected_add["shield_rep"] = shield_rep
-            armor_rep = abs(attr("armorDamageAmount", 0.0))
             if armor_rep > 0.0:
                 projected_add["armor_rep"] = armor_rep
-            cap_drain = abs(attr("energyNeutralizerAmount", 0.0))
             if cap_drain > 0.0:
                 projected_add["cap_drain"] = cap_drain
-            nos_drain = abs(attr("powerTransferAmount", 0.0))
             if nos_drain > 0.0 and "nosferatu" in group_name:
                 projected_add["cap_drain"] = max(projected_add.get("cap_drain", 0.0), nos_drain)
         else:
@@ -502,7 +781,6 @@ class RuntimeFromEftFactory:
                     projected_add["damage_kinetic"] = kinetic_dps * damage_cycle
                     projected_add["damage_explosive"] = explosive_dps * damage_cycle
 
-        is_weapon_like = self._is_weapon_like_group(group_name)
         if is_weapon_like and range_m > 0.0:
             try:
                 dps_obj = fitted_module.getDps()
@@ -542,6 +820,28 @@ class RuntimeFromEftFactory:
                         projected_add["weapon_tracking"] = max(0.0, attr("trackingSpeed", 0.0))
                         projected_add["weapon_optimal_sig"] = max(1.0, attr("optimalSigRadius", 40_000.0))
 
+        projected_mult_groups: dict[str, str | None] = {}
+        projected_signature: tuple[Any, ...] = tuple()
+        should_record_projected_profile = (
+            range_m > 0.0
+            and not is_ecm
+            and not is_command_burst
+            and not is_smart_bomb
+            and not is_weapon_like
+            and shield_rep <= 0.0
+            and armor_rep <= 0.0
+            and cap_drain <= 0.0
+            and not (nos_drain > 0.0 and "nosferatu" in group_name)
+        )
+        if should_record_projected_profile:
+            recorded_mult, recorded_add, recorded_groups, recorded_signature = self._projected_effects_from_pyfa_handler(
+                fitted_module,
+            )
+            projected_mult.update(recorded_mult)
+            projected_add.update(recorded_add)
+            projected_mult_groups.update(recorded_groups)
+            projected_signature = recorded_signature
+
         cap_capacity_bonus = attr_opt("capacitorCapacityBonus")
         if cap_capacity_bonus is not None and abs(cap_capacity_bonus) > 1e-9:
             local_mult["cap_max"] = pct_to_mult(cap_capacity_bonus)
@@ -574,7 +874,38 @@ class RuntimeFromEftFactory:
             if abs(damage_scale - 1.0) > 1e-6:
                 local_mult["dps"] = max(0.01, damage_scale)
 
-        has_projected = bool(projected_mult or projected_add) or (is_command_burst and range_m > 0.0)
+        has_projected_damage = any(str(key).startswith("damage_") for key in projected_add.keys())
+        is_weapon = is_weapon_like and has_projected_damage
+        has_projected_rep = shield_rep > 0.0 or armor_rep > 0.0
+        is_cap_warfare = cap_drain > 0.0 or (nos_drain > 0.0 and "nosferatu" in group_name)
+        is_offensive_ewar = any(token in group_name for token in ("weapon disruptor", "sensor damp", "warp scrambler"))
+        is_target_ewar = any(token in group_name for token in ("target painter", "stasis web", "stasis grappler"))
+        is_cap_booster = "capacitor booster" in group_name
+        is_propulsion = "propulsion module" in group_name
+        is_damage_control = group_name == "damage control"
+        is_hardener = any(
+            token in group_name
+            for token in (
+                "shield hardener",
+                "armor hardener",
+                "energized",
+                "armor resistance shift hardener",
+            )
+        )
+        has_projected = (
+            range_m > 0.0
+            and (
+                bool(projected_mult or projected_add or projected_signature)
+                or should_record_projected_profile
+                or is_command_burst
+                or is_smart_bomb
+                or is_burst_jammer
+                or is_ecm
+                or is_weapon
+                or has_projected_rep
+                or is_cap_warfare
+            )
+        )
         is_active_module = supports_active_state and ((cap_need > 0.0) or (cycle_ms > 0.0) or has_projected)
         if self._is_weapon_like_group(group_name) and cycle_ms > 0.0:
             is_active_module = True
@@ -582,6 +913,26 @@ class RuntimeFromEftFactory:
         state_required = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
         module_state = ModuleState.ONLINE
         module_id = f"mod{suffix}"
+        affects_local_pyfa_profile = is_command_burst or (not has_projected and state_required == ModuleState.ACTIVE)
+        module_tags = self._module_tags(
+            item=item,
+            has_projected=has_projected,
+            is_active_module=is_active_module,
+            affects_local_pyfa_profile=affects_local_pyfa_profile,
+            is_command_burst=is_command_burst,
+            is_smart_bomb=is_smart_bomb,
+            is_burst_jammer=is_burst_jammer,
+            is_weapon=is_weapon,
+            has_projected_rep=has_projected_rep,
+            is_cap_warfare=is_cap_warfare,
+            is_offensive_ewar=is_offensive_ewar,
+            is_target_ewar=is_target_ewar,
+            is_ecm=is_ecm,
+            is_propulsion=is_propulsion,
+            is_damage_control=is_damage_control,
+            is_hardener=is_hardener,
+            is_cap_booster=is_cap_booster,
+        )
 
         charge_capacity = 0
         item_modified_attrs = getattr(fitted_module, "itemModifiedAttributes", None)
@@ -632,6 +983,8 @@ class RuntimeFromEftFactory:
                 {},
                 projected_mult,
                 projected_add,
+                projected_mult_groups,
+                projected_signature,
             )
         else:
             effect = ModuleEffect(
@@ -647,6 +1000,8 @@ class RuntimeFromEftFactory:
                 local_add,
                 {},
                 {},
+                {},
+                tuple(),
             )
 
         return ModuleRuntime(
@@ -658,6 +1013,7 @@ class RuntimeFromEftFactory:
             charge_rate=charge_rate,
             charge_remaining=charge_remaining,
             charge_reload_time=charge_reload_time,
+            tags=module_tags,
         )
 
     @staticmethod
@@ -838,6 +1194,10 @@ class RuntimeFromEftFactory:
             raise ValueError(f"pyfa ship not found: {parsed.ship_name}")
 
         fit = fit_cls(ship=ship_cls(ship_item), name=parsed.fit_name)
+        try:
+            fit.implantLocation = 0
+        except Exception:
+            pass
         fit.character = character_cls.getAll5()
         fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]] = []
 
@@ -941,6 +1301,163 @@ class RuntimeFromEftFactory:
             "structure_resonance_explosive": float(ship.getModifiedItemAttr("explosiveDamageResonance") or 1.0),
         }
 
+    def _extract_pyfa_ship_attribute_penalty_context(self, fit_ctx: Any) -> dict[str, dict[str, Any]]:
+        modified_attrs = getattr(getattr(fit_ctx, "ship", None), "itemModifiedAttributes", None)
+        if modified_attrs is None:
+            return {}
+
+        forced = getattr(modified_attrs, "_ModifiedAttributeDict__forced", {})
+        pre_assigns = getattr(modified_attrs, "_ModifiedAttributeDict__preAssigns", {})
+        pre_increases = getattr(modified_attrs, "_ModifiedAttributeDict__preIncreases", {})
+        multipliers = getattr(modified_attrs, "_ModifiedAttributeDict__multipliers", {})
+        penalized = getattr(modified_attrs, "_ModifiedAttributeDict__penalizedMultipliers", {})
+        post_increases = getattr(modified_attrs, "_ModifiedAttributeDict__postIncreases", {})
+
+        attr_map = {
+            "maxVelocity": "speed",
+            "signatureRadius": "sig",
+            "scanResolution": "scan",
+            "maxTargetRange": "range",
+            "shieldCapacity": "shield_hp",
+            "armorHP": "armor_hp",
+            "hp": "structure_hp",
+            "capacitorCapacity": "cap_max",
+            "rechargeRate": "cap_recharge",
+            "mass": "mass",
+            "agility": "agility",
+            "scanGravimetricStrength": "sensor_strength_gravimetric",
+            "scanLadarStrength": "sensor_strength_ladar",
+            "scanMagnetometricStrength": "sensor_strength_magnetometric",
+            "scanRadarStrength": "sensor_strength_radar",
+            "shieldEmDamageResonance": "shield_resonance_em",
+            "shieldThermalDamageResonance": "shield_resonance_thermal",
+            "shieldKineticDamageResonance": "shield_resonance_kinetic",
+            "shieldExplosiveDamageResonance": "shield_resonance_explosive",
+            "armorEmDamageResonance": "armor_resonance_em",
+            "armorThermalDamageResonance": "armor_resonance_thermal",
+            "armorKineticDamageResonance": "armor_resonance_kinetic",
+            "armorExplosiveDamageResonance": "armor_resonance_explosive",
+            "emDamageResonance": "structure_resonance_em",
+            "thermalDamageResonance": "structure_resonance_thermal",
+            "kineticDamageResonance": "structure_resonance_kinetic",
+            "explosiveDamageResonance": "structure_resonance_explosive",
+        }
+
+        contexts: dict[str, dict[str, Any]] = {}
+        for attr_name, formula_key in attr_map.items():
+            if attr_name in forced:
+                continue
+            original = pre_assigns.get(attr_name, modified_attrs.getOriginal(attr_name))
+            if original is None:
+                continue
+            try:
+                pre_penalty_value = float(original or 0.0) + float(pre_increases.get(attr_name, 0.0) or 0.0)
+                pre_penalty_value *= float(multipliers.get(attr_name, 1.0) or 1.0)
+                post_penalty_value = float(post_increases.get(attr_name, 0.0) or 0.0)
+            except Exception:
+                continue
+
+            group_values: dict[str, list[float]] = {}
+            raw_groups = penalized.get(attr_name, {})
+            if isinstance(raw_groups, dict):
+                for group_name, values in raw_groups.items():
+                    if not isinstance(values, list):
+                        continue
+                    parsed_values = [float(value or 1.0) for value in values]
+                    if parsed_values:
+                        group_values[str(group_name)] = parsed_values
+
+            if not group_values and abs(post_penalty_value) <= 1e-9:
+                continue
+
+            contexts[formula_key] = {
+                "pre": pre_penalty_value,
+                "post": post_penalty_value,
+                "groups": group_values,
+            }
+        return contexts
+
+    def _extract_pyfa_weapon_attribute_penalty_context(self, fit_ctx: Any) -> list[dict[str, Any]]:
+        contexts: list[dict[str, Any]] = []
+        attr_map = {
+            "maxRange": "optimal",
+            "falloff": "falloff",
+            "trackingSpeed": "tracking",
+        }
+
+        for module in getattr(fit_ctx, "modules", []) or []:
+            item = getattr(module, "item", None)
+            if item is None:
+                continue
+            group_name = str(getattr(getattr(item, "group", None), "name", "") or "").lower()
+            is_launcher = "launcher" in group_name
+            is_turret = ("weapon" in group_name or "turret" in group_name) and not is_launcher
+            if not (is_turret or is_launcher):
+                continue
+
+            try:
+                dps_total = float(getattr(module.getDps(), "total", 0.0) or 0.0)
+            except Exception:
+                dps_total = 0.0
+            if dps_total <= 0.0:
+                continue
+
+            modified_attrs = getattr(module, "itemModifiedAttributes", None)
+            if modified_attrs is None:
+                continue
+
+            forced = getattr(modified_attrs, "_ModifiedAttributeDict__forced", {})
+            pre_assigns = getattr(modified_attrs, "_ModifiedAttributeDict__preAssigns", {})
+            pre_increases = getattr(modified_attrs, "_ModifiedAttributeDict__preIncreases", {})
+            multipliers = getattr(modified_attrs, "_ModifiedAttributeDict__multipliers", {})
+            penalized = getattr(modified_attrs, "_ModifiedAttributeDict__penalizedMultipliers", {})
+            post_increases = getattr(modified_attrs, "_ModifiedAttributeDict__postIncreases", {})
+
+            entry: dict[str, Any] = {
+                "weight": dps_total,
+                "kind": "gunnery" if is_turret else "launcher",
+            }
+
+            for attr_name, formula_key in attr_map.items():
+                if attr_name in forced:
+                    continue
+
+                try:
+                    current_value = float(module.getModifiedItemAttr(attr_name) or 0.0)
+                except Exception:
+                    current_value = 0.0
+
+                original = pre_assigns.get(attr_name, modified_attrs.getOriginal(attr_name))
+                context: dict[str, Any] = {
+                    "current": current_value,
+                }
+                if original is not None:
+                    try:
+                        pre_penalty_value = float(original or 0.0) + float(pre_increases.get(attr_name, 0.0) or 0.0)
+                        pre_penalty_value *= float(multipliers.get(attr_name, 1.0) or 1.0)
+                        context["pre"] = pre_penalty_value
+                        context["post"] = float(post_increases.get(attr_name, 0.0) or 0.0)
+                    except Exception:
+                        pass
+
+                group_values: dict[str, list[float]] = {}
+                raw_groups = penalized.get(attr_name, {})
+                if isinstance(raw_groups, dict):
+                    for group_name, values in raw_groups.items():
+                        if not isinstance(values, list):
+                            continue
+                        parsed_values = [float(value or 1.0) for value in values]
+                        if parsed_values:
+                            group_values[str(group_name)] = parsed_values
+                if group_values:
+                    context["groups"] = group_values
+
+                entry[formula_key] = context
+
+            contexts.append(entry)
+
+        return contexts
+
     @staticmethod
     def _module_state_text(value: str) -> ModuleState:
         state_name = str(value or "ONLINE").upper()
@@ -988,7 +1505,15 @@ class RuntimeFromEftFactory:
             modules: list[ModuleRuntime] = []
             pyfa_blueprint_modules: list[dict[str, Any]] = []
             for idx, (spec, fitted_module, effective_charge_name) in enumerate(fitted_modules, start=1):
-                module = self._module_effect_pyfa(fitted_module, idx)
+                module = self._module_effect_pyfa(
+                    parsed,
+                    fit_ctx,
+                    fitted_modules,
+                    fitted_module,
+                    idx,
+                    state_by_module_id=state_by_module_id,
+                    command_booster_snapshots=command_booster_snapshots,
+                )
                 if module is not None:
                     if spec.offline:
                         module.state = ModuleState.OFFLINE
@@ -1123,6 +1648,8 @@ class RuntimeFromEftFactory:
                 "modules": pyfa_blueprint_modules,
             }
             runtime.diagnostics["pyfa_command_boosters"] = deepcopy(command_booster_snapshots or [])
+            runtime.diagnostics["pyfa_ship_attribute_penalty_context"] = self._extract_pyfa_ship_attribute_penalty_context(fit_ctx)
+            runtime.diagnostics["pyfa_weapon_attribute_penalty_context"] = self._extract_pyfa_weapon_attribute_penalty_context(fit_ctx)
             runtime.diagnostics["motion_params"] = {
                 "mass": float(pyfa_final.get("mass", 0.0) or 0.0),
                 "agility": float(pyfa_final.get("agility", 0.0) or 0.0),
@@ -1510,6 +2037,7 @@ _STATIC_BACKEND: _PyfaStaticBackend | None = None
 _PYFA_RUNTIME_RESOLVED_CACHE: dict[tuple[Any, ...], tuple[FitRuntime, ShipProfile]] = {}
 _PYFA_PRECALCULATED_LOCAL_BASE_FIT_CACHE: dict[tuple[Any, ...], tuple[Any, tuple[str | None, ...]]] = {}
 _PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
+_PYFA_PROJECTION_SIGNATURE_ROUND_DIGITS = 6
 
 
 def _get_static_backend() -> _PyfaStaticBackend:
@@ -1517,6 +2045,20 @@ def _get_static_backend() -> _PyfaStaticBackend:
     if _STATIC_BACKEND is None:
         _STATIC_BACKEND = _PyfaStaticBackend()
     return _STATIC_BACKEND
+
+
+def _rollback_pyfa_saveddata_session() -> None:
+    try:
+        eos_db = importlib.import_module("eos.db")
+    except Exception:
+        return
+    rollback = getattr(eos_db, "rollback", None)
+    if not callable(rollback):
+        return
+    try:
+        rollback()
+    except Exception:
+        pass
 
 
 def get_fit_backend_status() -> str:
@@ -1718,21 +2260,16 @@ def _copy_precalculated_neutral_base_fit(
     return fit_copy, _copy_fitted_modules_from_template(parsed, fit_copy, charge_names)
 
 
-def _module_group_name(module: ModuleRuntime) -> str:
-    return str(getattr(module, "group", "") or "").strip().lower()
-
-
-def _module_group_has_equal(module: ModuleRuntime, tokens: tuple[str, ...]) -> bool:
-    group_name = _module_group_name(module)
-    return any(group_name == token for token in tokens)
+def _module_has_tag(module: ModuleRuntime, tag: str) -> bool:
+    return str(tag) in tuple(str(value) for value in getattr(module, "tags", ()) or ())
 
 
 def _module_requires_control_state(module: ModuleRuntime) -> bool:
-    return module.can_be_active()
+    return _module_has_tag(module, "controlled") or module.can_be_active()
 
 
 def _module_is_command_burst_module(module: ModuleRuntime) -> bool:
-    return _module_group_has_equal(module, ("command burst",))
+    return _module_has_tag(module, "command_burst")
 
 
 
@@ -1799,7 +2336,7 @@ def _runtime_module_state_map(runtime: FitRuntime) -> dict[str, str]:
 
 
 def _module_affects_local_pyfa_profile(module: ModuleRuntime) -> bool:
-    if _module_is_command_burst_module(module):
+    if _module_has_tag(module, "affects_local_pyfa_profile"):
         return True
     return any(
         effect.effect_class == EffectClass.LOCAL and effect.state_required == ModuleState.ACTIVE
@@ -1905,18 +2442,39 @@ def _normalized_snapshot_projection_signature(snapshot: dict[str, Any]) -> tuple
     return "in_range", None
 
 
-def _projected_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+def _normalized_projection_effect_signature(raw: Any) -> tuple[Any, ...] | None:
+    if not isinstance(raw, (tuple, list)):
+        return None
+    try:
+        return tuple(raw)
+    except Exception:
+        _rollback_pyfa_saveddata_session()
+        return None
+
+
+def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    direct_signature = _normalized_projection_effect_signature(snapshot.get("pyfa_projection_module_signature"))
+    if direct_signature is not None:
+        return direct_signature
+
     blueprint_raw = snapshot.get("blueprint")
     blueprint: dict[str, Any] = blueprint_raw if isinstance(blueprint_raw, dict) else {}
     state_raw = snapshot.get("state_by_module_id")
     state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
     command_raw = snapshot.get("command_booster_snapshots")
     command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
-    projection_key_mode, distance_signature = _normalized_snapshot_projection_signature(snapshot)
     return (
+        "legacy_source",
         _runtime_blueprint_signature(blueprint),
         _module_state_signature({str(module_id): str(state) for module_id, state in state_by_module_id.items()}),
         tuple(sorted(_command_snapshot_signature(command_snapshot) for command_snapshot in command_snapshots)),
+    )
+
+
+def _projected_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    projection_key_mode, distance_signature = _normalized_snapshot_projection_signature(snapshot)
+    return (
+        _projected_snapshot_module_signature(snapshot),
         projection_key_mode,
         distance_signature,
     )
@@ -1950,7 +2508,7 @@ def get_runtime_resolve_cache_key(
     projected_snapshots = _normalized_projected_source_snapshots(runtime, projected_source_snapshots)
     return (
         blueprint_signature,
-        _module_state_signature(_runtime_module_state_map(runtime)),
+        _runtime_local_profile_state_signature(runtime),
         tuple(sorted(_command_snapshot_signature(snapshot) for snapshot in snapshots)),
         tuple(sorted(_projected_snapshot_signature(snapshot) for snapshot in projected_snapshots)),
     )

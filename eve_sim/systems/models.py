@@ -92,6 +92,8 @@ _FORMULA_PROJECTED_KEYS = frozenset(
         "dps",
         "cap_max",
         "cap_recharge",
+        "mass",
+        "agility",
     }
 )
 
