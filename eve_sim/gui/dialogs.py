@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
+    QAbstractItemView,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -32,6 +33,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
     QTableView,
     QTabWidget,
     QVBoxLayout,
@@ -482,8 +485,11 @@ class ShipStatusDialog(QDialog):
         self._lock_ammo_draft_by_module: dict[str, str] = {}
         self._stable_profile_cache = None
         self._stable_profile_cache_key: tuple[Any, ...] | None = None
+        self._lock_controls_signature: tuple[Any, ...] | None = None
+        self._tab_signatures: dict[str, tuple[Any, ...] | str] = {}
+        self._tab_keys = ["overview", "combat", "defense", "cap_target", "modules", "debug"]
         self.setWindowTitle(f"{tr(self._language_getter(), 'ship_status_title')} - {ship_id}")
-        self.resize(520, 480)
+        self.resize(920, 720)
 
         layout = QVBoxLayout(self)
         lock_row1 = QHBoxLayout()
@@ -506,19 +512,156 @@ class ShipStatusDialog(QDialog):
         lock_row2.addWidget(self.btn_lock_clear)
         layout.addLayout(lock_row2)
 
+        self.tabs = QTabWidget(self)
+        layout.addWidget(self.tabs, 1)
+
+        self.overview_table = self._create_read_only_table(2)
+        overview_page = QWidget(self)
+        overview_layout = QVBoxLayout(overview_page)
+        overview_layout.setContentsMargins(0, 0, 0, 0)
+        overview_layout.addWidget(self.overview_table)
+        self.tabs.addTab(overview_page, "")
+
+        self.combat_table = self._create_read_only_table(2)
+        combat_page = QWidget(self)
+        combat_layout = QVBoxLayout(combat_page)
+        combat_layout.setContentsMargins(0, 0, 0, 0)
+        combat_layout.addWidget(self.combat_table)
+        self.tabs.addTab(combat_page, "")
+
+        self.defense_summary_table = self._create_read_only_table(2)
+        self.defense_resistance_table = self._create_read_only_table(6, stretch_last=False)
+        defense_page = QWidget(self)
+        defense_layout = QVBoxLayout(defense_page)
+        defense_layout.setContentsMargins(0, 0, 0, 0)
+        defense_layout.addWidget(self.defense_summary_table)
+        defense_layout.addWidget(self.defense_resistance_table, 1)
+        self.tabs.addTab(defense_page, "")
+
+        self.capacitor_table = self._create_read_only_table(2)
+        self.targeting_table = self._create_read_only_table(2)
+        cap_target_page = QWidget(self)
+        cap_target_layout = QVBoxLayout(cap_target_page)
+        cap_target_layout.setContentsMargins(0, 0, 0, 0)
+        cap_target_layout.addWidget(self.capacitor_table)
+        cap_target_layout.addWidget(self.targeting_table, 1)
+        self.tabs.addTab(cap_target_page, "")
+
+        self.modules_table = self._create_read_only_table(7, stretch_last=False)
+        modules_page = QWidget(self)
+        modules_layout = QVBoxLayout(modules_page)
+        modules_layout.setContentsMargins(0, 0, 0, 0)
+        modules_layout.addWidget(self.modules_table)
+        self.tabs.addTab(modules_page, "")
+
         self.info = QPlainTextEdit(self)
         self.info.setReadOnly(True)
-        layout.addWidget(self.info)
+        debug_page = QWidget(self)
+        debug_layout = QVBoxLayout(debug_page)
+        debug_layout.setContentsMargins(0, 0, 0, 0)
+        debug_layout.addWidget(self.info)
+        self.tabs.addTab(debug_page, "")
 
         self.lock_module_combo.currentIndexChanged.connect(self._on_lock_module_changed)
         self.lock_ammo_combo.currentTextChanged.connect(self._on_lock_ammo_changed)
         self.btn_lock_apply.clicked.connect(self._on_lock_apply_clicked)
         self.btn_lock_clear.clicked.connect(self._on_lock_clear_clicked)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_status)
         self.timer.start(500)
-        self.refresh_status()
+        self._retitle_tabs()
+        self.refresh_status(force=True)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self.timer.isActive():
+            self.timer.start(500)
+        self.refresh_status(force=True)
+
+    def hideEvent(self, event) -> None:
+        self.timer.stop()
+        super().hideEvent(event)
+
+    def _on_tab_changed(self, _index: int) -> None:
+        self._retitle_tabs()
+        self.refresh_status(force=True)
+
+    def _retitle_tabs(self) -> None:
+        lang = self._language_getter()
+        titles = [
+            tr(lang, "status_tab_overview"),
+            tr(lang, "status_tab_combat"),
+            tr(lang, "status_tab_defense"),
+            tr(lang, "status_tab_cap_target"),
+            tr(lang, "status_tab_modules"),
+            tr(lang, "status_tab_debug"),
+        ]
+        for index, title in enumerate(titles):
+            if index < self.tabs.count():
+                self.tabs.setTabText(index, title)
+
+    def _current_tab_key(self) -> str:
+        index = max(0, min(self.tabs.currentIndex(), len(self._tab_keys) - 1))
+        return self._tab_keys[index]
+
+    @staticmethod
+    def _create_read_only_table(column_count: int, *, stretch_last: bool = True) -> QTableWidget:
+        table = QTableWidget()
+        table.setColumnCount(column_count)
+        table.setRowCount(0)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setWordWrap(False)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setHighlightSections(False)
+        table.horizontalHeader().setStretchLastSection(stretch_last)
+        return table
+
+    @staticmethod
+    def _table_signature(rows: list[tuple[str, ...]], headers: tuple[str, ...]) -> tuple[Any, ...]:
+        return (headers, tuple(rows))
+
+    @staticmethod
+    def _apply_table(table: QTableWidget, headers: list[str], rows: list[tuple[str, ...]]) -> None:
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        for row_idx, row_values in enumerate(rows):
+            for col_idx, value in enumerate(row_values):
+                item = table.item(row_idx, col_idx)
+                if item is None:
+                    item = QTableWidgetItem()
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable & ~Qt.ItemFlag.ItemIsSelectable)
+                    table.setItem(row_idx, col_idx, item)
+                item.setText(str(value))
+        header = table.horizontalHeader()
+        if len(headers) == 2:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        elif len(headers) == 6:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            for index in range(1, len(headers)):
+                header.setSectionResizeMode(index, QHeaderView.ResizeMode.Stretch)
+        elif len(headers) == 7:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+
+    def _refresh_lock_controls_if_needed(self) -> None:
+        lang = self._language_getter()
+        fit_text = self._fit_text_getter(self.ship_id) or ""
+        signature = (lang, fit_text)
+        if signature != self._lock_controls_signature:
+            self._lock_controls_signature = signature
+            self._refresh_lock_controls()
 
     @staticmethod
     def _module_index_from_id(module_id: str) -> int | None:
@@ -642,8 +785,9 @@ class ShipStatusDialog(QDialog):
         ok, message = self._lock_charge_setter(self.ship_id, module_id, ammo_name)
         if ok:
             QMessageBox.information(self, tr(lang, "ammo_title"), message)
-            self._refresh_lock_controls()
-            self.refresh_status()
+            self._lock_controls_signature = None
+            self._tab_signatures.pop("modules", None)
+            self.refresh_status(force=True)
             return
         QMessageBox.warning(self, tr(lang, "ammo_title"), tr(lang, "status_lock_failed", error=message))
 
@@ -655,8 +799,9 @@ class ShipStatusDialog(QDialog):
         ok, message = self._lock_charge_clearer(self.ship_id, module_id)
         if ok:
             QMessageBox.information(self, tr(lang, "ammo_title"), message)
-            self._refresh_lock_controls()
-            self.refresh_status()
+            self._lock_controls_signature = None
+            self._tab_signatures.pop("modules", None)
+            self.refresh_status(force=True)
             return
         QMessageBox.warning(self, tr(lang, "ammo_title"), tr(lang, "status_lock_failed", error=message))
 
@@ -719,6 +864,120 @@ class ShipStatusDialog(QDialog):
         if base <= 0.0:
             base = left
         return f"{left:.1f}/{base:.1f}s"
+
+    @staticmethod
+    def _fmt_distance(value: float) -> str:
+        distance = max(0.0, float(value))
+        if distance >= 1000.0:
+            return f"{distance / 1000.0:.1f} km"
+        return f"{distance:.0f} m"
+
+    @staticmethod
+    def _fmt_percent(value: float) -> str:
+        return f"{float(value):.1f}%"
+
+    @staticmethod
+    def _fmt_rate(value: float, unit: str) -> str:
+        return f"{float(value):.2f} {unit}/s"
+
+    @staticmethod
+    def _peak_cap_recharge(profile: ShipProfile) -> float:
+        if float(profile.cap_recharge_time) <= 0.0:
+            return 0.0
+        return 2.5 * float(profile.max_cap) / float(profile.cap_recharge_time)
+
+    @staticmethod
+    def _sensor_strength_summary(profile: ShipProfile) -> str:
+        parts: list[str] = []
+        for label, value in (
+            ("Grav", profile.sensor_strength_gravimetric),
+            ("Ladar", profile.sensor_strength_ladar),
+            ("Mag", profile.sensor_strength_magnetometric),
+            ("Radar", profile.sensor_strength_radar),
+        ):
+            if float(value) > 0.0:
+                parts.append(f"{label} {float(value):.1f}")
+        return ", ".join(parts) if parts else "-"
+
+    @staticmethod
+    def _align_time_for_profile(profile: ShipProfile) -> float:
+        mass = max(0.0, float(getattr(profile, "mass", 0.0) or 0.0))
+        agility = max(0.0, float(getattr(profile, "agility", 0.0) or 0.0))
+        if mass > 0.0 and agility > 0.0:
+            return max(0.25, (mass * agility) / 1_000_000.0)
+        speed = max(150.0, float(getattr(profile, "max_speed", 0.0) or 0.0))
+        return max(2.5, min(14.0, 14_000.0 / speed))
+
+    @classmethod
+    def _layer_omni_ehp(
+        cls,
+        hp: float,
+        resonances: tuple[float, float, float, float],
+    ) -> float:
+        avg_resonance = max(0.01, sum(float(value) for value in resonances) / 4.0)
+        return max(0.0, float(hp)) / avg_resonance
+
+    @classmethod
+    def _total_omni_ehp(cls, profile: ShipProfile) -> float:
+        return (
+            cls._layer_omni_ehp(
+                profile.shield_hp,
+                (
+                    profile.shield_resonance_em,
+                    profile.shield_resonance_thermal,
+                    profile.shield_resonance_kinetic,
+                    profile.shield_resonance_explosive,
+                ),
+            )
+            + cls._layer_omni_ehp(
+                profile.armor_hp,
+                (
+                    profile.armor_resonance_em,
+                    profile.armor_resonance_thermal,
+                    profile.armor_resonance_kinetic,
+                    profile.armor_resonance_explosive,
+                ),
+            )
+            + cls._layer_omni_ehp(
+                profile.structure_hp,
+                (
+                    profile.structure_resonance_em,
+                    profile.structure_resonance_thermal,
+                    profile.structure_resonance_kinetic,
+                    profile.structure_resonance_explosive,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _damage_split(profile: ShipProfile) -> str:
+        values = {
+            "EM": max(0.0, float(profile.damage_em)),
+            "TH": max(0.0, float(profile.damage_thermal)),
+            "KI": max(0.0, float(profile.damage_kinetic)),
+            "EX": max(0.0, float(profile.damage_explosive)),
+        }
+        total = sum(values.values())
+        if total <= 1e-9:
+            return "-"
+        return " / ".join(f"{label} {amount / total * 100.0:.1f}%" for label, amount in values.items() if amount > 0.0)
+
+    @staticmethod
+    def _support_projection_summary(runtime) -> tuple[float, float, float]:
+        shield_rep_per_sec = 0.0
+        armor_rep_per_sec = 0.0
+        cap_warfare_per_sec = 0.0
+        if runtime is None:
+            return shield_rep_per_sec, armor_rep_per_sec, cap_warfare_per_sec
+        for module in runtime.modules:
+            for effect in module.effects:
+                if effect.effect_class != EffectClass.PROJECTED:
+                    continue
+                cycle_time = max(0.1, float(effect.cycle_time) or 0.1)
+                shield_rep_per_sec += max(0.0, float(effect.projected_add.get("shield_rep", 0.0) or 0.0)) / cycle_time
+                armor_rep_per_sec += max(0.0, float(effect.projected_add.get("armor_rep", 0.0) or 0.0)) / cycle_time
+                cap_warfare_per_sec += max(0.0, float(effect.projected_add.get("cap_drain", 0.0) or 0.0)) / cycle_time
+        return shield_rep_per_sec, armor_rep_per_sec, cap_warfare_per_sec
 
     @staticmethod
     def _module_cycle_time(module: ModuleRuntime) -> float:
@@ -829,7 +1088,15 @@ class ShipStatusDialog(QDialog):
             return ship.profile
         fit_text = self._fit_text_getter(self.ship_id) or ""
         runtime_state_key = tuple((module.module_id, module.state.value) for module in ship.runtime.modules)
-        cache_key = (fit_text, id(ship.runtime), runtime_state_key)
+        diagnostics = ship.runtime.diagnostics if isinstance(ship.runtime.diagnostics, dict) else {}
+        cache_key = (
+            fit_text,
+            id(ship.runtime),
+            runtime_state_key,
+            diagnostics.get("pyfa_resolve_signature"),
+            diagnostics.get("pyfa_command_booster_signature"),
+            diagnostics.get("pyfa_projected_sources_signature"),
+        )
         if self._stable_profile_cache is not None and self._stable_profile_cache_key == cache_key:
             return self._stable_profile_cache
 
@@ -859,51 +1126,7 @@ class ShipStatusDialog(QDialog):
             self._cached_module_specs = []
         return self._cached_module_specs
 
-    def refresh_status(self) -> None:
-        lang = self._language_getter()
-        self.setWindowTitle(f"{tr(lang, 'ship_status_title')} - {self.ship_id}")
-        self._refresh_lock_controls()
-        ship = self.engine.world.ships.get(self.ship_id)
-        if ship is None:
-            self.info.setPlainText(tr(lang, "ship_missing"))
-            return
-
-        profile = ship.profile
-        speed = ship.nav.velocity.length()
-        dph = float(profile.volley)
-        dps = float(profile.dps)
-        hp_cur = ship.vital.shield + ship.vital.armor + ship.vital.structure
-        hp_max = ship.vital.shield_max + ship.vital.armor_max + ship.vital.structure_max
-        hp_pct = 100.0 * hp_cur / max(1.0, hp_max)
-        ship_type_name = get_type_display_name(ship.fit.ship_name, language=lang)
-        stable_profile = self._stable_profile(ship)
-
-        lines: list[str] = []
-        lines.append(f"{tr(lang, 'status_ship')}: {ship.ship_id}")
-        lines.append(f"{tr(lang, 'status_type')}: {ship_type_name}")
-        lines.append(f"{tr(lang, 'status_team_squad')}: {ship.team.value} / {ship.squad_id}")
-        lines.append(f"{tr(lang, 'status_alive')}: {ship.vital.alive}")
-        lines.append(f"{tr(lang, 'status_speed')}: {speed:.2f} m/s")
-        lines.append(f"{tr(lang, 'status_facing')}: {ship.nav.facing_deg:.2f} deg")
-        lines.append(f"{tr(lang, 'status_dph')}: {stable_profile.volley:.2f}")
-        lines.append(f"{tr(lang, 'status_dps')}: {stable_profile.dps:.2f}")
-        lines.append(f"{tr(lang, 'status_hp')}: {hp_cur:.1f}/{hp_max:.1f} ({hp_pct:.2f}%)")
-        lines.append(
-            f"{tr(lang, 'status_shield')}: {ship.vital.shield:.1f}/{ship.vital.shield_max:.1f} | "
-            f"{tr(lang, 'status_armor')}: {ship.vital.armor:.1f}/{ship.vital.armor_max:.1f} | "
-            f"{tr(lang, 'status_structure')}: {ship.vital.structure:.1f}/{ship.vital.structure_max:.1f}"
-        )
-        lines.append(f"{tr(lang, 'status_cap')}: {ship.vital.cap:.1f}/{stable_profile.max_cap:.1f}")
-        lines.append(f"{tr(lang, 'status_target')}: {ship.combat.current_target or tr(lang, 'status_target_none')}")
-        now = float(self.engine.world.now)
-        lines.append(f"{tr(lang, 'status_ecm_incoming')}: {self._format_ecm_incoming_status(lang, ship, now)}")
-        lines.append(
-            f"{tr(lang, 'status_res')}: "
-            f"S[{self._res_pct(profile.shield_resonance_em):.1f}/{self._res_pct(profile.shield_resonance_thermal):.1f}/{self._res_pct(profile.shield_resonance_kinetic):.1f}/{self._res_pct(profile.shield_resonance_explosive):.1f}] "
-            f"A[{self._res_pct(profile.armor_resonance_em):.1f}/{self._res_pct(profile.armor_resonance_thermal):.1f}/{self._res_pct(profile.armor_resonance_kinetic):.1f}/{self._res_pct(profile.armor_resonance_explosive):.1f}] "
-            f"H[{self._res_pct(profile.structure_resonance_em):.1f}/{self._res_pct(profile.structure_resonance_thermal):.1f}/{self._res_pct(profile.structure_resonance_kinetic):.1f}/{self._res_pct(profile.structure_resonance_explosive):.1f}]"
-        )
-        lines.append("")
+    def _runtime_maps(self, ship) -> tuple[dict[int, str], dict[int, ModuleRuntime], dict[int, str], dict[str, str], dict[str, float]]:
         runtime_by_slot: dict[int, str] = {}
         projected_by_slot: dict[int, str] = {}
         projected_by_module: dict[str, str] = {}
@@ -911,10 +1134,11 @@ class ShipStatusDialog(QDialog):
         reactivation_by_module: dict[str, float] = {}
         if ship.runtime is not None:
             for module in ship.runtime.modules:
-                parts = module.module_id.rsplit("-", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    runtime_by_slot[int(parts[1])] = module.normalized_state().value
-                    runtime_module_by_slot[int(parts[1])] = module
+                slot_index = self._module_index_from_id(module.module_id)
+                if slot_index is None:
+                    continue
+                runtime_by_slot[slot_index] = module.normalized_state().value
+                runtime_module_by_slot[slot_index] = module
             reactivation_by_module = {
                 str(mid): float(left)
                 for mid, left in ship.combat.module_reactivation_timers.items()
@@ -922,57 +1146,57 @@ class ShipStatusDialog(QDialog):
             }
             for module_id, target_id in ship.combat.projected_targets.items():
                 projected_by_module[module_id] = target_id
-                parts = module_id.rsplit("-", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    projected_by_slot[int(parts[1])] = target_id
+                slot_index = self._module_index_from_id(module_id)
+                if slot_index is not None:
+                    projected_by_slot[slot_index] = target_id
+        return runtime_by_slot, runtime_module_by_slot, projected_by_slot, projected_by_module, reactivation_by_module
 
+    def _module_timer_label(
+        self,
+        lang: str,
+        ship,
+        module: ModuleRuntime,
+        effective_state: str,
+        cooldown_left: float,
+    ) -> str:
+        cooldown_left = max(0.0, float(cooldown_left))
+        if cooldown_left > 0.0:
+            delay_total = self._module_reactivation_delay(module)
+            return f"{tr(lang, 'status_reactivation_time')} {self._fmt_time_pair(cooldown_left, delay_total)}"
+
+        reloading_left = max(
+            0.0,
+            float(ship.combat.module_ammo_reload_timers.get(module.module_id, 0.0) or 0.0),
+        )
+        if reloading_left > 0.0:
+            reload_total = max(0.0, float(module.charge_reload_time))
+            return f"{tr(lang, 'status_reload_time')} {self._fmt_time_pair(reloading_left, reload_total)}"
+
+        if str(effective_state).upper() == "ACTIVE":
+            cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0))
+            if cycle_left > 0.0:
+                cycle_total = self._module_cycle_time(module)
+                return f"{tr(lang, 'status_cycle_time')} {self._fmt_time_pair(cycle_left, cycle_total)}"
+
+        return "-"
+
+    def _module_rows(self, ship, lang: str) -> list[tuple[str, ...]]:
         fit_text = self._fit_text_getter(self.ship_id) or ""
         module_specs = self._get_module_specs_cached(fit_text)
+        runtime_by_slot, runtime_module_by_slot, projected_by_slot, projected_by_module, reactivation_by_module = self._runtime_maps(ship)
+        rows: list[tuple[str, ...]] = []
 
-        lines.append(f"{tr(lang, 'status_modules')}: ")
-        lines.append(f"{tr(lang, 'status_modules_fitted')}: {len(module_specs)} | {tr(lang, 'status_modules_runtime')}: {len(runtime_by_slot)}")
-        if not module_specs:
-            if ship.runtime is None:
-                lines.append(f"  {tr(lang, 'status_module_none')}")
-            else:
-                for module in ship.runtime.modules:
-                    effective_state = module.normalized_state().value
-                    has_projected = self._module_has_projected_effects(module)
-                    is_area_effect = self._is_area_effect_group(module.group)
-                    if self._is_weapon_group(module.group):
-                        current_target_id = ship.combat.current_target
-                    elif has_projected and not is_area_effect:
-                        current_target_id = projected_by_module.get(module.module_id)
-                    else:
-                        current_target_id = None
-                    effective_state = self._display_module_state(module, effective_state, current_target_id)
-                    cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
-                    if cooldown_left > 0.0:
-                        state_label = tr(lang, "state_REACTIVATING")
-                    else:
-                        state_label = tr(lang, f"state_{effective_state}")
-                    line = f"  - {module.module_id} | {get_type_display_name(module.group, language=lang)} | {tr(lang, 'status_state')}={state_label}"
-                    line += self._format_module_charge_status(lang, ship, module)
-                    line += self._format_module_time_status(lang, ship, module, effective_state, cooldown_left)
-                    if has_projected and not is_area_effect:
-                        target_id = projected_by_module.get(module.module_id, tr(lang, "status_target_none"))
-                        line += f" | {tr(lang, 'status_target')}={target_id}"
-                        if self._is_ecm_group(module.group):
-                            line += self._format_ecm_cycle_result_for_module(lang, ship, module.module_id, target_id)
-                    elif self._is_weapon_group(module.group):
-                        line += f" | {tr(lang, 'status_target')}={ship.combat.current_target or tr(lang, 'status_target_none')}"
-                    lines.append(line)
-        else:
+        if module_specs:
             for idx, spec in enumerate(module_specs, start=1):
+                runtime_module = runtime_module_by_slot.get(idx)
+                state_key = "OFFLINE" if spec.offline else runtime_by_slot.get(idx, "UNMODELED")
+                group_name = runtime_module.group if runtime_module is not None else spec.module_name
                 module_name = get_type_display_name(spec.module_name, language=lang)
                 if spec.charge_name:
-                    charge_name = get_type_display_name(spec.charge_name, language=lang)
-                    module_name = f"{module_name} ({charge_name})"
-                if spec.offline:
-                    state_key = "OFFLINE"
-                else:
-                    state_key = runtime_by_slot.get(idx, "UNMODELED")
-                runtime_module = runtime_module_by_slot.get(idx)
+                    module_name = f"{module_name} ({get_type_display_name(spec.charge_name, language=lang)})"
+                target_label = "-"
+                charge_label = "-"
+                timer_label = "-"
                 if runtime_module is not None:
                     has_projected = self._module_has_projected_effects(runtime_module)
                     is_area_effect = self._is_area_effect_group(runtime_module.group)
@@ -983,28 +1207,311 @@ class ShipStatusDialog(QDialog):
                     else:
                         current_target_id = None
                     state_key = self._display_module_state(runtime_module, state_key, current_target_id)
-                cooldown_left = 0.0
-                if runtime_module is not None:
                     cooldown_left = reactivation_by_module.get(runtime_module.module_id, 0.0)
-                if cooldown_left > 0.0:
-                    state_label = tr(lang, "state_REACTIVATING")
+                    if cooldown_left > 0.0:
+                        state_label = tr(lang, "state_REACTIVATING")
+                    else:
+                        state_label = tr(lang, f"state_{state_key}")
+                    charge_label = (
+                        f"{self._fmt_charge_amount(runtime_module.charge_remaining)}/{int(runtime_module.charge_capacity)}"
+                        if int(runtime_module.charge_capacity) > 0
+                        else "-"
+                    )
+                    timer_label = self._module_timer_label(lang, ship, runtime_module, state_key, cooldown_left)
+                    if has_projected and not is_area_effect:
+                        target_label = str(projected_by_slot.get(idx) or tr(lang, "status_target_none"))
+                    elif self._is_weapon_group(runtime_module.group):
+                        target_label = str(ship.combat.current_target or tr(lang, "status_target_none"))
                 else:
                     state_label = tr(lang, f"state_{state_key}")
-                line = f"  - [{idx:02d}] {module_name} | {tr(lang, 'status_state')}={state_label}"
-                if runtime_module is not None:
-                    line += self._format_module_charge_status(lang, ship, runtime_module)
-                    line += self._format_module_time_status(lang, ship, runtime_module, state_key, cooldown_left)
-                    has_projected = self._module_has_projected_effects(runtime_module)
-                    if has_projected and not self._is_area_effect_group(runtime_module.group):
-                        target_id = projected_by_slot.get(idx, tr(lang, "status_target_none"))
-                        line += f" | {tr(lang, 'status_target')}={target_id}"
-                        if self._is_ecm_group(runtime_module.group):
-                            line += self._format_ecm_cycle_result_for_module(lang, ship, runtime_module.module_id, target_id)
-                    elif self._is_weapon_group(runtime_module.group):
-                        line += f" | {tr(lang, 'status_target')}={ship.combat.current_target or tr(lang, 'status_target_none')}"
-                lines.append(line)
+                rows.append(
+                    (
+                        f"[{idx:02d}]",
+                        module_name,
+                        str(group_name or "-"),
+                        state_label,
+                        target_label,
+                        charge_label,
+                        timer_label,
+                    )
+                )
+            return rows
 
-        self.info.setPlainText("\n".join(lines))
+        if ship.runtime is None:
+            return [(tr(lang, "status_module_none"), "-", "-", "-", "-", "-", "-")]
+
+        ordered_modules = sorted(
+            ship.runtime.modules,
+            key=lambda module: (self._module_index_from_id(module.module_id) or 9999, module.module_id),
+        )
+        for module in ordered_modules:
+            target_label = "-"
+            has_projected = self._module_has_projected_effects(module)
+            is_area_effect = self._is_area_effect_group(module.group)
+            if self._is_weapon_group(module.group):
+                current_target_id = ship.combat.current_target
+            elif has_projected and not is_area_effect:
+                current_target_id = projected_by_module.get(module.module_id)
+            else:
+                current_target_id = None
+            effective_state = self._display_module_state(module, module.normalized_state().value, current_target_id)
+            cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
+            if cooldown_left > 0.0:
+                state_label = tr(lang, "state_REACTIVATING")
+            else:
+                state_label = tr(lang, f"state_{effective_state}")
+            if has_projected and not is_area_effect:
+                target_label = str(projected_by_module.get(module.module_id) or tr(lang, "status_target_none"))
+            elif self._is_weapon_group(module.group):
+                target_label = str(ship.combat.current_target or tr(lang, "status_target_none"))
+            rows.append(
+                (
+                    str(self._module_index_from_id(module.module_id) or "-"),
+                    module.module_id,
+                    str(module.group or "-"),
+                    state_label,
+                    target_label,
+                    (
+                        f"{self._fmt_charge_amount(module.charge_remaining)}/{int(module.charge_capacity)}"
+                        if int(module.charge_capacity) > 0
+                        else "-"
+                    ),
+                    self._module_timer_label(lang, ship, module, effective_state, cooldown_left),
+                )
+            )
+        return rows
+
+    def _refresh_overview_tab(self, ship, lang: str, force: bool) -> None:
+        profile = self._stable_profile(ship)
+        hp_cur = ship.vital.shield + ship.vital.armor + ship.vital.structure
+        hp_max = ship.vital.shield_max + ship.vital.armor_max + ship.vital.structure_max
+        rows = [
+            (tr(lang, "status_ship"), ship.ship_id),
+            (tr(lang, "status_type"), get_type_display_name(ship.fit.ship_name, language=lang)),
+            (tr(lang, "status_team_squad"), f"{ship.team.value} / {ship.squad_id}"),
+            (tr(lang, "status_alive"), str(bool(ship.vital.alive))),
+            (tr(lang, "status_backend"), get_fit_backend_status()),
+            (tr(lang, "status_speed"), f"{ship.nav.velocity.length():.1f} / {profile.max_speed:.1f} m/s"),
+            (tr(lang, "status_facing"), f"{ship.nav.facing_deg:.1f} deg"),
+            (tr(lang, "status_hp"), f"{hp_cur:.1f} / {hp_max:.1f} ({hp_cur / max(1.0, hp_max) * 100.0:.1f}%)"),
+            (
+                tr(lang, "status_cap"),
+                f"{ship.vital.cap:.1f} / {ship.vital.cap_max:.1f} ({ship.vital.cap / max(1.0, ship.vital.cap_max) * 100.0:.1f}%)",
+            ),
+            (tr(lang, "status_target"), str(ship.combat.current_target or tr(lang, "status_target_none"))),
+            (tr(lang, "status_locked_targets"), f"{len(ship.combat.lock_targets)} / {max(0, int(profile.max_locked_targets))}"),
+            (tr(lang, "status_ecm_incoming"), self._format_ecm_incoming_status(lang, ship, float(self.engine.world.now))),
+            (tr(lang, "status_ecm_last_attempt"), self._format_ecm_attempt_status(lang, ship, float(self.engine.world.now))),
+        ]
+        headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        signature = self._table_signature(rows, headers)
+        if not force and self._tab_signatures.get("overview") == signature:
+            return
+        self._tab_signatures["overview"] = signature
+        self._apply_table(self.overview_table, list(headers), rows)
+
+    def _refresh_combat_tab(self, ship, lang: str, force: bool) -> None:
+        profile = self._stable_profile(ship)
+        shield_rep_ps, armor_rep_ps, cap_warfare_ps = self._support_projection_summary(ship.runtime)
+        rows = [
+            (tr(lang, "status_dps"), f"{profile.dps:.2f}"),
+            (tr(lang, "status_dph"), f"{profile.volley:.2f}"),
+            (tr(lang, "status_turret_dps"), f"{profile.turret_dps:.2f}"),
+            (tr(lang, "status_missile_dps"), f"{profile.missile_dps:.2f}"),
+            (tr(lang, "status_optimal"), self._fmt_distance(profile.optimal)),
+            (tr(lang, "status_falloff_short"), self._fmt_distance(profile.falloff)),
+            (tr(lang, "status_tracking_short"), f"{profile.tracking:.4f}"),
+            (tr(lang, "status_optimal_sig"), f"{profile.optimal_sig:.1f} m"),
+            (tr(lang, "status_missile_range"), self._fmt_distance(profile.missile_max_range)),
+            (tr(lang, "status_explosion_radius"), f"{profile.missile_explosion_radius:.1f} m"),
+            (tr(lang, "status_explosion_velocity"), f"{profile.missile_explosion_velocity:.1f} m/s"),
+            (tr(lang, "status_damage_split"), self._damage_split(profile)),
+            (tr(lang, "status_remote_shield_rep_ps"), self._fmt_rate(shield_rep_ps, "HP")),
+            (tr(lang, "status_remote_armor_rep_ps"), self._fmt_rate(armor_rep_ps, "HP")),
+            (tr(lang, "status_cap_warfare_ps"), self._fmt_rate(cap_warfare_ps, "GJ")),
+        ]
+        headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        signature = self._table_signature(rows, headers)
+        if not force and self._tab_signatures.get("combat") == signature:
+            return
+        self._tab_signatures["combat"] = signature
+        self._apply_table(self.combat_table, list(headers), rows)
+
+    def _refresh_defense_tab(self, ship, lang: str, force: bool) -> None:
+        profile = self._stable_profile(ship)
+        summary_rows = [
+            (tr(lang, "status_shield"), f"{ship.vital.shield:.1f} / {ship.vital.shield_max:.1f}"),
+            (tr(lang, "status_armor"), f"{ship.vital.armor:.1f} / {ship.vital.armor_max:.1f}"),
+            (tr(lang, "status_structure"), f"{ship.vital.structure:.1f} / {ship.vital.structure_max:.1f}"),
+            (tr(lang, "status_total_raw_hp"), f"{profile.shield_hp + profile.armor_hp + profile.structure_hp:.1f}"),
+            (tr(lang, "status_total_ehp"), f"{self._total_omni_ehp(profile):.1f}"),
+        ]
+        resistance_rows = [
+            (
+                tr(lang, "status_shield"),
+                self._fmt_percent(self._res_pct(profile.shield_resonance_em)),
+                self._fmt_percent(self._res_pct(profile.shield_resonance_thermal)),
+                self._fmt_percent(self._res_pct(profile.shield_resonance_kinetic)),
+                self._fmt_percent(self._res_pct(profile.shield_resonance_explosive)),
+                f"{self._layer_omni_ehp(profile.shield_hp, (profile.shield_resonance_em, profile.shield_resonance_thermal, profile.shield_resonance_kinetic, profile.shield_resonance_explosive)):.1f}",
+            ),
+            (
+                tr(lang, "status_armor"),
+                self._fmt_percent(self._res_pct(profile.armor_resonance_em)),
+                self._fmt_percent(self._res_pct(profile.armor_resonance_thermal)),
+                self._fmt_percent(self._res_pct(profile.armor_resonance_kinetic)),
+                self._fmt_percent(self._res_pct(profile.armor_resonance_explosive)),
+                f"{self._layer_omni_ehp(profile.armor_hp, (profile.armor_resonance_em, profile.armor_resonance_thermal, profile.armor_resonance_kinetic, profile.armor_resonance_explosive)):.1f}",
+            ),
+            (
+                tr(lang, "status_structure"),
+                self._fmt_percent(self._res_pct(profile.structure_resonance_em)),
+                self._fmt_percent(self._res_pct(profile.structure_resonance_thermal)),
+                self._fmt_percent(self._res_pct(profile.structure_resonance_kinetic)),
+                self._fmt_percent(self._res_pct(profile.structure_resonance_explosive)),
+                f"{self._layer_omni_ehp(profile.structure_hp, (profile.structure_resonance_em, profile.structure_resonance_thermal, profile.structure_resonance_kinetic, profile.structure_resonance_explosive)):.1f}",
+            ),
+        ]
+        summary_headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        resistance_headers = (tr(lang, "status_layer"), "EM", "TH", "KI", "EX", tr(lang, "status_omni_ehp"))
+        signature = (
+            self._table_signature(summary_rows, summary_headers),
+            self._table_signature(resistance_rows, resistance_headers),
+        )
+        if not force and self._tab_signatures.get("defense") == signature:
+            return
+        self._tab_signatures["defense"] = signature
+        self._apply_table(self.defense_summary_table, list(summary_headers), summary_rows)
+        self._apply_table(self.defense_resistance_table, list(resistance_headers), resistance_rows)
+
+    def _refresh_cap_target_tab(self, ship, lang: str, force: bool) -> None:
+        profile = self._stable_profile(ship)
+        capacitor_rows = [
+            (tr(lang, "status_cap"), f"{ship.vital.cap:.1f} / {ship.vital.cap_max:.1f}"),
+            (tr(lang, "status_cap_peak_recharge"), f"{self._peak_cap_recharge(profile):.2f} GJ/s"),
+            (tr(lang, "status_cap_recharge_time"), f"{profile.cap_recharge_time:.2f}s"),
+            (tr(lang, "status_cap_resistance"), self._fmt_percent((1.0 - float(profile.energy_warfare_resistance or 1.0)) * 100.0)),
+        ]
+        targeting_rows = [
+            (tr(lang, "status_targets"), str(max(0, int(profile.max_locked_targets)))),
+            (tr(lang, "status_target_range"), self._fmt_distance(profile.max_target_range)),
+            (tr(lang, "status_scan_resolution"), f"{profile.scan_resolution:.1f} mm"),
+            (tr(lang, "status_sensor_strengths"), self._sensor_strength_summary(profile)),
+            (tr(lang, "status_signature_radius"), f"{profile.sig_radius:.1f} m"),
+            (tr(lang, "status_align_time"), f"{self._align_time_for_profile(profile):.2f}s"),
+            (tr(lang, "status_mass"), f"{profile.mass:,.0f} kg"),
+            (tr(lang, "status_agility"), f"{profile.agility:.3f}"),
+            (tr(lang, "status_warp_stability"), f"{profile.warp_stability:.1f}"),
+            (tr(lang, "status_warp_scramble"), f"{profile.warp_scramble_status:.1f}"),
+        ]
+        headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        signature = (
+            self._table_signature(capacitor_rows, headers),
+            self._table_signature(targeting_rows, headers),
+        )
+        if not force and self._tab_signatures.get("cap_target") == signature:
+            return
+        self._tab_signatures["cap_target"] = signature
+        self._apply_table(self.capacitor_table, list(headers), capacitor_rows)
+        self._apply_table(self.targeting_table, list(headers), targeting_rows)
+
+    def _refresh_modules_tab(self, ship, lang: str, force: bool) -> None:
+        rows = self._module_rows(ship, lang)
+        headers = (
+            tr(lang, "status_col_slot"),
+            tr(lang, "status_col_module"),
+            tr(lang, "status_col_group"),
+            tr(lang, "status_col_state"),
+            tr(lang, "status_col_target"),
+            tr(lang, "status_col_charge"),
+            tr(lang, "status_col_timer"),
+        )
+        signature = self._table_signature(rows, headers)
+        if not force and self._tab_signatures.get("modules") == signature:
+            return
+        self._tab_signatures["modules"] = signature
+        self._apply_table(self.modules_table, list(headers), rows)
+
+    def _refresh_debug_tab(self, ship, lang: str, force: bool) -> None:
+        diagnostics = {}
+        if ship.runtime is not None and isinstance(ship.runtime.diagnostics, dict):
+            for key, value in ship.runtime.diagnostics.items():
+                if key in {"pyfa_blueprint", "pyfa_command_boosters", "pyfa_projected_sources"}:
+                    continue
+                diagnostics[key] = value
+            diagnostics["pyfa_command_boosters_count"] = len(ship.runtime.diagnostics.get("pyfa_command_boosters", []))
+            diagnostics["pyfa_projected_sources_count"] = len(ship.runtime.diagnostics.get("pyfa_projected_sources", []))
+        lines = [
+            f"{tr(lang, 'status_backend')}: {get_fit_backend_status()}",
+            f"{tr(lang, 'status_ship')}: {ship.ship_id}",
+            f"runtime: {'yes' if ship.runtime is not None else 'no'}",
+            f"profile: dps={ship.profile.dps:.2f}, volley={ship.profile.volley:.2f}, speed={ship.profile.max_speed:.2f}",
+        ]
+        if diagnostics:
+            lines.append("")
+            lines.append("diagnostics:")
+            lines.append(json.dumps(diagnostics, ensure_ascii=False, indent=2, default=str))
+        fit_text = (self._fit_text_getter(self.ship_id) or "").strip()
+        if fit_text:
+            lines.append("")
+            lines.append("fit:")
+            lines.append(fit_text)
+        text = "\n".join(lines)
+        if not force and self._tab_signatures.get("debug") == text:
+            return
+        self._tab_signatures["debug"] = text
+        self.info.setPlainText(text)
+
+    def _clear_views_for_missing_ship(self, lang: str) -> None:
+        metric_headers = [tr(lang, "status_metric"), tr(lang, "status_value")]
+        missing_rows = [(tr(lang, "ship_missing"), "-")]
+        self._apply_table(self.overview_table, metric_headers, missing_rows)
+        self._apply_table(self.combat_table, metric_headers, missing_rows)
+        self._apply_table(self.defense_summary_table, metric_headers, missing_rows)
+        self._apply_table(self.capacitor_table, metric_headers, missing_rows)
+        self._apply_table(self.targeting_table, metric_headers, missing_rows)
+        self._apply_table(
+            self.defense_resistance_table,
+            [tr(lang, "status_layer"), "EM", "TH", "KI", "EX", tr(lang, "status_omni_ehp")],
+            [(tr(lang, "ship_missing"), "-", "-", "-", "-", "-")],
+        )
+        self._apply_table(
+            self.modules_table,
+            [
+                tr(lang, "status_col_slot"),
+                tr(lang, "status_col_module"),
+                tr(lang, "status_col_group"),
+                tr(lang, "status_col_state"),
+                tr(lang, "status_col_target"),
+                tr(lang, "status_col_charge"),
+                tr(lang, "status_col_timer"),
+            ],
+            [(tr(lang, "ship_missing"), "-", "-", "-", "-", "-", "-")],
+        )
+        self.info.setPlainText(tr(lang, "ship_missing"))
+
+    def refresh_status(self, force: bool = False) -> None:
+        lang = self._language_getter()
+        self.setWindowTitle(f"{tr(lang, 'ship_status_title')} - {self.ship_id}")
+        self._retitle_tabs()
+        self._refresh_lock_controls_if_needed()
+        ship = self.engine.world.ships.get(self.ship_id)
+        if ship is None:
+            self._clear_views_for_missing_ship(lang)
+            return
+        tab_key = self._current_tab_key()
+        if tab_key == "overview":
+            self._refresh_overview_tab(ship, lang, force)
+        elif tab_key == "combat":
+            self._refresh_combat_tab(ship, lang, force)
+        elif tab_key == "defense":
+            self._refresh_defense_tab(ship, lang, force)
+        elif tab_key == "cap_target":
+            self._refresh_cap_target_tab(ship, lang, force)
+        elif tab_key == "modules":
+            self._refresh_modules_tab(ship, lang, force)
+        else:
+            self._refresh_debug_tab(ship, lang, force)
 
 
 
