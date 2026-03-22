@@ -165,6 +165,62 @@ class CombatState:
 
 
 @dataclass(slots=True)
+class ProjectileEntity:
+    projectile_id: str
+    kind: str
+    source_ship_id: str
+    source_module_id: str
+    team: Team
+    position: Vector2
+    velocity: Vector2
+    facing_deg: float
+    target_ship_id: str | None
+    speed: float
+    max_speed: float
+    max_range: float
+    distance_traveled: float
+    flight_time: float
+    age: float
+    acceleration_time: float
+    damage_em: float
+    damage_thermal: float
+    damage_kinetic: float
+    damage_explosive: float
+    explosion_radius: float
+    explosion_velocity: float
+    damage_reduction_factor: float
+    shield: float = 0.0
+    armor: float = 0.0
+    structure: float = 1.0
+    shield_max: float = 0.0
+    armor_max: float = 0.0
+    structure_max: float = 1.0
+    shield_resonance_em: float = 1.0
+    shield_resonance_thermal: float = 1.0
+    shield_resonance_kinetic: float = 1.0
+    shield_resonance_explosive: float = 1.0
+    armor_resonance_em: float = 1.0
+    armor_resonance_thermal: float = 1.0
+    armor_resonance_kinetic: float = 1.0
+    armor_resonance_explosive: float = 1.0
+    structure_resonance_em: float = 1.0
+    structure_resonance_thermal: float = 1.0
+    structure_resonance_kinetic: float = 1.0
+    structure_resonance_explosive: float = 1.0
+    blast_radius: float = 0.0
+    alive: bool = True
+
+
+@dataclass(slots=True)
+class ProjectileBlast:
+    blast_id: str
+    kind: str
+    position: Vector2
+    radius_m: float
+    expires_at: float
+
+
+@dataclass(slots=True)
 class VitalState:
     shield: float
     armor: float

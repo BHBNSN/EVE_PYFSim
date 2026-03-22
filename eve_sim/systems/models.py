@@ -139,6 +139,8 @@ class ModuleStaticMetadata:
     is_burst_jammer: bool
     is_area_effect: bool
     is_weapon: bool
+    is_missile_weapon: bool
+    is_bomb_launcher: bool
     has_projected_rep: bool
     is_cap_warfare: bool
     is_target_ewar: bool

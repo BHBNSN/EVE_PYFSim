@@ -151,6 +151,32 @@ class SimulationEngine:
             "tick": self.world.tick,
             "now": self.world.now,
             "ships": ships,
+            "projectiles": {
+                projectile_id: {
+                    "projectile_id": projectile.projectile_id,
+                    "kind": projectile.kind,
+                    "source_ship_id": projectile.source_ship_id,
+                    "source_module_id": projectile.source_module_id,
+                    "team": projectile.team.value,
+                    "position": {"x": projectile.position.x, "y": projectile.position.y},
+                    "target_ship_id": projectile.target_ship_id,
+                    "distance_traveled": float(projectile.distance_traveled),
+                    "flight_time": float(projectile.flight_time),
+                    "age": float(projectile.age),
+                    "blast_radius": float(projectile.blast_radius),
+                }
+                for projectile_id, projectile in self.world.projectiles.items()
+            },
+            "projectile_blasts": {
+                blast_id: {
+                    "blast_id": blast.blast_id,
+                    "kind": blast.kind,
+                    "position": {"x": blast.position.x, "y": blast.position.y},
+                    "radius_m": float(blast.radius_m),
+                    "expires_at": float(blast.expires_at),
+                }
+                for blast_id, blast in self.world.projectile_blasts.items()
+            },
             "intents": {k: asdict(v) for k, v in self.world.intents.items()},
             "squad_focus_queues": {k: list(v) for k, v in self.world.squad_focus_queues.items()},
         }

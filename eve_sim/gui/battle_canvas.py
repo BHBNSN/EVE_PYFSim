@@ -360,8 +360,6 @@ class BattleCanvas(QWidget):
             return QColor(88, 214, 141, 13), QColor(88, 214, 141, 13)
         if group in {"smart bomb", "structure area denial module"}:
             return QColor(255, 145, 77, 13), QColor(255, 165, 96, 13)
-        if group == "burst jammer":
-            return QColor(102, 204, 255, 13), QColor(122, 214, 255, 13)
         return None
 
     @staticmethod
@@ -382,7 +380,7 @@ class BattleCanvas(QWidget):
                 self._area_cycle_overlays.pop(key, None)
                 continue
             module = next((m for m in ship.runtime.modules if m.module_id == overlay.module_id), None)
-            if module is None or module.state != ModuleState.ACTIVE:
+            if module is None or self._module_area_style(module) is None or module.state != ModuleState.ACTIVE:
                 self._area_cycle_overlays.pop(key, None)
                 continue
             cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(overlay.module_id, 0.0) or 0.0))
@@ -421,6 +419,21 @@ class BattleCanvas(QWidget):
         self._sync_area_cycle_overlays()
         return list(self._area_cycle_overlays.values())
 
+    def _iter_active_projectile_blasts(self):
+        now = float(self.engine.world.now)
+        for blast in self.engine.world.projectile_blasts.values():
+            if float(blast.expires_at) <= now:
+                continue
+            if str(blast.kind) != "bomb":
+                continue
+            yield blast
+
+    @staticmethod
+    def _projectile_colors(kind: str) -> tuple[QColor, QColor]:
+        if str(kind) == "bomb":
+            return QColor(150, 100, 55), QColor(160, 110, 70, 28)
+        return QColor(184, 96, 255), QColor(184, 96, 255, 24)
+
     def paintEvent(self, event) -> None:
         del event
         painter = QPainter(self)
@@ -446,6 +459,26 @@ class BattleCanvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(overlay.border_color, 1))
             painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+
+        for blast in self._iter_active_projectile_blasts():
+            x, y = self._to_screen(blast.position)
+            radius_px = max(1, int(float(blast.radius_m) * self.zoom))
+            fill = QColor(160, 110, 70, 18)
+            border = QColor(176, 122, 76, 120)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(border, 1))
+            painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+
+        for projectile in self.engine.world.projectiles.values():
+            px, py = self._to_screen(projectile.position)
+            projectile_color, _trail_color = self._projectile_colors(projectile.kind)
+            radius_px = 3 if str(projectile.kind) == "bomb" else 2
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(projectile_color)
+            painter.drawEllipse(px - radius_px, py - radius_px, radius_px * 2, radius_px * 2)
 
         leader_ship = self._selected_squad_leader_ship()
         if leader_ship is not None:

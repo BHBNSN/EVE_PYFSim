@@ -603,6 +603,44 @@ class RuntimeFromEftFactory:
 
         return projected_mult, projected_add, projected_mult_groups, signature
 
+    def _module_damage_components(
+        self,
+        fitted_module: Any,
+        *,
+        read_active: bool = False,
+    ) -> tuple[float, float, float, float] | None:
+        original_state = getattr(fitted_module, "state", None)
+        state_switched = False
+        if read_active:
+            active_state = _pyfa_module_state_from_runtime_state(self, fitted_module, "ACTIVE")
+            if active_state is not None and active_state != original_state:
+                try:
+                    fitted_module.state = active_state
+                    state_switched = True
+                except Exception:
+                    state_switched = False
+
+        try:
+            dps_obj = fitted_module.getDps()
+        except Exception:
+            dps_obj = None
+        finally:
+            if state_switched and original_state is not None:
+                try:
+                    fitted_module.state = original_state
+                except Exception:
+                    pass
+
+        if dps_obj is None:
+            return None
+
+        return (
+            max(0.0, float(getattr(dps_obj, "em", 0.0) or 0.0)),
+            max(0.0, float(getattr(dps_obj, "thermal", 0.0) or 0.0)),
+            max(0.0, float(getattr(dps_obj, "kinetic", 0.0) or 0.0)),
+            max(0.0, float(getattr(dps_obj, "explosive", 0.0) or 0.0)),
+        )
+
     def _module_effect_pyfa(
         self,
         parsed: ParsedEftFit | Any,
@@ -643,8 +681,24 @@ class RuntimeFromEftFactory:
             except Exception:
                 return None
 
+        def charge_attr_opt(name: str) -> float | None:
+            try:
+                value = fitted_module.getModifiedChargeAttr(name)
+            except Exception:
+                value = None
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
         def attr(name: str, default: float = 0.0) -> float:
             value = attr_opt(name)
+            return float(default if value is None else value)
+
+        def charge_attr(name: str, default: float = 0.0) -> float:
+            value = charge_attr_opt(name)
             return float(default if value is None else value)
 
         def pct_to_mult(value: float) -> float:
@@ -697,6 +751,16 @@ class RuntimeFromEftFactory:
         falloff_m = max(0.0, attr("falloffEffectiveness", 0.0))
         if falloff_m <= 0.0:
             falloff_m = max(0.0, attr("falloff", 0.0))
+        pyfa_cycle_sec = 0.0
+        try:
+            cycle_params = fitted_module.getCycleParameters()
+        except Exception:
+            cycle_params = None
+        if cycle_params is not None:
+            try:
+                pyfa_cycle_sec = max(0.0, float(getattr(cycle_params, "averageTime", 0.0) or 0.0) / 1000.0)
+            except Exception:
+                pyfa_cycle_sec = 0.0
 
         local_mult: dict[str, float] = {}
         local_add: dict[str, float] = {}
@@ -706,6 +770,12 @@ class RuntimeFromEftFactory:
         is_command_burst = "command burst" in group_name
         is_burst_jammer = "burst jammer" in group_name
         is_smart_bomb = ("smart bomb" in group_name) or ("structure area denial module" in group_name)
+        is_bomb_launcher = ("bomb launcher" in group_name)
+        if not is_bomb_launcher and loaded_charge is not None:
+            try:
+                is_bomb_launcher = bool(loaded_charge.requiresSkill("Bomb Deployment"))
+            except Exception:
+                is_bomb_launcher = False
         is_weapon_like = self._is_weapon_like_group(group_name)
 
         speed_factor = attr_opt("speedFactor")
@@ -764,35 +834,27 @@ class RuntimeFromEftFactory:
                 local_add["rep"] = local_add.get("rep", 0.0) + local_rep
 
         if is_smart_bomb and range_m > 0.0:
-            try:
-                dps_obj = fitted_module.getDps()
-            except Exception:
-                dps_obj = None
-
-            if dps_obj is not None:
+            damage_components = self._module_damage_components(
+                fitted_module,
+                read_active=True,
+            )
+            if damage_components is not None:
                 damage_cycle = max(0.1, cycle_sec)
-                em_dps = max(0.0, float(getattr(dps_obj, "em", 0.0) or 0.0))
-                thermal_dps = max(0.0, float(getattr(dps_obj, "thermal", 0.0) or 0.0))
-                kinetic_dps = max(0.0, float(getattr(dps_obj, "kinetic", 0.0) or 0.0))
-                explosive_dps = max(0.0, float(getattr(dps_obj, "explosive", 0.0) or 0.0))
+                em_dps, thermal_dps, kinetic_dps, explosive_dps = damage_components
                 if (em_dps + thermal_dps + kinetic_dps + explosive_dps) > 0.0:
                     projected_add["damage_em"] = em_dps * damage_cycle
                     projected_add["damage_thermal"] = thermal_dps * damage_cycle
                     projected_add["damage_kinetic"] = kinetic_dps * damage_cycle
                     projected_add["damage_explosive"] = explosive_dps * damage_cycle
 
-        if is_weapon_like and range_m > 0.0:
-            try:
-                dps_obj = fitted_module.getDps()
-            except Exception:
-                dps_obj = None
-
-            if dps_obj is not None:
+        if is_weapon_like:
+            damage_components = self._module_damage_components(
+                fitted_module,
+                read_active=True,
+            )
+            if damage_components is not None:
                 damage_cycle = max(0.1, cycle_sec)
-                em_dps = max(0.0, float(getattr(dps_obj, "em", 0.0) or 0.0))
-                thermal_dps = max(0.0, float(getattr(dps_obj, "thermal", 0.0) or 0.0))
-                kinetic_dps = max(0.0, float(getattr(dps_obj, "kinetic", 0.0) or 0.0))
-                explosive_dps = max(0.0, float(getattr(dps_obj, "explosive", 0.0) or 0.0))
+                em_dps, thermal_dps, kinetic_dps, explosive_dps = damage_components
                 if (em_dps + thermal_dps + kinetic_dps + explosive_dps) > 0.0:
                     projected_add["damage_em"] = em_dps * damage_cycle
                     projected_add["damage_thermal"] = thermal_dps * damage_cycle
@@ -800,21 +862,92 @@ class RuntimeFromEftFactory:
                     projected_add["damage_explosive"] = explosive_dps * damage_cycle
 
                     if "launcher" in group_name:
-                        projected_add["weapon_is_missile"] = 1.0
-                        try:
-                            explosion_radius = max(0.0, float(fitted_module.getModifiedChargeAttr("aoeCloudSize") or 0.0))
-                            explosion_velocity = max(0.0, float(fitted_module.getModifiedChargeAttr("aoeVelocity") or 0.0))
-                            damage_reduction_factor = max(
-                                0.1,
-                                float(fitted_module.getModifiedChargeAttr("damageReductionFactor") or 0.5),
-                            )
-                        except Exception:
-                            explosion_radius = 0.0
-                            explosion_velocity = 0.0
-                            damage_reduction_factor = 0.5
+                        if is_bomb_launcher:
+                            projected_add["weapon_is_bomb"] = 1.0
+                            projected_add["weapon_blast_radius"] = max(0.0, charge_attr("explosionRange", 0.0))
+                        else:
+                            projected_add["weapon_is_missile"] = 1.0
+                        explosion_radius = max(0.0, charge_attr("aoeCloudSize", 0.0))
+                        explosion_velocity = max(0.0, charge_attr("aoeVelocity", 0.0))
+                        damage_reduction_factor = max(
+                            0.1,
+                            charge_attr_opt("aoeDamageReductionFactor")
+                            or charge_attr_opt("damageReductionFactor")
+                            or 0.5,
+                        )
+                        charge_velocity = max(0.0, charge_attr("maxVelocity", 0.0))
+                        charge_delay_sec = max(0.0, charge_attr("explosionDelay", 0.0) / 1000.0)
+                        charge_mass = max(0.0, charge_attr("mass", 0.0))
+                        charge_agility = max(0.0, charge_attr("agility", 0.0))
+                        projectile_shield_hp = max(0.0, charge_attr("shieldCapacity", 0.0))
+                        projectile_armor_hp = max(0.0, charge_attr("armorHP", 0.0))
+                        projectile_structure_hp = max(0.0, charge_attr("hp", 0.0))
+                        charge_range = 0.0
+                        if charge_velocity > 0.0 and charge_delay_sec > 0.0:
+                            accel_time = min(charge_delay_sec, (charge_mass * charge_agility) / 1_000_000.0) if charge_mass > 0.0 and charge_agility > 0.0 else 0.0
+                            charge_range = (charge_velocity * 0.5 * accel_time) + (charge_velocity * max(0.0, charge_delay_sec - accel_time))
+                        if range_m <= 0.0 and charge_range > 0.0:
+                            range_m = charge_range
+                        if falloff_m <= 1.0:
+                            falloff_m = 0.0
                         projected_add["weapon_explosion_radius"] = explosion_radius
                         projected_add["weapon_explosion_velocity"] = explosion_velocity
                         projected_add["weapon_drf"] = damage_reduction_factor
+                        projected_add["weapon_projectile_speed"] = charge_velocity
+                        projected_add["weapon_projectile_flight_time"] = charge_delay_sec
+                        projected_add["weapon_projectile_mass"] = charge_mass
+                        projected_add["weapon_projectile_agility"] = charge_agility
+                        projected_add["weapon_projectile_shield_hp"] = projectile_shield_hp
+                        projected_add["weapon_projectile_armor_hp"] = projectile_armor_hp
+                        projected_add["weapon_projectile_structure_hp"] = projectile_structure_hp
+                        projected_add["weapon_projectile_shield_resonance_em"] = max(
+                            0.0,
+                            charge_attr_opt("shieldEmDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_shield_resonance_thermal"] = max(
+                            0.0,
+                            charge_attr_opt("shieldThermalDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_shield_resonance_kinetic"] = max(
+                            0.0,
+                            charge_attr_opt("shieldKineticDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_shield_resonance_explosive"] = max(
+                            0.0,
+                            charge_attr_opt("shieldExplosiveDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_armor_resonance_em"] = max(
+                            0.0,
+                            charge_attr_opt("armorEmDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_armor_resonance_thermal"] = max(
+                            0.0,
+                            charge_attr_opt("armorThermalDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_armor_resonance_kinetic"] = max(
+                            0.0,
+                            charge_attr_opt("armorKineticDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_armor_resonance_explosive"] = max(
+                            0.0,
+                            charge_attr_opt("armorExplosiveDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_structure_resonance_em"] = max(
+                            0.0,
+                            charge_attr_opt("emDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_structure_resonance_thermal"] = max(
+                            0.0,
+                            charge_attr_opt("thermalDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_structure_resonance_kinetic"] = max(
+                            0.0,
+                            charge_attr_opt("kineticDamageResonance") or 1.0,
+                        )
+                        projected_add["weapon_projectile_structure_resonance_explosive"] = max(
+                            0.0,
+                            charge_attr_opt("explosiveDamageResonance") or 1.0,
+                        )
                     else:
                         projected_add["weapon_is_turret"] = 1.0
                         projected_add["weapon_tracking"] = max(0.0, attr("trackingSpeed", 0.0))
@@ -873,6 +1006,15 @@ class RuntimeFromEftFactory:
 
             if abs(damage_scale - 1.0) > 1e-6:
                 local_mult["dps"] = max(0.01, damage_scale)
+
+        if is_weapon_like and range_m <= 0.0:
+            range_m = max(
+                range_m,
+                float(projected_add.get("weapon_projectile_speed", 0.0) or 0.0)
+                * float(projected_add.get("weapon_projectile_flight_time", 0.0) or 0.0),
+            )
+        if pyfa_cycle_sec > 0.0:
+            cycle_sec = max(0.1, pyfa_cycle_sec)
 
         has_projected_damage = any(str(key).startswith("damage_") for key in projected_add.keys())
         is_weapon = is_weapon_like and has_projected_damage
