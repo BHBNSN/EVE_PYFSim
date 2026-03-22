@@ -1054,6 +1054,45 @@ class ShipStatusDialog(QDialog):
         speed = max(150.0, float(getattr(profile, "max_speed", 0.0) or 0.0))
         return max(2.5, min(14.0, 14_000.0 / speed))
 
+    @staticmethod
+    def _format_ship_id_summary(lang: str, ship_ids: list[str]) -> str:
+        normalized = sorted(str(ship_id) for ship_id in ship_ids if str(ship_id).strip())
+        if not normalized:
+            return tr(lang, "status_target_none")
+        return ", ".join(normalized)
+
+    @staticmethod
+    def _format_lock_timer_summary(
+        lang: str,
+        timer_entries: list[tuple[str, float]],
+    ) -> str:
+        normalized = [
+            (str(ship_id), max(0.0, float(remaining)))
+            for ship_id, remaining in timer_entries
+            if str(ship_id).strip() and max(0.0, float(remaining)) > 0.0
+        ]
+        if not normalized:
+            return tr(lang, "status_target_none")
+        normalized.sort(key=lambda item: (item[1], item[0]))
+        return ", ".join(f"{ship_id} ({remaining:.1f}s)" for ship_id, remaining in normalized)
+
+    def _incoming_lock_status(self, ship, lang: str) -> tuple[str, str]:
+        locked_by: list[str] = []
+        locking_by: list[tuple[str, float]] = []
+        for other in self.engine.world.ships.values():
+            if other.ship_id == ship.ship_id or not other.vital.alive:
+                continue
+            if ship.ship_id in other.combat.lock_targets:
+                locked_by.append(str(other.ship_id))
+                continue
+            remaining = max(0.0, float(other.combat.lock_timers.get(ship.ship_id, 0.0) or 0.0))
+            if remaining > 0.0:
+                locking_by.append((str(other.ship_id), remaining))
+        return (
+            self._format_ship_id_summary(lang, locked_by),
+            self._format_lock_timer_summary(lang, locking_by),
+        )
+
     @classmethod
     def _layer_omni_ehp(
         cls,
@@ -1563,6 +1602,12 @@ class ShipStatusDialog(QDialog):
 
     def _refresh_cap_target_tab(self, ship, lang: str, force: bool) -> None:
         profile = self._stable_profile(ship)
+        outgoing_locking = [
+            (str(target_id), float(remaining))
+            for target_id, remaining in ship.combat.lock_timers.items()
+            if str(target_id) not in ship.combat.lock_targets
+        ]
+        locked_by_text, locking_by_text = self._incoming_lock_status(ship, lang)
         capacitor_rows = [
             (tr(lang, "status_cap"), f"{ship.vital.cap:.1f} / {ship.vital.cap_max:.1f}"),
             (tr(lang, "status_cap_peak_recharge"), f"{self._peak_cap_recharge(profile):.2f} GJ/s"),
@@ -1580,6 +1625,11 @@ class ShipStatusDialog(QDialog):
             (tr(lang, "status_agility"), f"{profile.agility:.3f}"),
             (tr(lang, "status_warp_stability"), f"{profile.warp_stability:.1f}"),
             (tr(lang, "status_warp_scramble"), f"{profile.warp_scramble_status:.1f}"),
+            (tr(lang, "status_current_target"), str(ship.combat.current_target or tr(lang, "status_target_none"))),
+            (tr(lang, "status_locked_targets_detail"), self._format_ship_id_summary(lang, list(ship.combat.lock_targets))),
+            (tr(lang, "status_locking_targets"), self._format_lock_timer_summary(lang, outgoing_locking)),
+            (tr(lang, "status_locked_by"), locked_by_text),
+            (tr(lang, "status_locking_by"), locking_by_text),
         ]
         headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
         signature = (

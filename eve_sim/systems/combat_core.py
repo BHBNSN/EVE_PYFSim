@@ -60,6 +60,7 @@ _PROFILE_PASSTHROUGH_ATTRS = (
 )
 
 _PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
+_REPAIR_QUEUE_LAYERS = ("shield", "armor", "structure")
 
 _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS = frozenset(
     {
@@ -101,6 +102,8 @@ class CombatSystem:
         self._cached_command_booster_snapshots: dict[str, list[dict[str, Any]]] | None = None
         self._cached_projected_source_snapshots: dict[str, list[dict[str, Any]]] | None = None
         self._module_static_metadata_by_object_id: dict[int, tuple[weakref.ReferenceType[Any], ModuleStaticMetadata]] = {}
+        self._repair_queue_cache: dict[tuple[Team, str], tuple[str, ...]] = {}
+        self._repair_queue_dirty: set[tuple[Team, str]] = set()
         self._timing_wheel = TimingWheel()
         self._decision_reference_time: float | None = None
 
@@ -321,6 +324,21 @@ class CombatSystem:
     def _mark_pyfa_remote_inputs_dirty(self) -> None:
         self._pyfa_remote_inputs_dirty = True
 
+    def _mark_all_repair_queues_dirty(self) -> None:
+        self._repair_queue_cache.clear()
+        for team in Team:
+            for layer in _REPAIR_QUEUE_LAYERS:
+                self._repair_queue_dirty.add((team, layer))
+
+    def _mark_team_repair_queues_dirty(self, team: Team, *layers: str) -> None:
+        if team is None:
+            return
+        dirty_layers = tuple(str(layer) for layer in (layers or _REPAIR_QUEUE_LAYERS) if str(layer) in _REPAIR_QUEUE_LAYERS)
+        for layer in dirty_layers:
+            cache_key = (team, layer)
+            self._repair_queue_cache.pop(cache_key, None)
+            self._repair_queue_dirty.add(cache_key)
+
     def _refresh_alive_runtime_ship_ids(self, world: WorldState) -> None:
         current_alive_runtime_ship_ids = {
             ship.ship_id
@@ -330,6 +348,7 @@ class CombatSystem:
         if current_alive_runtime_ship_ids != self._alive_runtime_ship_ids:
             self._alive_runtime_ship_ids = current_alive_runtime_ship_ids
             self._mark_pyfa_remote_inputs_dirty()
+            self._mark_all_repair_queues_dirty()
 
     def _cached_pyfa_remote_inputs_available(self) -> bool:
         return self._cached_command_booster_snapshots is not None and self._cached_projected_source_snapshots is not None
@@ -373,6 +392,15 @@ class CombatSystem:
         is_ecm = "ecm" in tags
         is_weapon = "weapon" in tags
         has_projected_rep = "remote_repair" in tags
+        repair_layers: list[str] = []
+        if has_projected_rep:
+            for _effect_index, effect in projected_effects:
+                if float(effect.projected_add.get("shield_rep", 0.0) or 0.0) > 0.0 and "shield" not in repair_layers:
+                    repair_layers.append("shield")
+                if float(effect.projected_add.get("armor_rep", 0.0) or 0.0) > 0.0 and "armor" not in repair_layers:
+                    repair_layers.append("armor")
+                if float(effect.projected_add.get("structure_rep", 0.0) or 0.0) > 0.0 and "structure" not in repair_layers:
+                    repair_layers.append("structure")
         is_offensive_ewar = "offensive_ewar" in tags or is_ecm or is_cap_warfare
         supports_formula_projected_profile = (
             has_projected
@@ -422,7 +450,7 @@ class CombatSystem:
                 decision_rule = ModuleDecisionRule(
                     rule_id="projected_remote_repair",
                     activation_mode="always",
-                    target_mode="ally_lowest_hp",
+                    target_mode="ally_repair_queue",
                 )
             elif is_offensive_ewar:
                 decision_rule = ModuleDecisionRule(
@@ -505,6 +533,7 @@ class CombatSystem:
             is_propulsion=is_propulsion,
             is_damage_control=is_damage_control,
             affects_local_pyfa_profile=_module_affects_local_pyfa_profile(module),
+            repair_layers=tuple(repair_layers),
             decision_rule=decision_rule,
         )
         module_ref = weakref.ref(
@@ -1769,10 +1798,23 @@ class CombatSystem:
         ship.vital.structure = max(0.0, min(float(ship.vital.structure), ship.vital.structure_max))
 
     def _sync_vital_max_with_profile(self, ship, profile: ShipProfile) -> None:
+        previous_values = {
+            "shield": (float(ship.vital.shield), float(ship.vital.shield_max)),
+            "armor": (float(ship.vital.armor), float(ship.vital.armor_max)),
+            "structure": (float(ship.vital.structure), float(ship.vital.structure_max)),
+        }
         ship.vital.shield_max = max(1.0, float(getattr(profile, "shield_hp", ship.vital.shield_max) or ship.vital.shield_max))
         ship.vital.armor_max = max(1.0, float(getattr(profile, "armor_hp", ship.vital.armor_max) or ship.vital.armor_max))
         ship.vital.structure_max = max(1.0, float(getattr(profile, "structure_hp", ship.vital.structure_max) or ship.vital.structure_max))
         self._clamp_ship_layer_hp(ship)
+        changed_layers = [
+            layer
+            for layer in _REPAIR_QUEUE_LAYERS
+            if abs(self._ship_layer_values(ship, layer)[0] - previous_values[layer][0]) > 1e-6
+            or abs(self._ship_layer_values(ship, layer)[1] - previous_values[layer][1]) > 1e-6
+        ]
+        if changed_layers:
+            self._mark_team_repair_queues_dirty(ship.team, *changed_layers)
 
     def _cached_lock_time(self, attacker_profile, defender_profile) -> float:
         key = (
@@ -1919,6 +1961,61 @@ class CombatSystem:
         hp_max = max(1.0, ship.vital.shield_max + ship.vital.armor_max + ship.vital.structure_max)
         hp_now = ship.vital.shield + ship.vital.armor + ship.vital.structure
         return hp_now / hp_max
+
+    @staticmethod
+    def _ship_layer_values(ship, layer: str) -> tuple[float, float]:
+        if layer == "shield":
+            return float(ship.vital.shield), max(1.0, float(ship.vital.shield_max))
+        if layer == "armor":
+            return float(ship.vital.armor), max(1.0, float(ship.vital.armor_max))
+        return float(ship.vital.structure), max(1.0, float(ship.vital.structure_max))
+
+    @classmethod
+    def _ship_layer_fraction(cls, ship, layer: str) -> float:
+        current, maximum = cls._ship_layer_values(ship, layer)
+        return max(0.0, min(1.0, current / maximum))
+
+    @classmethod
+    def _ship_needs_layer_repair(cls, ship, layer: str) -> bool:
+        if not ship.vital.alive:
+            return False
+        current, maximum = cls._ship_layer_values(ship, layer)
+        return (maximum - current) > 1e-6
+
+    def _team_repair_queue(self, world: WorldState, team: Team, layer: str) -> tuple[str, ...]:
+        cache_key = (team, layer)
+        if cache_key not in self._repair_queue_dirty:
+            cached = self._repair_queue_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        ranked: list[tuple[float, str]] = []
+        for ship in world.ships.values():
+            if ship.team != team:
+                continue
+            if not self._ship_needs_layer_repair(ship, layer):
+                continue
+            ranked.append((self._ship_layer_fraction(ship, layer), str(ship.ship_id)))
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        queue = tuple(ship_id for _fraction, ship_id in ranked)
+        self._repair_queue_cache[cache_key] = queue
+        self._repair_queue_dirty.discard(cache_key)
+        return queue
+
+    def _select_repair_queue_target(self, world: WorldState, source, module, metadata: ModuleStaticMetadata) -> str | None:
+        for layer in metadata.repair_layers:
+            for target_id in self._team_repair_queue(world, source.team, layer):
+                if target_id == source.ship_id:
+                    continue
+                target = world.ships.get(target_id)
+                if target is None or not target.vital.alive or target.team != source.team:
+                    continue
+                if not self._ship_needs_layer_repair(target, layer):
+                    continue
+                if not self._module_in_projected_range(source, target, module):
+                    continue
+                return target_id
+        return None
 
     @staticmethod
     def _module_in_projected_range(source, target, module) -> bool:
@@ -2336,6 +2433,10 @@ class CombatSystem:
                 allowed_ids.add(str(focus_queue[1]))
             return target_id in allowed_ids and target_id in enemy_ids
 
+        if rule.target_mode == "ally_repair_queue":
+            metadata = self._module_static_metadata(module)
+            return target_id == self._select_repair_queue_target(world, source, module, metadata)
+
         if rule.target_mode == "ally_lowest_hp":
             if target_id == source.ship_id:
                 return False
@@ -2456,6 +2557,8 @@ class CombatSystem:
             return None
         if rule.target_mode == "weapon_focus_prefocus":
             return self._select_weapon_focus_target(world, source, module, existing_target_id)
+        if rule.target_mode == "ally_repair_queue":
+            return self._select_repair_queue_target(world, source, module, self._module_static_metadata(module))
         if rule.target_mode == "ally_lowest_hp":
             return self._select_ally_lowest_hp_in_range(source, module, allies_pool, existing_target_id)
         if rule.target_mode == "enemy_random":
@@ -3162,6 +3265,8 @@ class CombatSystem:
         shield_repaired = 0.0
         armor_repaired = 0.0
         cap_drained = 0.0
+        dirty_layers: set[str] = set()
+        alive_before = bool(target.vital.alive)
 
         shield_rep = float(effect.projected_add.get("shield_rep", 0.0) or 0.0)
         if shield_rep > 0.0:
@@ -3169,6 +3274,8 @@ class CombatSystem:
             before = target.vital.shield
             target.vital.shield = min(target.vital.shield_max, target.vital.shield + amount)
             shield_repaired = max(0.0, target.vital.shield - before)
+            if shield_repaired > 0.0:
+                dirty_layers.add("shield")
 
         armor_rep = float(effect.projected_add.get("armor_rep", 0.0) or 0.0)
         if armor_rep > 0.0:
@@ -3176,6 +3283,8 @@ class CombatSystem:
             before = target.vital.armor
             target.vital.armor = min(target.vital.armor_max, target.vital.armor + amount)
             armor_repaired = max(0.0, target.vital.armor - before)
+            if armor_repaired > 0.0:
+                dirty_layers.add("armor")
 
         cap_drain = float(effect.projected_add.get("cap_drain", 0.0) or 0.0)
         if cap_drain > 0.0:
@@ -3192,6 +3301,8 @@ class CombatSystem:
             max(0.0, float(effect.projected_add.get("damage_explosive", 0.0) or 0.0)),
         )
         if _sum_damage(base_damage) <= 0.0:
+            if dirty_layers:
+                self._mark_team_repair_queues_dirty(target.team, *dirty_layers)
             return shield_repaired, armor_repaired, cap_drained, 0.0, 0.0, 0.0, 0.0, 0.0
 
         damage_factor = strength if damage_factor_override is None else max(0.0, float(damage_factor_override))
@@ -3199,6 +3310,8 @@ class CombatSystem:
         dealt_damage = _scale_damage(base_damage, damage_factor)
         total_damage = _sum_damage(dealt_damage)
         if total_damage <= 0.0:
+            if dirty_layers:
+                self._mark_team_repair_queues_dirty(target.team, *dirty_layers)
             return shield_repaired, armor_repaired, cap_drained, 0.0, 0.0, 0.0, 0.0, 0.0
 
         shield_before = target.vital.shield
@@ -3211,6 +3324,12 @@ class CombatSystem:
             dealt_damage,
             target_profile,
         )
+        if abs(target.vital.shield - shield_before) > 1e-6:
+            dirty_layers.add("shield")
+        if abs(target.vital.armor - armor_before) > 1e-6:
+            dirty_layers.add("armor")
+        if abs(target.vital.structure - structure_before) > 1e-6:
+            dirty_layers.add("structure")
         applied = (shield_before + armor_before + structure_before) - (
             target.vital.shield + target.vital.armor + target.vital.structure
         )
@@ -3219,6 +3338,10 @@ class CombatSystem:
         if target.vital.structure <= 0:
             target.vital.alive = False
             target.nav.velocity = Vector2(0.0, 0.0)
+        if alive_before and not target.vital.alive:
+            dirty_layers.update(_REPAIR_QUEUE_LAYERS)
+        if dirty_layers:
+            self._mark_team_repair_queues_dirty(target.team, *dirty_layers)
 
         return (
             shield_repaired,

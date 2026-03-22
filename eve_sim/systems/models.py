@@ -149,6 +149,7 @@ class ModuleStaticMetadata:
     is_propulsion: bool
     is_damage_control: bool
     affects_local_pyfa_profile: bool
+    repair_layers: tuple[str, ...]
     decision_rule: ModuleDecisionRule
 
 
