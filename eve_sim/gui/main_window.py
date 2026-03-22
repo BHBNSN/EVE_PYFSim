@@ -162,6 +162,7 @@ class MainWindow(QMainWindow):
         for idx, ship_id in enumerate(world_ship_ids):
             if idx < len(self.manual_setup):
                 self._ship_fit_texts[ship_id] = self.manual_setup[idx].fit_text
+        self._seed_ship_initial_fit_keys()
         self.store = PreferencesStore()
         self.prefs = self.store.load()
         if self.prefs.filter_team in ("BLUE", "RED"):
@@ -253,6 +254,9 @@ class MainWindow(QMainWindow):
                 self._get_ship_locked_module_charge,
                 self._set_ship_module_charge_lock,
                 self._clear_ship_module_charge_lock,
+                self._get_ship_module_manual_mode,
+                self._set_ship_module_manual_mode,
+                self._sync_ship_module_manual_mode_to_matching_squad_fit,
                 self,
             )
             self._status_dialogs[ship_id] = dialog
@@ -356,6 +360,126 @@ class MainWindow(QMainWindow):
         if not locked:
             self._ship_locked_module_charges.pop(ship_id, None)
 
+    @staticmethod
+    def _normalize_module_manual_mode(mode: str | None) -> str:
+        normalized = str(mode or "auto").strip().lower()
+        return normalized if normalized in {"auto", "active", "online"} else "auto"
+
+    def _seed_ship_initial_fit_keys(self) -> None:
+        for ship in self.engine.world.ships.values():
+            self._ship_initial_fit_key(ship)
+
+    @staticmethod
+    def _find_ship_runtime_module(ship, module_id: str):
+        runtime = getattr(ship, "runtime", None)
+        if runtime is None:
+            return None
+        return next((candidate for candidate in runtime.modules if str(candidate.module_id) == str(module_id)), None)
+
+    def _ship_initial_fit_key(self, ship) -> str:
+        runtime = getattr(ship, "runtime", None)
+        if runtime is not None and isinstance(getattr(runtime, "diagnostics", None), dict):
+            initial_fit_key = str(runtime.diagnostics.get("initial_fit_key", "") or "")
+            if not initial_fit_key:
+                initial_fit_key = str(getattr(ship.fit, "fit_key", "") or "")
+                runtime.diagnostics["initial_fit_key"] = initial_fit_key
+            return initial_fit_key
+        return str(getattr(ship.fit, "fit_key", "") or "")
+
+    def _apply_ship_module_manual_mode(self, ship, module_id: str, normalized_mode: str) -> None:
+        if normalized_mode == "auto":
+            ship.combat.module_manual_modes.pop(module_id, None)
+        else:
+            ship.combat.module_manual_modes[module_id] = normalized_mode
+        ship.combat.module_decision_pending.add(str(module_id))
+
+    def _get_ship_module_manual_mode(self, ship_id: str, module_id: str) -> str:
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return "auto"
+        return self._normalize_module_manual_mode(ship.combat.module_manual_modes.get(module_id))
+
+    def _set_ship_module_manual_mode(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+        lang = self.current_language()
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return False, tr(lang, "ship_missing")
+        if not self._is_ammo_configurable_team(ship.team):
+            return False, tr(lang, "status_module_mode_team_denied")
+        if ship.runtime is None:
+            return False, tr(lang, "status_module_none")
+
+        module = self._find_ship_runtime_module(ship, module_id)
+        if module is None:
+            return False, tr(lang, "status_lock_module_missing")
+        if not module.can_be_active() or module.state == ModuleState.OFFLINE:
+            return False, tr(lang, "status_module_mode_unsupported")
+
+        normalized_mode = self._normalize_module_manual_mode(mode)
+        self._apply_ship_module_manual_mode(ship, module_id, normalized_mode)
+        self.request_overview_refresh(force=True)
+        self.canvas.update()
+        self._log_user_action(
+            "module_mode_override",
+            ship=ship_id,
+            module=module_id,
+            mode=normalized_mode,
+        )
+        return True, normalized_mode
+
+    def _sync_ship_module_manual_mode_to_matching_squad_fit(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+        lang = self.current_language()
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return False, tr(lang, "ship_missing")
+        if not self._is_ammo_configurable_team(ship.team):
+            return False, tr(lang, "status_module_mode_team_denied")
+        if ship.runtime is None:
+            return False, tr(lang, "status_module_none")
+
+        source_module = self._find_ship_runtime_module(ship, module_id)
+        if source_module is None:
+            return False, tr(lang, "status_lock_module_missing")
+        if not source_module.can_be_active() or source_module.state == ModuleState.OFFLINE:
+            return False, tr(lang, "status_module_mode_unsupported")
+
+        normalized_mode = self._normalize_module_manual_mode(mode)
+        initial_fit_key = self._ship_initial_fit_key(ship)
+        updated_ship_ids: list[str] = []
+        for candidate in self.engine.world.ships.values():
+            if candidate.team != ship.team or candidate.squad_id != ship.squad_id:
+                continue
+            if self._ship_initial_fit_key(candidate) != initial_fit_key:
+                continue
+            target_module = self._find_ship_runtime_module(candidate, module_id)
+            if target_module is None:
+                continue
+            if not target_module.can_be_active() or target_module.state == ModuleState.OFFLINE:
+                continue
+            self._apply_ship_module_manual_mode(candidate, module_id, normalized_mode)
+            updated_ship_ids.append(candidate.ship_id)
+
+        if not updated_ship_ids:
+            return False, tr(lang, "status_module_mode_sync_none")
+
+        self.request_overview_refresh(force=True)
+        self.canvas.update()
+        self._log_user_action(
+            "module_mode_override_sync",
+            ship=ship_id,
+            module=module_id,
+            mode=normalized_mode,
+            squad=ship.squad_id,
+            initial_fit_key=initial_fit_key,
+            updated_ships=len(updated_ship_ids),
+        )
+        return True, tr(
+            lang,
+            "status_module_mode_sync_done",
+            count=len(updated_ship_ids),
+            mode=tr(lang, f"status_module_mode_{normalized_mode}"),
+        )
+
     def _sync_manual_setup_fit_text(self, ship_id: str, fit_text: str) -> None:
         ship_ids = list(self.engine.world.ships.keys())
         try:
@@ -431,6 +555,7 @@ class MainWindow(QMainWindow):
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return False, tr(lang, "ship_missing"), None
+        initial_fit_key = self._ship_initial_fit_key(ship)
         try:
             parsed = self._parser.parse(fit_text)
             runtime_template, fit = self._factory.build(parsed)
@@ -442,6 +567,8 @@ class MainWindow(QMainWindow):
         ship.runtime = runtime
         ship.fit = fit
         ship.profile = profile
+        if isinstance(getattr(runtime, "diagnostics", None), dict) and initial_fit_key:
+            runtime.diagnostics["initial_fit_key"] = initial_fit_key
 
         runtime_module_ids = {m.module_id for m in runtime.modules}
         for timer_map in (
@@ -453,6 +580,9 @@ class MainWindow(QMainWindow):
             for module_id in list(timer_map.keys()):
                 if module_id not in runtime_module_ids:
                     timer_map.pop(module_id, None)
+        for module_id in list(ship.combat.module_manual_modes.keys()):
+            if module_id not in runtime_module_ids:
+                ship.combat.module_manual_modes.pop(module_id, None)
 
         self._prune_ship_locked_module_charges(ship_id, runtime_module_ids)
         self._ship_fit_texts[ship_id] = fit_text

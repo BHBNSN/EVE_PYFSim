@@ -722,6 +722,8 @@ class CombatSystem:
         recent_enemy_weapon_damage_active: bool,
         has_focus_queue: bool,
     ) -> bool:
+        if self._manual_module_mode(ship, str(module.module_id)) != "auto":
+            return module.state != module.state.OFFLINE
         decision_rule = metadata.decision_rule
         return module_keeps_decision_pending(
             ship,
@@ -733,6 +735,43 @@ class CombatSystem:
             recent_enemy_weapon_damage_active=recent_enemy_weapon_damage_active,
             has_focus_queue=has_focus_queue,
         )
+
+    @staticmethod
+    def _manual_module_mode(ship, module_id: str) -> str:
+        raw_modes = getattr(ship.combat, "module_manual_modes", {})
+        if not isinstance(raw_modes, dict):
+            return "auto"
+        normalized = str(raw_modes.get(str(module_id), "auto") or "auto").strip().lower()
+        return normalized if normalized in {"auto", "active", "online"} else "auto"
+
+    def _requested_module_mode(
+        self,
+        ship,
+        module,
+        metadata: ModuleStaticMetadata,
+        *,
+        propulsion_active: bool,
+    ) -> str:
+        explicit_mode = self._manual_module_mode(ship, str(module.module_id))
+        if explicit_mode != "auto":
+            return explicit_mode
+        if metadata.is_propulsion:
+            return "active" if propulsion_active else "online"
+        return "auto"
+
+    def _manual_weapon_target(self, world: WorldState, source, module, previous_target_id: str | None) -> str | None:
+        for candidate_id in (previous_target_id, getattr(source.combat, "current_target", None)):
+            if not candidate_id:
+                continue
+            target = world.ships.get(str(candidate_id))
+            if target is None or not target.vital.alive or target.team == source.team:
+                continue
+            if not self._module_in_projected_range(source, target, module):
+                continue
+            if not self._can_target_under_ecm(source, str(candidate_id), self._decision_now(world)):
+                continue
+            return str(candidate_id)
+        return None
 
     def _validate_cached_pyfa_base_profiles(
         self,
@@ -2799,34 +2838,43 @@ class CombatSystem:
                             ammo_reload_started_this_tick = True
 
                 decision_rule = metadata.decision_rule
+                requested_mode = self._requested_module_mode(
+                    ship,
+                    module,
+                    metadata,
+                    propulsion_active=propulsion_active,
+                )
                 desired_active = False
                 projected_target_id: str | None = None
                 has_projected = metadata.has_projected
                 cycle_started = False
 
                 if has_projected:
-                    if (not force_target_reselect) and self._can_reuse_projected_target(
-                        world,
-                        ship,
-                        module,
-                        decision_rule,
-                        previous_projected_target,
-                        allies_pool,
-                        enemies_alive,
-                        ally_ids,
-                        enemy_ids,
-                    ):
-                        projected_target_id = previous_projected_target
+                    if requested_mode == "active" and metadata.is_weapon and not metadata.is_area_effect:
+                        projected_target_id = self._manual_weapon_target(world, ship, module, previous_projected_target)
                     else:
-                        projected_target_id = self._select_projected_target(
+                        if (not force_target_reselect) and self._can_reuse_projected_target(
                             world,
                             ship,
                             module,
-                            allies_pool=allies_pool,
-                            enemies_pool=enemies_alive,
-                            rule=decision_rule,
-                            existing_target_id=None,
-                        )
+                            decision_rule,
+                            previous_projected_target,
+                            allies_pool,
+                            enemies_alive,
+                            ally_ids,
+                            enemy_ids,
+                        ):
+                            projected_target_id = previous_projected_target
+                        else:
+                            projected_target_id = self._select_projected_target(
+                                world,
+                                ship,
+                                module,
+                                allies_pool=allies_pool,
+                                enemies_pool=enemies_alive,
+                                rule=decision_rule,
+                                existing_target_id=None,
+                            )
                     if decision_rule.target_mode == "weapon_focus_prefocus":
                         delay_pair = (previous_projected_target, projected_target_id)
                         if delay_pair not in synced_weapon_fire_delay_pairs:
@@ -2838,13 +2886,18 @@ class CombatSystem:
                             )
                             synced_weapon_fire_delay_pairs.add(delay_pair)
 
-                desired_active = self._should_activate_module(
-                    world,
-                    ship,
-                    module,
-                    decision_rule,
-                    projected_target_id,
-                )
+                if requested_mode == "active":
+                    desired_active = True
+                elif requested_mode == "online":
+                    desired_active = False
+                else:
+                    desired_active = self._should_activate_module(
+                        world,
+                        ship,
+                        module,
+                        decision_rule,
+                        projected_target_id,
+                    )
                 if has_projected and projected_target_id is None and not metadata.is_area_effect:
                     desired_active = False
 

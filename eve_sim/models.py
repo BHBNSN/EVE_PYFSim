@@ -157,6 +157,7 @@ class CombatState:
     module_cycle_deadlines: dict[str, float] = field(default_factory=dict)
     module_reactivation_timers: dict[str, float] = field(default_factory=dict)
     module_reactivation_deadlines: dict[str, float] = field(default_factory=dict)
+    module_manual_modes: dict[str, str] = field(default_factory=dict)
     module_decision_pending: set[str] = field(default_factory=set)
     module_decision_pending_signature: tuple[str, ...] = field(default_factory=tuple)
     module_decision_propulsion_active: bool | None = None
