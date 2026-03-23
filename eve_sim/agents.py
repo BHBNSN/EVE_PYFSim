@@ -96,7 +96,6 @@ class ShipAgent(BaseAgent):
             arrive_radius = max(120.0, ship.nav.radius * 1.5)
             if ship.nav.position.distance_to(move_target) <= arrive_radius and ship.nav.velocity.length() <= 50.0:
                 ship.nav.command_target = None
-                ship.nav.velocity = Vector2(0.0, 0.0)
                 self.current_order = None
             else:
                 ship.nav.command_target = move_target
@@ -108,7 +107,6 @@ class ShipAgent(BaseAgent):
                 ship.nav.command_target = leader.nav.position
             else:
                 ship.nav.command_target = None
-                ship.nav.velocity = Vector2(0.0, 0.0)
 
         if self.current_order and self.current_order.kind == "ATTACK":
             ship.combat.current_target = self.current_order.payload.get("target_id")

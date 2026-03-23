@@ -4280,8 +4280,6 @@ class CombatSystem:
                     )
                 self._diag_logged_ships.add(ship.ship_id)
             ship.nav.max_speed = ship_profile.max_speed
-            if ship.nav.velocity.length() > ship.nav.max_speed:
-                ship.nav.velocity = ship.nav.velocity.normalized() * ship.nav.max_speed
 
             ship.vital.cap_max = ship_profile.max_cap
             if ship.vital.cap > ship.vital.cap_max:

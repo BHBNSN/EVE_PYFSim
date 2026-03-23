@@ -248,11 +248,6 @@ class MovementSystem:
                     displacement = (current_velocity + new_velocity) * (0.5 * dt)
 
         new_speed = new_velocity.length()
-        if new_speed > speed_cap:
-            new_velocity = new_velocity.normalized() * speed_cap
-            displacement = (current_velocity + new_velocity) * (0.5 * dt)
-            new_speed = speed_cap
-
         ship.nav.velocity = new_velocity
         ship.nav.facing_deg = new_velocity.angle_deg() if new_speed > 1e-6 else desired_angle
         return displacement
