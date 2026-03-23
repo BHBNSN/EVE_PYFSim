@@ -1009,11 +1009,47 @@ class CombatSystem:
         return "exact_range", self._quantize_pyfa_projection_range(target_snapshot.distance)
 
     @staticmethod
+    def _runtime_state_rank(state: ModuleState) -> int:
+        return {
+            ModuleState.OFFLINE: 0,
+            ModuleState.ONLINE: 1,
+            ModuleState.ACTIVE: 2,
+            ModuleState.OVERHEATED: 3,
+        }.get(state, 0)
+
+    @classmethod
+    def _runtime_module_max_state(cls, runtime: FitRuntime | None, module_id: str) -> ModuleState:
+        if runtime is None:
+            return ModuleState.OVERHEATED
+        raw_map = runtime.diagnostics.get("pyfa_max_state_by_module_id")
+        if not isinstance(raw_map, dict):
+            return ModuleState.OVERHEATED
+        state_name = str(raw_map.get(str(module_id), ModuleState.OVERHEATED.value) or ModuleState.OVERHEATED.value).upper()
+        if state_name in ModuleState.__members__:
+            return ModuleState[state_name]
+        return ModuleState.OVERHEATED
+
+    @classmethod
+    def _clamp_runtime_state_to_pyfa_max(cls, requested_state: ModuleState, max_state: ModuleState) -> ModuleState:
+        return requested_state if cls._runtime_state_rank(requested_state) <= cls._runtime_state_rank(max_state) else max_state
+
+    @classmethod
+    def _runtime_inactive_module_state(cls, runtime: FitRuntime | None, module_id: str) -> ModuleState:
+        max_state = cls._runtime_module_max_state(runtime, module_id)
+        if cls._runtime_state_rank(max_state) < cls._runtime_state_rank(ModuleState.ONLINE):
+            return ModuleState.OFFLINE
+        return ModuleState.ONLINE
+
+    @staticmethod
     def _copy_runtime_dynamic_state(source_runtime, target_runtime) -> None:
+        raw_max_state_map = target_runtime.diagnostics.get("pyfa_max_state_by_module_id")
+        max_state_map = raw_max_state_map if isinstance(raw_max_state_map, dict) else {}
         if len(source_runtime.modules) == len(target_runtime.modules):
             for source_module, target_module in zip(source_runtime.modules, target_runtime.modules):
                 target_module.module_id = source_module.module_id
-                target_module.state = source_module.state
+                max_state_name = str(max_state_map.get(str(target_module.module_id), ModuleState.OVERHEATED.value) or ModuleState.OVERHEATED.value).upper()
+                max_state = ModuleState[max_state_name] if max_state_name in ModuleState.__members__ else ModuleState.OVERHEATED
+                target_module.state = CombatSystem._clamp_runtime_state_to_pyfa_max(source_module.state, max_state)
                 if source_module.charge_capacity > 0:
                     target_module.charge_remaining = max(
                         0.0,
@@ -1026,9 +1062,43 @@ class CombatSystem:
             source_module = source_by_module_id.get(module.module_id)
             if source_module is None:
                 continue
-            module.state = source_module.state
+            max_state_name = str(max_state_map.get(str(module.module_id), ModuleState.OVERHEATED.value) or ModuleState.OVERHEATED.value).upper()
+            max_state = ModuleState[max_state_name] if max_state_name in ModuleState.__members__ else ModuleState.OVERHEATED
+            module.state = CombatSystem._clamp_runtime_state_to_pyfa_max(source_module.state, max_state)
             if module.charge_capacity > 0:
                 module.charge_remaining = max(0.0, min(float(source_module.charge_remaining), float(module.charge_capacity)))
+
+    def _apply_runtime_activation_limit_transitions(
+        self,
+        world: WorldState,
+        ship,
+        source_runtime: FitRuntime,
+        target_runtime: FitRuntime,
+    ) -> bool:
+        source_by_module_id = {str(module.module_id): module for module in source_runtime.modules}
+        pyfa_remote_inputs_dirty = False
+
+        for target_module in target_runtime.modules:
+            module_id = str(target_module.module_id)
+            source_module = source_by_module_id.get(module_id)
+            if source_module is None:
+                continue
+            if source_module.state not in {ModuleState.ACTIVE, ModuleState.OVERHEATED}:
+                continue
+            if target_module.state in {ModuleState.ACTIVE, ModuleState.OVERHEATED}:
+                continue
+
+            previous_projected_target = ship.combat.projected_targets.get(module_id)
+            self._flush_projected_cycle_total(world, ship.ship_id, target_module, previous_projected_target)
+            self._clear_module_cycle_snapshots(ship.ship_id, module_id)
+            self._clear_module_cycle_timer(ship, module_id)
+            self._clear_module_reactivation_timer(ship, module_id)
+            if target_module.state == ModuleState.OFFLINE:
+                ship.combat.projected_targets.pop(module_id, None)
+            if self._module_affects_pyfa_remote_inputs(target_module):
+                pyfa_remote_inputs_dirty = True
+
+        return pyfa_remote_inputs_dirty
 
     @staticmethod
     def _clone_resolved_runtime_for_ship(source_runtime, resolved_runtime) -> FitRuntime:
@@ -2893,25 +2963,10 @@ class CombatSystem:
                 ship = pending["ship"]
                 target_runtime = resolved_runtime if index == 0 else self._clone_resolved_runtime_for_ship(source_runtime, resolved_runtime)
                 target_runtime.fit_key = source_runtime.fit_key
-                minimum_potential_cycle_time = self._runtime_minimum_potential_cycle_time(source_runtime)
 
                 blueprint = source_runtime.diagnostics.get("pyfa_blueprint")
                 if isinstance(blueprint, dict):
                     target_runtime.diagnostics["pyfa_blueprint"] = deepcopy(blueprint)
-
-                if pending["cache_key"] is not None:
-                    target_runtime.diagnostics["pyfa_resolve_signature"] = pending["cache_key"]
-                else:
-                    target_runtime.diagnostics.pop("pyfa_resolve_signature", None)
-
-                if pending["local_signature"] is not None:
-                    target_runtime.diagnostics["pyfa_local_state_signature"] = pending["local_signature"]
-                else:
-                    target_runtime.diagnostics.pop("pyfa_local_state_signature", None)
-                target_runtime.diagnostics["runtime_local_state_signature"] = pending["local_signature"]
-                target_runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = self._runtime_has_active_pyfa_remote_inputs(source_runtime)
-                target_runtime.diagnostics["runtime_minimum_potential_cycle_signature"] = self._runtime_offline_module_signature(source_runtime)
-                target_runtime.diagnostics["runtime_minimum_potential_cycle_time"] = minimum_potential_cycle_time
 
                 target_runtime.diagnostics["pyfa_command_boosters"] = pending["booster_snapshots"]
                 target_runtime.diagnostics["pyfa_projected_sources"] = pending["projected_snapshots"]
@@ -2921,6 +2976,32 @@ class CombatSystem:
                 target_runtime.diagnostics["pyfa_base_profile"] = resolved_profile
 
                 self._copy_runtime_dynamic_state(source_runtime, target_runtime)
+                if self._apply_runtime_activation_limit_transitions(world, ship, source_runtime, target_runtime):
+                    self._mark_pyfa_remote_inputs_dirty()
+                resolved_local_signature = self._local_runtime_state_signature_from_metadata(target_runtime)
+                resolved_cache_key = get_runtime_resolve_cache_key(
+                    target_runtime,
+                    pending["booster_snapshots"],
+                    pending["projected_snapshots"],
+                )
+                if resolved_cache_key is not None:
+                    target_runtime.diagnostics["pyfa_resolve_signature"] = resolved_cache_key
+                else:
+                    target_runtime.diagnostics.pop("pyfa_resolve_signature", None)
+                if resolved_local_signature is not None:
+                    target_runtime.diagnostics["pyfa_local_state_signature"] = resolved_local_signature
+                else:
+                    target_runtime.diagnostics.pop("pyfa_local_state_signature", None)
+                target_runtime.diagnostics["runtime_local_state_signature"] = resolved_local_signature
+                target_runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = self._runtime_has_active_pyfa_remote_inputs(
+                    target_runtime
+                )
+                target_runtime.diagnostics["runtime_minimum_potential_cycle_signature"] = self._runtime_offline_module_signature(
+                    target_runtime
+                )
+                target_runtime.diagnostics["runtime_minimum_potential_cycle_time"] = self._runtime_minimum_potential_cycle_time(
+                    target_runtime
+                )
                 target_runtime.diagnostics["runtime_observed_module_state_signature"] = self._runtime_observed_module_state_signature(
                     target_runtime
                 )
@@ -3639,6 +3720,10 @@ class CombatSystem:
                         else:
                             self._clear_module_reactivation_timer(ship, module_id)
 
+                module_max_state = self._runtime_module_max_state(ship.runtime, module_id)
+                if desired_active and self._runtime_state_rank(module_max_state) < self._runtime_state_rank(ModuleState.ACTIVE):
+                    desired_active = False
+
                 activation_target_id: str | None = (
                     projected_target_id
                     if has_projected and not metadata.is_area_effect
@@ -3680,7 +3765,8 @@ class CombatSystem:
                     self._clear_module_cycle_snapshots(ship.ship_id, module_id)
                     self._clear_module_cycle_timer(ship, module_id)
 
-                module.state = module.state.ACTIVE if desired_active else module.state.ONLINE
+                inactive_state = self._runtime_inactive_module_state(ship.runtime, module_id)
+                module.state = ModuleState.ACTIVE if desired_active else inactive_state
                 if projected_target_id is not None:
                     ship.combat.projected_targets[module_id] = projected_target_id
                 elif module_id in ship.combat.projected_targets:

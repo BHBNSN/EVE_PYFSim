@@ -133,3 +133,6 @@ logs/
 Pyfa-master/
 tests/
 tools/
+*.pdf
+pytest.ini
+.tmp/

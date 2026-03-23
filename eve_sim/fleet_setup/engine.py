@@ -1372,7 +1372,7 @@ class RuntimeFromEftFactory:
             fitted_modules.append((spec, module, charge_name))
 
         if calculate_modified_attributes:
-            fit.calculateModifiedAttributes()
+            _calculate_pyfa_fit_with_state_normalization(self, fit, fitted_modules)
         return fit, fitted_modules
 
     def _compute_pyfa_final_stats(self, fit) -> dict[str, float]:
@@ -1646,7 +1646,15 @@ class RuntimeFromEftFactory:
 
             modules: list[ModuleRuntime] = []
             pyfa_blueprint_modules: list[dict[str, Any]] = []
+            pyfa_max_state_by_module_id: dict[str, str] = {}
             for idx, (spec, fitted_module, effective_charge_name) in enumerate(fitted_modules, start=1):
+                module_id = f"mod-{idx}"
+                requested_state_name = (
+                    "OFFLINE"
+                    if spec.offline
+                    else str((state_by_module_id or {}).get(module_id, "ONLINE") or "ONLINE")
+                )
+                requested_state = self._module_state_text(requested_state_name)
                 module = self._module_effect_pyfa(
                     parsed,
                     fit_ctx,
@@ -1657,10 +1665,31 @@ class RuntimeFromEftFactory:
                     command_booster_snapshots=command_booster_snapshots,
                 )
                 if module is not None:
+                    actual_state = (
+                        ModuleState.OFFLINE
+                        if spec.offline
+                        else _runtime_state_from_pyfa_state_value(
+                            self,
+                            _pyfa_module_state_from_runtime_state(self, fitted_module, requested_state_name),
+                            requested_state,
+                        )
+                    )
+                    max_allowed_state = (
+                        ModuleState.OFFLINE
+                        if spec.offline
+                        else _runtime_state_from_pyfa_state_value(
+                            self,
+                            _pyfa_module_state_from_runtime_state(self, fitted_module, "OVERHEATED"),
+                            actual_state,
+                        )
+                    )
                     if spec.offline:
                         module.state = ModuleState.OFFLINE
                     elif state_by_module_id is not None:
-                        module.state = self._module_state_text(state_by_module_id.get(module.module_id, module.state.value))
+                        module.state = _clamp_runtime_state_to_pyfa_max(requested_state, max_allowed_state)
+                    else:
+                        module.state = actual_state
+                    pyfa_max_state_by_module_id[module_id] = max_allowed_state.value
                     modules.append(module)
                     pyfa_blueprint_modules.append(
                         {
@@ -1790,6 +1819,7 @@ class RuntimeFromEftFactory:
                 "modules": pyfa_blueprint_modules,
             }
             runtime.diagnostics["pyfa_command_boosters"] = deepcopy(command_booster_snapshots or [])
+            runtime.diagnostics["pyfa_max_state_by_module_id"] = pyfa_max_state_by_module_id
             runtime.diagnostics["pyfa_ship_attribute_penalty_context"] = self._extract_pyfa_ship_attribute_penalty_context(fit_ctx)
             runtime.diagnostics["pyfa_weapon_attribute_penalty_context"] = self._extract_pyfa_weapon_attribute_penalty_context(fit_ctx)
             runtime.diagnostics["motion_params"] = {
@@ -2360,24 +2390,140 @@ def _pyfa_module_state_from_runtime_state(
     online_state = factory._pyfa._fitting_module_state_online
     active_state = factory._pyfa._fitting_module_state_active
     overheated_state = factory._pyfa._fitting_module_state_overheated or active_state
+    def _apply_context_limits(candidate: Any) -> Any:
+        if candidate is None:
+            return None
+        try:
+            can_have_state = getattr(fitted_module, "canHaveState", None)
+            if callable(can_have_state):
+                original_state = getattr(fitted_module, "state", None)
+                try:
+                    fitted_module.state = candidate
+                    constrained_state = can_have_state(candidate)
+                finally:
+                    if original_state is not None:
+                        fitted_module.state = original_state
+                if constrained_state is not True and constrained_state is not None:
+                    return constrained_state
+        except Exception:
+            pass
+        return candidate
     if state_name == "OFFLINE":
+        requested_state = offline_state
         candidates = [offline_state]
     elif state_name == "ONLINE":
+        requested_state = online_state
         candidates = [online_state, offline_state]
     elif state_name == "OVERHEATED":
+        requested_state = overheated_state
         candidates = [overheated_state, active_state, online_state, offline_state]
     else:
+        requested_state = active_state
         candidates = [active_state, online_state, offline_state]
+
+    if requested_state is not None:
+        try:
+            if not hasattr(fitted_module, "isValidState") or fitted_module.isValidState(requested_state):
+                return _apply_context_limits(requested_state)
+        except Exception:
+            return _apply_context_limits(requested_state)
+        try:
+            get_max_state = getattr(fitted_module, "getMaxState", None)
+            if callable(get_max_state):
+                downgraded_state = get_max_state(proposedState=requested_state)
+                if downgraded_state is not None:
+                    return _apply_context_limits(downgraded_state)
+        except Exception:
+            pass
 
     for candidate in candidates:
         if candidate is None:
             continue
         try:
             if not hasattr(fitted_module, "isValidState") or fitted_module.isValidState(candidate):
-                return candidate
+                return _apply_context_limits(candidate)
         except Exception:
-            return candidate
-    return online_state if online_state is not None else offline_state
+            return _apply_context_limits(candidate)
+    return offline_state if offline_state is not None else online_state
+
+
+def _normalize_pyfa_local_module_states(
+    factory: RuntimeFromEftFactory,
+    fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]],
+) -> bool:
+    if not fitted_modules:
+        return False
+    changed = False
+    online_state = factory._pyfa._fitting_module_state_online
+    offline_state = factory._pyfa._fitting_module_state_offline
+    for _spec, fitted_module, _charge_name in fitted_modules:
+        current_state = getattr(fitted_module, "state", None)
+        if current_state is None:
+            continue
+        try:
+            can_have_state = fitted_module.canHaveState(current_state)
+        except Exception:
+            can_have_state = True
+        if can_have_state is not True and can_have_state is not None:
+            if fitted_module.state != can_have_state:
+                changed = True
+            fitted_module.state = can_have_state
+            continue
+        try:
+            is_valid = not hasattr(fitted_module, "isValidState") or fitted_module.isValidState(fitted_module.state)
+        except Exception:
+            is_valid = True
+        if is_valid:
+            continue
+        try:
+            get_max_state = getattr(fitted_module, "getMaxState", None)
+            downgraded_state = get_max_state(proposedState=fitted_module.state) if callable(get_max_state) else None
+        except Exception:
+            downgraded_state = None
+        if downgraded_state is None:
+            downgraded_state = online_state if online_state is not None else offline_state
+        if downgraded_state is not None and fitted_module.state != downgraded_state:
+            changed = True
+            fitted_module.state = downgraded_state
+    return changed
+
+
+def _calculate_pyfa_fit_with_state_normalization(
+    factory: RuntimeFromEftFactory,
+    fit: Any,
+    fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]],
+) -> None:
+    for _ in range(3):
+        fit.calculated = False
+        fit.calculateModifiedAttributes()
+        if not _normalize_pyfa_local_module_states(factory, fitted_modules):
+            break
+
+
+def _runtime_state_from_pyfa_module_state(
+    factory: RuntimeFromEftFactory,
+    fitted_module: Any,
+    fallback: ModuleState = ModuleState.ONLINE,
+) -> ModuleState:
+    current_state = getattr(fitted_module, "state", None)
+    return _runtime_state_from_pyfa_state_value(factory, current_state, fallback)
+
+
+def _runtime_state_from_pyfa_state_value(
+    factory: RuntimeFromEftFactory,
+    current_state: Any,
+    fallback: ModuleState = ModuleState.ONLINE,
+) -> ModuleState:
+    overheated_state = factory._pyfa._fitting_module_state_overheated
+    if overheated_state is not None and current_state == overheated_state:
+        return ModuleState.OVERHEATED
+    if current_state == factory._pyfa._fitting_module_state_active:
+        return ModuleState.ACTIVE
+    if current_state == factory._pyfa._fitting_module_state_online:
+        return ModuleState.ONLINE
+    if current_state == factory._pyfa._fitting_module_state_offline:
+        return ModuleState.OFFLINE
+    return fallback
 
 
 def _apply_pyfa_local_state_map(
@@ -2391,6 +2537,7 @@ def _apply_pyfa_local_state_map(
         if module_id not in state_map:
             continue
         fitted_module.state = _pyfa_module_state_from_runtime_state(factory, fitted_module, state_map[module_id])
+    _normalize_pyfa_local_module_states(factory, fitted_modules)
 
 
 def _copy_precalculated_neutral_base_fit(
@@ -2475,6 +2622,22 @@ def _runtime_module_state_map(runtime: FitRuntime) -> dict[str, str]:
         str(module.module_id): str(module.normalized_state().value)
         for module in runtime.modules
     }
+
+
+def _runtime_state_rank(state: ModuleState) -> int:
+    return {
+        ModuleState.OFFLINE: 0,
+        ModuleState.ONLINE: 1,
+        ModuleState.ACTIVE: 2,
+        ModuleState.OVERHEATED: 3,
+    }.get(state, 0)
+
+
+def _clamp_runtime_state_to_pyfa_max(
+    requested_state: ModuleState,
+    max_state: ModuleState,
+) -> ModuleState:
+    return requested_state if _runtime_state_rank(requested_state) <= _runtime_state_rank(max_state) else max_state
 
 
 def _module_affects_local_pyfa_profile(module: ModuleRuntime) -> bool:
@@ -2657,12 +2820,17 @@ def get_runtime_resolve_cache_key(
 
 
 def _copy_dynamic_runtime_state(source: FitRuntime, target: FitRuntime) -> None:
+    raw_max_state_map = target.diagnostics.get("pyfa_max_state_by_module_id")
+    max_state_map = raw_max_state_map if isinstance(raw_max_state_map, dict) else {}
     source_by_id = {module.module_id: module for module in source.modules}
     for module in target.modules:
         src = source_by_id.get(module.module_id)
         if src is None:
             continue
-        module.state = module.normalized_state(src.state)
+        requested_state = module.normalized_state(src.state)
+        max_state_name = str(max_state_map.get(str(module.module_id), ModuleState.OVERHEATED.value) or ModuleState.OVERHEATED.value).upper()
+        max_state = ModuleState[max_state_name] if max_state_name in ModuleState.__members__ else ModuleState.OVERHEATED
+        module.state = _clamp_runtime_state_to_pyfa_max(requested_state, max_state)
         if module.charge_capacity > 0:
             module.charge_remaining = max(0.0, min(float(src.charge_remaining), float(module.charge_capacity)))
 
@@ -2838,8 +3006,7 @@ def resolve_runtime_from_pyfa_runtime(
         next_fit_id = 2
         next_fit_id = _attach_command_snapshot_fits(factory, target_fit, snapshots, next_fit_id, runtime)
         next_fit_id = _attach_projected_snapshot_fits(factory, target_fit, projected_snapshots, next_fit_id, runtime)
-        target_fit.calculated = False
-        target_fit.calculateModifiedAttributes()
+        _calculate_pyfa_fit_with_state_normalization(factory, target_fit, target_fitted_modules)
 
         resolved_runtime, _fit, profile = factory._build_runtime_artifacts_from_pyfa_fit(
             parsed,
