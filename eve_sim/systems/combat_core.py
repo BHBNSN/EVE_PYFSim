@@ -57,6 +57,9 @@ _PROFILE_PASSTHROUGH_ATTRS = (
     "missile_kinetic_dps",
     "missile_explosive_dps",
     "missile_damage_reduction_factor",
+    "warp_speed_au_s",
+    "warp_capacitor_need",
+    "max_warp_distance_au",
 )
 
 _PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
@@ -167,8 +170,40 @@ class CombatSystem:
             "rep_cycle",
             "mass",
             "agility",
+            "warp_speed_au_s",
+            "warp_capacitor_need",
+            "max_warp_distance_au",
         ):
             setattr(target, attr, getattr(base, attr))
+
+    @staticmethod
+    def _ship_in_warp(ship) -> bool:
+        return str(getattr(getattr(ship.nav, "warp", None), "phase", "idle") or "idle") == "warp"
+
+    def _clear_ship_warp_engagement_state(self, ship, runtime: FitRuntime | None = None) -> None:
+        self._break_all_locks(ship)
+        ship.combat.last_attack_target = None
+        if runtime is None:
+            return
+
+        for module, metadata in self._ship_candidate_control_entries(ship, runtime):
+            if not (
+                metadata.has_projected
+                or metadata.is_weapon
+                or metadata.is_command_burst
+                or metadata.is_area_effect
+                or metadata.has_projected_rep
+                or metadata.is_cap_warfare
+                or metadata.is_target_ewar
+                or metadata.is_ecm
+            ):
+                continue
+            module_id = str(module.module_id)
+            if module.state in {module.state.ACTIVE, module.state.OVERHEATED}:
+                module.state = module.state.ONLINE
+            self._clear_module_cycle_snapshots(ship.ship_id, module_id)
+            self._clear_module_cycle_timer(ship, module_id)
+            self._clear_module_reactivation_timer(ship, module_id)
 
     def _apply_runtime_projected_impacts(self, base: ShipProfile, impacts: list[ProjectedImpact], runtime=None) -> ShipProfile:
         penalty_context = None
@@ -284,6 +319,9 @@ class CombatSystem:
             "missile_explosion_radius",
             "missile_explosion_velocity",
             "missile_max_range",
+            "warp_speed_au_s",
+            "warp_capacitor_need",
+            "max_warp_distance_au",
         ):
             setattr(fallback, attr, getattr(fit_base, attr))
         return fallback
@@ -345,7 +383,7 @@ class CombatSystem:
         current_alive_runtime_ship_ids = {
             ship.ship_id
             for ship in world.ships.values()
-            if ship.vital.alive and ship.runtime is not None
+            if ship.vital.alive and ship.runtime is not None and not self._ship_in_warp(ship)
         }
         if current_alive_runtime_ship_ids != self._alive_runtime_ship_ids:
             self._alive_runtime_ship_ids = current_alive_runtime_ship_ids
@@ -1958,10 +1996,20 @@ class CombatSystem:
         for ship in world.ships.values():
             if not ship.vital.alive:
                 continue
+            if self._ship_in_warp(ship):
+                ship.combat.lock_targets.clear()
+                ship.combat.lock_timers.clear()
+                ship.combat.lock_deadlines.clear()
+                continue
             self._prepare_ship_timer_views(ship, now_value)
             for target_id, left in list(ship.combat.lock_timers.items()):
                 target = world.ships.get(target_id)
-                if target is None or not target.vital.alive or not self._can_target_under_ecm(ship, target_id, now_value):
+                if (
+                    target is None
+                    or not target.vital.alive
+                    or self._ship_in_warp(target)
+                    or not self._can_target_under_ecm(ship, target_id, now_value)
+                ):
                     self._clear_lock_timer(ship, target_id)
                     ship.combat.lock_targets.discard(target_id)
                     continue
@@ -2543,7 +2591,7 @@ class CombatSystem:
         del dt
         impacts: dict[str, list[ProjectedImpact]] = {}
         for source in world.ships.values():
-            if not source.vital.alive or source.runtime is None:
+            if not source.vital.alive or source.runtime is None or self._ship_in_warp(source):
                 continue
             for module, metadata in self._runtime_module_buckets(source.runtime).runtime_projected_entries:
                 if metadata.is_missile_weapon or metadata.is_bomb_launcher:
@@ -2556,7 +2604,7 @@ class CombatSystem:
                     if not target_id:
                         continue
                     target = world.ships.get(target_id)
-                    if target is None or not target.vital.alive:
+                    if target is None or not target.vital.alive or self._ship_in_warp(target):
                         continue
 
                     if not self._ensure_target_lock(
@@ -2620,6 +2668,8 @@ class CombatSystem:
         for ship in world.ships.values():
             if ship.team != team:
                 continue
+            if self._ship_in_warp(ship):
+                continue
             if not self._ship_needs_layer_repair(ship, layer):
                 continue
             ranked.append((self._ship_layer_fraction(ship, layer), str(ship.ship_id)))
@@ -2635,7 +2685,7 @@ class CombatSystem:
                 if target_id == source.ship_id:
                     continue
                 target = world.ships.get(target_id)
-                if target is None or not target.vital.alive or target.team != source.team:
+                if target is None or not target.vital.alive or self._ship_in_warp(target) or target.team != source.team:
                     continue
                 if not self._ship_needs_layer_repair(target, layer):
                     continue
@@ -2712,7 +2762,13 @@ class CombatSystem:
         return float(now) >= float(ready_at)
 
     def _candidates_in_projected_range(self, source, module, candidates: list) -> list:
-        return [candidate for candidate in candidates if candidate.vital.alive and self._module_in_projected_range(source, candidate, module)]
+        return [
+            candidate
+            for candidate in candidates
+            if candidate.vital.alive
+            and not self._ship_in_warp(candidate)
+            and self._module_in_projected_range(source, candidate, module)
+        ]
 
     def _iter_area_targets_in_range(self, world: WorldState, source, module, effect, *, candidates: list | None = None) -> list:
         targets: list = []
@@ -2724,6 +2780,8 @@ class CombatSystem:
         candidate_iterable = candidates if candidates is not None else world.ships.values()
         for candidate in candidate_iterable:
             if not candidate.vital.alive:
+                continue
+            if self._ship_in_warp(candidate):
                 continue
             if candidate.ship_id == source.ship_id and not include_self:
                 continue
@@ -2739,7 +2797,7 @@ class CombatSystem:
     def _collect_command_booster_snapshots(self, world: WorldState) -> dict[str, list[dict[str, Any]]]:
         snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
         for source in world.ships.values():
-            if not source.vital.alive or source.runtime is None:
+            if not source.vital.alive or source.runtime is None or self._ship_in_warp(source):
                 continue
 
             blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
@@ -2764,7 +2822,11 @@ class CombatSystem:
                 target_ids = {
                     target_id
                     for target_id in self._module_cycle_snapshots_for(source.ship_id, module.module_id)
-                    if (target := world.ships.get(target_id)) is not None and target.vital.alive and target.team == source.team and target.runtime is not None
+                    if (target := world.ships.get(target_id)) is not None
+                    and target.vital.alive
+                    and not self._ship_in_warp(target)
+                    and target.team == source.team
+                    and target.runtime is not None
                 }
                 if not target_ids:
                     continue
@@ -2802,7 +2864,7 @@ class CombatSystem:
     ) -> dict[str, list[dict[str, Any]]]:
         snapshots_by_ship: dict[str, list[dict[str, Any]]] = {}
         for source in world.ships.values():
-            if not source.vital.alive or source.runtime is None:
+            if not source.vital.alive or source.runtime is None or self._ship_in_warp(source):
                 continue
 
             blueprint = source.runtime.diagnostics.get("pyfa_blueprint")
@@ -2819,10 +2881,13 @@ class CombatSystem:
             source_command_snapshots = command_boosters_by_ship.get(source.ship_id, [])
             base_state_by_module_id: dict[str, str] = {}
             active_projected_modules: list[tuple[Any, str]] = []
+            projected_module_ids: set[str] = set()
 
             for module, metadata in zip(source.runtime.modules, self._runtime_module_metadata_list(source.runtime)):
                 state_value = str(module.state.value or "ONLINE").upper()
                 projected_state = state_value
+                if metadata.has_projected:
+                    projected_module_ids.add(str(module.module_id))
 
                 if state_value in {"ACTIVE", "OVERHEATED"}:
                     if metadata.is_command_burst:
@@ -2842,7 +2907,7 @@ class CombatSystem:
                 if not target_id:
                     continue
                 target = world.ships.get(target_id)
-                if target is None or not target.vital.alive or target.runtime is None:
+                if target is None or not target.vital.alive or self._ship_in_warp(target) or target.runtime is None:
                     continue
                 target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target_id)
                 if target_snapshot is None:
@@ -2853,6 +2918,9 @@ class CombatSystem:
                 )
 
                 state_by_module_id = dict(base_state_by_module_id)
+                for projected_module_id in projected_module_ids:
+                    if projected_module_id != str(active_projected_module.module_id):
+                        state_by_module_id[projected_module_id] = "OFFLINE"
                 state_by_module_id[active_projected_module.module_id] = active_state
                 snapshots_by_ship.setdefault(target_id, []).append(
                     {
@@ -3436,7 +3504,7 @@ class CombatSystem:
         alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
         alive_ids_by_team: dict[Team, set[str]] = {Team.BLUE: set(), Team.RED: set()}
         for candidate in world.ships.values():
-            if candidate.vital.alive:
+            if candidate.vital.alive and not self._ship_in_warp(candidate):
                 alive_by_team[candidate.team].append(candidate)
                 alive_ids_by_team[candidate.team].add(candidate.ship_id)
 
@@ -3452,6 +3520,9 @@ class CombatSystem:
             if self._reconcile_external_module_state_changes(world, ship, runtime):
                 pyfa_remote_inputs_dirty = True
             self._prepare_ship_timer_views(ship, now_value)
+            if self._ship_in_warp(ship):
+                self._clear_ship_warp_engagement_state(ship, runtime)
+                continue
             focus_key = self._focus_key(ship.team, ship.squad_id)
             focus_queue = tuple(str(target_id) for target_id in world.squad_focus_queues.get(focus_key, []))
             has_focus_queue = bool(focus_queue)
@@ -4043,7 +4114,7 @@ class CombatSystem:
     def _update_squad_prelocks(self, world: WorldState, dt: float, effective_profiles: dict[str, ShipProfile]) -> None:
         squads: dict[str, list] = {}
         for ship in world.ships.values():
-            if not ship.vital.alive:
+            if not ship.vital.alive or self._ship_in_warp(ship):
                 continue
             squads.setdefault(self._focus_key(ship.team, ship.squad_id), []).append(ship)
 
@@ -4063,7 +4134,7 @@ class CombatSystem:
                 if target_id in seen:
                     continue
                 target = world.ships.get(target_id)
-                if target is None or (not target.vital.alive) or target.team == own_team:
+                if target is None or (not target.vital.alive) or self._ship_in_warp(target) or target.team == own_team:
                     continue
                 seen.add(target_id)
                 cleaned.append(target_id)
@@ -4228,7 +4299,7 @@ class CombatSystem:
         self._update_squad_prelocks(world, dt, effective_profiles)
 
         for source in world.ships.values():
-            if not source.vital.alive or source.runtime is None:
+            if not source.vital.alive or source.runtime is None or self._ship_in_warp(source):
                 continue
             for module in source.runtime.modules:
                 metadata = self._module_static_metadata(module)
@@ -4253,7 +4324,7 @@ class CombatSystem:
                     if metadata.is_smart_bomb:
                         for target_id, target_snapshot in cycle_target_snapshots.items():
                             target = world.ships.get(target_id)
-                            if target is None or not target.vital.alive:
+                            if target is None or not target.vital.alive or self._ship_in_warp(target):
                                 continue
                             strength = self._cycle_effect_strength(effect, effect_index, target_snapshot)
                             if strength > 0.0:
@@ -4263,7 +4334,7 @@ class CombatSystem:
                         if not tgt_id:
                             continue
                         target = world.ships.get(tgt_id)
-                        if target is None or not target.vital.alive:
+                        if target is None or not target.vital.alive or self._ship_in_warp(target):
                             continue
                         got_snapshot = cycle_target_snapshots.get(tgt_id)
                         if got_snapshot is None:
@@ -4378,12 +4449,17 @@ class CombatSystem:
                 dt=dt,
             )
 
+            if self._ship_in_warp(ship):
+                ship.combat.current_target = None
+                continue
+
             current_target_id = ship.combat.current_target
             if current_target_id:
                 current_target = world.ships.get(current_target_id)
                 if (
                     current_target is None
                     or not current_target.vital.alive
+                    or self._ship_in_warp(current_target)
                     or current_target.team == ship.team
                 ):
                     ship.combat.current_target = None
@@ -4392,7 +4468,7 @@ class CombatSystem:
                 queue = list(world.squad_focus_queues.get(self._focus_key(ship.team, ship.squad_id), []))
                 for candidate_id in queue:
                     candidate = world.ships.get(candidate_id)
-                    if candidate is None or not candidate.vital.alive or candidate.team == ship.team:
+                    if candidate is None or not candidate.vital.alive or self._ship_in_warp(candidate) or candidate.team == ship.team:
                         continue
                     ship.combat.current_target = candidate_id
                     break

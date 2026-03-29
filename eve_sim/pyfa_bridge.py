@@ -84,6 +84,9 @@ class PyfaBridge:
             energy_warfare_resistance=max(0.0, float(getattr(fit, "energy_warfare_resistance", 1.0) or 1.0)),
             mass=max(0.0, float(getattr(fit, "mass", 0.0) or 0.0)),
             agility=max(0.0, float(getattr(fit, "agility", 0.0) or 0.0)),
+            warp_speed_au_s=max(0.0, float(getattr(fit, "warp_speed_au_s", 0.0) or 0.0)),
+            warp_capacitor_need=max(0.0, float(getattr(fit, "warp_capacitor_need", 0.0) or 0.0)),
+            max_warp_distance_au=max(0.0, float(getattr(fit, "max_warp_distance_au", 0.0) or 0.0)),
         )
         self._profile_cache[fit.fit_key] = profile
         return profile

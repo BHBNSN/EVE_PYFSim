@@ -48,13 +48,22 @@ class ShipAgent(BaseAgent):
         mapped_id = world.squad_leaders.get(squad_key)
         if mapped_id:
             mapped_ship = world.ships.get(mapped_id)
-            if mapped_ship is not None and mapped_ship.vital.alive and mapped_ship.team == ship.team and mapped_ship.squad_id == ship.squad_id:
+            if (
+                mapped_ship is not None
+                and mapped_ship.vital.alive
+                and str(getattr(getattr(mapped_ship.nav, "warp", None), "phase", "idle") or "idle") == "idle"
+                and mapped_ship.team == ship.team
+                and mapped_ship.squad_id == ship.squad_id
+            ):
                 return mapped_ship
 
         members = [
             s
             for s in world.ships.values()
-            if s.team == ship.team and s.squad_id == ship.squad_id and s.vital.alive
+            if s.team == ship.team
+            and s.squad_id == ship.squad_id
+            and s.vital.alive
+            and str(getattr(getattr(s.nav, "warp", None), "phase", "idle") or "idle") == "idle"
         ]
         if not members:
             return None
@@ -90,6 +99,28 @@ class ShipAgent(BaseAgent):
 
         if self.current_order and self.current_order.kind == "PROPULSION":
             ship.nav.propulsion_command_active = bool(self.current_order.payload.get("active", False))
+
+        if self.current_order and self.current_order.kind == "WARP":
+            payload = self.current_order.payload
+            ship.nav.warp.phase = "align"
+            ship.nav.warp.target_position = Vector2(
+                float(payload.get("x", ship.nav.position.x)),
+                float(payload.get("y", ship.nav.position.y)),
+            )
+            ship.nav.warp.target_ship_id = str(payload.get("target_ship_id", "") or "") or None
+            ship.nav.warp.target_beacon_id = str(payload.get("target_beacon_id", "") or "") or None
+            ship.nav.warp.align_elapsed = 0.0
+            ship.nav.warp.origin = None
+            ship.nav.warp.destination = None
+            ship.nav.warp.warp_distance_m = 0.0
+            ship.nav.warp.warp_duration = 0.0
+            ship.nav.warp.warp_elapsed = 0.0
+            ship.nav.warp.capacitor_cost = 0.0
+            ship.nav.command_target = None
+            self.current_order = None
+
+        if str(getattr(ship.nav.warp, "phase", "idle") or "idle") != "idle":
+            return
 
         if self.current_order and self.current_order.kind == "MOVE" and is_leader:
             move_target = Vector2(self.current_order.payload["x"], self.current_order.payload["y"])
@@ -139,7 +170,10 @@ class CommanderAgent(BaseAgent):
         members = [
             s
             for s in world.ships.values()
-            if s.squad_id == squad_id and s.team == team and s.vital.alive
+            if s.squad_id == squad_id
+            and s.team == team
+            and s.vital.alive
+            and str(getattr(getattr(s.nav, "warp", None), "phase", "idle") or "idle") == "idle"
         ]
         members.sort(key=lambda s: s.ship_id)
         return members
@@ -166,7 +200,12 @@ class CommanderAgent(BaseAgent):
             if target_id in seen:
                 continue
             target = world.ships.get(target_id)
-            if target is None or not target.vital.alive or target.team == own_team:
+            if (
+                target is None
+                or not target.vital.alive
+                or str(getattr(getattr(target.nav, "warp", None), "phase", "idle") or "idle") != "idle"
+                or target.team == own_team
+            ):
                 continue
             seen.add(target_id)
             out.append(target_id)

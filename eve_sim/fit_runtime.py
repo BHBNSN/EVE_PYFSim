@@ -50,6 +50,9 @@ class HullProfile:
     energy_warfare_resistance: float = 1.0
     mass: float = 0.0
     agility: float = 0.0
+    warp_speed_au_s: float = 0.0
+    warp_capacitor_need: float = 0.0
+    max_warp_distance_au: float = 0.0
 
 
 @dataclass(slots=True)
@@ -242,6 +245,9 @@ class RuntimeStatEngine:
             energy_warfare_resistance=max(0.0, float(getattr(hull, "energy_warfare_resistance", 1.0) or 1.0)),
             mass=max(0.0, (hull.mass + add["mass"]) * self._stacking_multiplier(mul["mass"])),
             agility=max(0.0, (hull.agility + add["agility"]) * self._stacking_multiplier(mul["agility"])),
+            warp_speed_au_s=max(0.0, float(getattr(hull, "warp_speed_au_s", 0.0) or 0.0)),
+            warp_capacitor_need=max(0.0, float(getattr(hull, "warp_capacitor_need", 0.0) or 0.0)),
+            max_warp_distance_au=max(0.0, float(getattr(hull, "max_warp_distance_au", 0.0) or 0.0)),
         )
         self._cache[key] = profile
         return profile
@@ -411,6 +417,9 @@ class RuntimeStatEngine:
                     penalty_context.get("agility"),
                 ),
             ),
+            warp_speed_au_s=max(0.0, float(getattr(target, "warp_speed_au_s", 0.0) or 0.0)),
+            warp_capacitor_need=max(0.0, float(getattr(target, "warp_capacitor_need", 0.0) or 0.0)),
+            max_warp_distance_au=max(0.0, float(getattr(target, "max_warp_distance_au", 0.0) or 0.0)),
             sensor_strength_gravimetric=max(
                 0.0,
                 self._apply_penalized_projection(

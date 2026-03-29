@@ -68,6 +68,7 @@ from ..lan_commands import (
     CMD_SQUAD_MOVE,
     CMD_SQUAD_PREFOCUS,
     CMD_SQUAD_PROPULSION,
+    CMD_SQUAD_WARP,
     CMD_SYNC_SETUP,
     SQUAD_FOCUS_COMMANDS,
 )
@@ -77,6 +78,7 @@ from ..models import (
     FitDescriptor,
     FleetIntent,
     NavigationState,
+    Order,
     QualityLevel,
     QualityState,
     ShipEntity,
@@ -212,6 +214,8 @@ class MainWindow(QMainWindow):
             ui_cfg,
             self.issue_move_to,
             self.issue_approach_target,
+            self.issue_warp_to_ship,
+            self.issue_warp_to_beacon,
             self.issue_focus_target,
             self.issue_prefocus_target,
             self.cancel_prefocus_target,
@@ -1378,6 +1382,118 @@ class MainWindow(QMainWindow):
 
         self._enqueue_tick_op(apply)
 
+    def _apply_squad_warp(
+        self,
+        team: Team,
+        squad_id: str,
+        target_position: Vector2,
+        *,
+        target_ship_id: str | None = None,
+        target_beacon_id: str | None = None,
+    ) -> None:
+        scoped_key = self._focus_key(team, squad_id)
+        self._squad_approach_targets.pop(scoped_key, None)
+        self._squad_guidance_targets[scoped_key] = Vector2(target_position.x, target_position.y)
+        members = [
+            ship
+            for ship in self.engine.world.ships.values()
+            if ship.team == team and ship.squad_id == squad_id and ship.vital.alive
+        ]
+        for ship in members:
+            distance = ship.nav.position.distance_to(target_position)
+            ship.order_queue = [order for order in ship.order_queue if order.kind not in {"WARP", "MOVE", "ATTACK"}]
+            if distance < 150_000.0:
+                continue
+            ship.order_queue.append(
+                Order(
+                    kind="WARP",
+                    payload={
+                        "x": target_position.x,
+                        "y": target_position.y,
+                        "target_ship_id": target_ship_id,
+                        "target_beacon_id": target_beacon_id,
+                        "immediate": True,
+                    },
+                    issue_time=self.engine.world.now,
+                )
+            )
+
+    def issue_warp_to_ship(self, squad_id: str, target_id: str) -> None:
+        squad = squad_id.strip()
+        target = target_id.strip()
+        if not squad or not target:
+            return
+        self._log_user_action("squad_warp_ship", squad=squad, target=target)
+        if self.network_mode == "client" and self.lan_client is not None:
+            target_ship = self.engine.world.ships.get(target)
+            if target_ship is None or not target_ship.vital.alive:
+                return
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SQUAD_WARP,
+                    "squad_id": squad,
+                    "target_ship_id": target,
+                    "x": target_ship.nav.position.x,
+                    "y": target_ship.nav.position.y,
+                }
+            )
+            self._squad_guidance_targets[self._focus_key(self.controlled_team, squad)] = Vector2(
+                target_ship.nav.position.x,
+                target_ship.nav.position.y,
+            )
+            return
+
+        def apply() -> None:
+            target_ship = self.engine.world.ships.get(target)
+            if target_ship is None or not target_ship.vital.alive:
+                return
+            self._apply_squad_warp(
+                self.controlled_team,
+                squad,
+                Vector2(target_ship.nav.position.x, target_ship.nav.position.y),
+                target_ship_id=target,
+            )
+
+        self._enqueue_tick_op(apply)
+
+    def issue_warp_to_beacon(self, squad_id: str, beacon_id: str) -> None:
+        squad = squad_id.strip()
+        beacon_key = beacon_id.strip()
+        if not squad or not beacon_key:
+            return
+        self._log_user_action("squad_warp_beacon", squad=squad, beacon=beacon_key)
+        beacon = self.engine.world.beacons.get(beacon_key)
+        if beacon is None:
+            return
+        if self.network_mode == "client" and self.lan_client is not None:
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SQUAD_WARP,
+                    "squad_id": squad,
+                    "target_beacon_id": beacon_key,
+                    "x": beacon.position.x,
+                    "y": beacon.position.y,
+                }
+            )
+            self._squad_guidance_targets[self._focus_key(self.controlled_team, squad)] = Vector2(
+                beacon.position.x,
+                beacon.position.y,
+            )
+            return
+
+        def apply() -> None:
+            current_beacon = self.engine.world.beacons.get(beacon_key)
+            if current_beacon is None:
+                return
+            self._apply_squad_warp(
+                self.controlled_team,
+                squad,
+                Vector2(current_beacon.position.x, current_beacon.position.y),
+                target_beacon_id=beacon_key,
+            )
+
+        self._enqueue_tick_op(apply)
+
     def _update_approach_targets(self) -> None:
         if not self._squad_approach_targets:
             return
@@ -1651,6 +1767,9 @@ class MainWindow(QMainWindow):
         action_status = QAction(tr(lang, "menu_show_status", ship=target_id), self)
         action_status.triggered.connect(lambda: self.show_ship_status(target_id))
         menu.addAction(action_status)
+        action_warp = QAction(tr(lang, "menu_warp_ship", squad=self.ui_state.selected_squad, ship=target_id), self)
+        action_warp.triggered.connect(lambda: self.issue_warp_to_ship(self.ui_state.selected_squad, target_id))
+        menu.addAction(action_warp)
         enemy_team = Team.RED.value if self.controlled_team == Team.BLUE else Team.BLUE.value
         if target_team == enemy_team:
             action_focus = QAction(tr(lang, "menu_focus", squad=self.ui_state.selected_squad, ship=target_id), self)
@@ -1797,6 +1916,31 @@ class MainWindow(QMainWindow):
                 focus_target=old.focus_target if old else None,
                 propulsion_active=prop_state,
             ))
+        elif kind == CMD_SQUAD_WARP:
+            target_ship_id = str(cmd.get("target_ship_id", "") or "").strip() or None
+            target_beacon_id = str(cmd.get("target_beacon_id", "") or "").strip() or None
+            if target_ship_id:
+                target_ship = self.engine.world.ships.get(target_ship_id)
+                if target_ship is None or not target_ship.vital.alive:
+                    return
+                target = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
+            elif target_beacon_id:
+                beacon = self.engine.world.beacons.get(target_beacon_id)
+                if beacon is None:
+                    return
+                target = Vector2(beacon.position.x, beacon.position.y)
+            else:
+                try:
+                    target = Vector2(float(cmd.get("x", 0.0)), float(cmd.get("y", 0.0)))
+                except Exception:
+                    return
+            self._apply_squad_warp(
+                team,
+                squad,
+                target,
+                target_ship_id=target_ship_id,
+                target_beacon_id=target_beacon_id,
+            )
         elif kind == CMD_SQUAD_APPROACH:
             target_id = str(cmd.get("target_id", "")).strip()
             target_ship = self.engine.world.ships.get(target_id)

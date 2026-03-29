@@ -113,8 +113,16 @@ class PerceptionSystem:
     def __init__(self, sensor_range: float = 250_000.0) -> None:
         self.sensor_range = sensor_range
 
+    @staticmethod
+    def _ship_in_warp(ship) -> bool:
+        return str(getattr(getattr(ship.nav, "warp", None), "phase", "idle") or "idle") == "warp"
+
     def run(self, world: WorldState) -> None:
-        alive = [s for s in world.ships.values() if s.vital.alive]
+        alive = [s for s in world.ships.values() if s.vital.alive and not self._ship_in_warp(s)]
+        alive_ids = {ship.ship_id for ship in alive}
+        for ship in world.ships.values():
+            if ship.ship_id not in alive_ids:
+                ship.perception = []
         if not alive:
             return
         if len(alive) <= 24:

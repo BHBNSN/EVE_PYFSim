@@ -51,6 +51,9 @@ class FitDescriptor:
     energy_warfare_resistance: float = 1.0
     mass: float = 0.0
     agility: float = 0.0
+    warp_speed_au_s: float = 0.0
+    warp_capacitor_need: float = 0.0
+    max_warp_distance_au: float = 0.0
 
 
 @dataclass(slots=True)
@@ -117,6 +120,25 @@ class ShipProfile:
     energy_warfare_resistance: float = 1.0
     mass: float = 0.0
     agility: float = 0.0
+    warp_speed_au_s: float = 0.0
+    warp_capacitor_need: float = 0.0
+    max_warp_distance_au: float = 0.0
+
+
+@dataclass(slots=True)
+class WarpState:
+    phase: str = "idle"
+    target_position: Vector2 | None = None
+    target_ship_id: str | None = None
+    target_beacon_id: str | None = None
+    align_elapsed: float = 0.0
+    align_timeout: float = 180.0
+    origin: Vector2 | None = None
+    destination: Vector2 | None = None
+    warp_distance_m: float = 0.0
+    warp_duration: float = 0.0
+    warp_elapsed: float = 0.0
+    capacitor_cost: float = 0.0
 
 
 @dataclass(slots=True)
@@ -128,6 +150,7 @@ class NavigationState:
     radius: float = 60.0
     command_target: Vector2 | None = None
     propulsion_command_active: bool = False
+    warp: WarpState = field(default_factory=WarpState)
 
 
 @dataclass(slots=True)

@@ -1379,6 +1379,15 @@ class RuntimeFromEftFactory:
         ship = fit.ship
         weapon_stats = self._collect_pyfa_weapon_stats(cast(list[Any], fit.modules), ship, require_volley=True)
         warp_scramble_status = float(ship.getModifiedItemAttr("warpScrambleStatus") or 0.0)
+        warp_capacitor_need = float(ship.getModifiedItemAttr("warpCapacitorNeed") or 0.0)
+        try:
+            warp_speed_au_s = float(getattr(fit, "warpSpeed", 0.0) or 0.0)
+        except Exception:
+            warp_speed_au_s = 0.0
+        try:
+            max_warp_distance_au = float(getattr(fit, "maxWarpDistance", 0.0) or 0.0)
+        except Exception:
+            max_warp_distance_au = 0.0
         total_dps = max(float(fit.getTotalDps().total), float(weapon_stats.get("dps", 0.0) or 0.0))
         total_volley = max(float(fit.getTotalVolley().total), float(weapon_stats.get("volley", 0.0) or 0.0))
         return {
@@ -1423,6 +1432,9 @@ class RuntimeFromEftFactory:
             "sensor_strength_radar": float(ship.getModifiedItemAttr("scanRadarStrength") or 0.0),
             "warp_scramble_status": warp_scramble_status,
             "warp_stability": -warp_scramble_status,
+            "warp_speed_au_s": max(0.0, warp_speed_au_s),
+            "warp_capacitor_need": max(0.0, warp_capacitor_need),
+            "max_warp_distance_au": max(0.0, max_warp_distance_au),
             "energy_warfare_resistance": float(ship.getModifiedItemAttr("energyWarfareResistance") or 1.0),
             "max_cap": float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0),
             "cap_recharge_time": float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0,
@@ -1723,6 +1735,9 @@ class RuntimeFromEftFactory:
                 sensor_strength_radar=max(0.0, float(pyfa_final.get("sensor_strength_radar", 0.0) or 0.0)),
                 warp_scramble_status=float(pyfa_final.get("warp_scramble_status", 0.0) or 0.0),
                 warp_stability=float(pyfa_final.get("warp_stability", 0.0) or 0.0),
+                warp_speed_au_s=max(0.0, float(pyfa_final.get("warp_speed_au_s", 0.0) or 0.0)),
+                warp_capacitor_need=max(0.0, float(pyfa_final.get("warp_capacitor_need", 0.0) or 0.0)),
+                max_warp_distance_au=max(0.0, float(pyfa_final.get("max_warp_distance_au", 0.0) or 0.0)),
                 energy_warfare_resistance=max(0.0, float(pyfa_final.get("energy_warfare_resistance", 1.0) or 1.0)),
                 max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
                 max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
@@ -1795,6 +1810,9 @@ class RuntimeFromEftFactory:
                 energy_warfare_resistance=profile.energy_warfare_resistance,
                 mass=profile.mass,
                 agility=profile.agility,
+                warp_speed_au_s=profile.warp_speed_au_s,
+                warp_capacitor_need=profile.warp_capacitor_need,
+                max_warp_distance_au=profile.max_warp_distance_au,
             )
 
             runtime = FitRuntime(
@@ -1853,6 +1871,9 @@ class RuntimeFromEftFactory:
                 energy_warfare_resistance=profile.energy_warfare_resistance,
                 mass=profile.mass,
                 agility=profile.agility,
+                warp_speed_au_s=profile.warp_speed_au_s,
+                warp_capacitor_need=profile.warp_capacitor_need,
+                max_warp_distance_au=profile.max_warp_distance_au,
             )
             return runtime, fit, profile
         finally:

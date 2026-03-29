@@ -139,6 +139,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "status_prefix": {"zh_CN": "Tick", "en_US": "Tick"},
     "ship_status_title": {"zh_CN": "舰船状态", "en_US": "Ship Status"},
     "menu_show_status": {"zh_CN": "查看 {ship} 当前状态", "en_US": "View {ship} Status"},
+    "menu_warp_ship": {"zh_CN": "{squad} 跃迁至 {ship}", "en_US": "{squad} Warp To {ship}"},
+    "menu_warp_beacon": {"zh_CN": "{squad} 跃迁至 {beacon}", "en_US": "{squad} Warp To {beacon}"},
     "menu_focus": {"zh_CN": "{squad} 集火 {ship}", "en_US": "{squad} Focus {ship}"},
     "menu_prefocus": {"zh_CN": "{squad} 预集火 {ship}", "en_US": "{squad} Pre-focus {ship}"},
     "menu_cancel_prefocus": {"zh_CN": "{squad} 取消预锁定 {ship}", "en_US": "{squad} Cancel Pre-lock {ship}"},

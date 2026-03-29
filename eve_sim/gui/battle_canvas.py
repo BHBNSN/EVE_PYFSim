@@ -122,6 +122,8 @@ class BattleCanvas(QWidget):
         ui_cfg: UiConfig,
         on_issue_move: Callable[[str, Vector2], None],
         on_issue_approach: Callable[[str, str], None],
+        on_issue_warp_ship: Callable[[str, str], None],
+        on_issue_warp_beacon: Callable[[str, str], None],
         on_issue_focus: Callable[[str], None],
         on_issue_prefocus: Callable[[str], None],
         on_cancel_prefocus: Callable[[str], None],
@@ -142,6 +144,8 @@ class BattleCanvas(QWidget):
         self.ui_cfg = ui_cfg
         self.on_issue_move = on_issue_move
         self.on_issue_approach = on_issue_approach
+        self.on_issue_warp_ship = on_issue_warp_ship
+        self.on_issue_warp_beacon = on_issue_warp_beacon
         self.on_issue_focus = on_issue_focus
         self.on_issue_prefocus = on_issue_prefocus
         self.on_cancel_prefocus = on_cancel_prefocus
@@ -218,6 +222,20 @@ class BattleCanvas(QWidget):
                 chosen_dist = dist
         return chosen
 
+    def _pick_beacon_at(self, p: QPoint, max_px_distance: float = 14.0):
+        chosen = None
+        chosen_dist = max_px_distance
+        for beacon in self.engine.world.beacons.values():
+            sx, sy = self._to_screen(beacon.position)
+            dx = sx - p.x()
+            dy = sy - p.y()
+            dist = (dx * dx + dy * dy) ** 0.5
+            pick_radius = max(max_px_distance, float(beacon.radius) * self.zoom)
+            if dist <= pick_radius and dist <= chosen_dist:
+                chosen = beacon
+                chosen_dist = dist
+        return chosen
+
     def _to_screen(self, p: Vector2) -> tuple[int, int]:
         cx = self.width() // 2
         cy = self.height() // 2
@@ -272,12 +290,16 @@ class BattleCanvas(QWidget):
         if event.button() == Qt.MouseButton.RightButton:
             world_target = self._to_world(event.position().toPoint())
             clicked = self._pick_ship_at(event.position().toPoint())
+            clicked_beacon = None if clicked is not None else self._pick_beacon_at(event.position().toPoint())
             lang = self.language_getter()
             menu = QMenu(self)
             if clicked is not None and clicked.vital.alive:
                 action_status = QAction(tr(lang, "menu_show_status", ship=clicked.ship_id), self)
                 action_status.triggered.connect(lambda: self.on_show_status(clicked.ship_id))
                 menu.addAction(action_status)
+                action_warp = QAction(tr(lang, "menu_warp_ship", squad=self.selected_squad, ship=clicked.ship_id), self)
+                action_warp.triggered.connect(lambda: self.on_issue_warp_ship(self.selected_squad, clicked.ship_id))
+                menu.addAction(action_warp)
                 controlled_team = self.controlled_team_getter()
                 if clicked.team != controlled_team:
                     self.selected_enemy_target = clicked.ship_id
@@ -302,6 +324,14 @@ class BattleCanvas(QWidget):
                         )
                         action_cancel_prefocus.triggered.connect(lambda: self.on_cancel_prefocus(clicked.ship_id))
                         menu.addAction(action_cancel_prefocus)
+            elif clicked_beacon is not None:
+                action_warp_beacon = QAction(
+                    tr(lang, "menu_warp_beacon", squad=self.selected_squad, beacon=clicked_beacon.beacon_id),
+                    self,
+                )
+                action_warp_beacon.triggered.connect(lambda: self.on_issue_warp_beacon(self.selected_squad, clicked_beacon.beacon_id))
+                menu.addAction(action_warp_beacon)
+                menu.addSeparator()
 
             menu.addSeparator()
             squad_menu = menu.addMenu(tr(lang, "menu_induce_squad_here"))
