@@ -261,6 +261,16 @@ STRINGS: dict[str, dict[str, str]] = {
     "status_red": {"zh_CN": "红方", "en_US": "RED"},
     "status_zoom": {"zh_CN": "缩放", "en_US": "Zoom"},
     "status_step_ms": {"zh_CN": "步耗时ms", "en_US": "Step ms"},
+    "status_col_target_rule": {"zh_CN": "目标规则", "en_US": "Target Rule"},
+    "status_module_target_mode_auto": {"zh_CN": "自动", "en_US": "Auto"},
+    "status_module_target_mode_weapon_focus_prefocus": {"zh_CN": "集火/预集火", "en_US": "Focus / Prefocus"},
+    "status_module_target_mode_enemy_nearest": {"zh_CN": "最近敌人", "en_US": "Nearest Enemy"},
+    "status_module_target_mode_enemy_random": {"zh_CN": "随机敌人", "en_US": "Random Enemy"},
+    "status_module_target_mode_ally_repair_queue": {"zh_CN": "维修队列", "en_US": "Repair Queue"},
+    "status_module_target_mode_ally_nearest": {"zh_CN": "最近友军", "en_US": "Nearest Ally"},
+    "status_module_target_mode_unsupported": {"zh_CN": "该模块当前不支持目标规则覆盖", "en_US": "This module does not currently support target rule overrides"},
+    "status_module_target_mode_invalid": {"zh_CN": "该目标规则不适用于当前模块", "en_US": "This target rule is not valid for the current module"},
+    "status_module_control_sync_done": {"zh_CN": "已同步 {count} 艘同小队同初始装配舰船的模块控制", "en_US": "Synced module controls to {count} matching squad ships"},
 }
 
 

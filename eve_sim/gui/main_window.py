@@ -258,9 +258,11 @@ class MainWindow(QMainWindow):
                 self._get_ship_locked_module_charge,
                 self._set_ship_module_charge_lock,
                 self._clear_ship_module_charge_lock,
+                self._get_ship_module_target_mode,
+                self._set_ship_module_target_mode,
                 self._get_ship_module_manual_mode,
                 self._set_ship_module_manual_mode,
-                self._sync_ship_module_manual_mode_to_matching_squad_fit,
+                self._sync_ship_module_controls_to_matching_squad_fit,
                 self,
             )
             self._status_dialogs[ship_id] = dialog
@@ -369,6 +371,18 @@ class MainWindow(QMainWindow):
         normalized = str(mode or "auto").strip().lower()
         return normalized if normalized in {"auto", "active", "online"} else "auto"
 
+    @staticmethod
+    def _normalize_module_target_mode(mode: str | None) -> str:
+        normalized = str(mode or "auto").strip().lower()
+        return normalized if normalized in {
+            "auto",
+            "weapon_focus_prefocus",
+            "enemy_nearest",
+            "enemy_random",
+            "ally_repair_queue",
+            "ally_nearest",
+        } else "auto"
+
     def _seed_ship_initial_fit_keys(self) -> None:
         for ship in self.engine.world.ships.values():
             self._ship_initial_fit_key(ship)
@@ -397,11 +411,24 @@ class MainWindow(QMainWindow):
             ship.combat.module_manual_modes[module_id] = normalized_mode
         ship.combat.module_decision_pending.add(str(module_id))
 
+    def _apply_ship_module_target_mode(self, ship, module_id: str, normalized_mode: str) -> None:
+        if normalized_mode == "auto":
+            ship.combat.module_target_modes.pop(module_id, None)
+        else:
+            ship.combat.module_target_modes[module_id] = normalized_mode
+        ship.combat.module_decision_pending.add(str(module_id))
+
     def _get_ship_module_manual_mode(self, ship_id: str, module_id: str) -> str:
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return "auto"
         return self._normalize_module_manual_mode(ship.combat.module_manual_modes.get(module_id))
+
+    def _get_ship_module_target_mode(self, ship_id: str, module_id: str) -> str:
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return "auto"
+        return self._normalize_module_target_mode(ship.combat.module_target_modes.get(module_id))
 
     def _set_ship_module_manual_mode(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
         lang = self.current_language()
@@ -431,7 +458,49 @@ class MainWindow(QMainWindow):
         )
         return True, normalized_mode
 
-    def _sync_ship_module_manual_mode_to_matching_squad_fit(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+    def _set_ship_module_target_mode(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+        lang = self.current_language()
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return False, tr(lang, "ship_missing")
+        if not self._is_ammo_configurable_team(ship.team):
+            return False, tr(lang, "status_module_mode_team_denied")
+        if ship.runtime is None:
+            return False, tr(lang, "status_module_none")
+
+        module = self._find_ship_runtime_module(ship, module_id)
+        if module is None:
+            return False, tr(lang, "status_lock_module_missing")
+
+        metadata = self.engine.combat._module_static_metadata(module)
+        valid_modes = self.engine.combat._module_target_mode_choices(module, metadata)
+        if not valid_modes:
+            return False, tr(lang, "status_module_target_mode_unsupported")
+
+        normalized_mode = self._normalize_module_target_mode(mode)
+        if normalized_mode != "auto" and normalized_mode not in valid_modes:
+            return False, tr(lang, "status_module_target_mode_invalid")
+        default_mode = self._normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+        applied_mode = "auto" if normalized_mode == default_mode else normalized_mode
+
+        self._apply_ship_module_target_mode(ship, module_id, applied_mode)
+        self.request_overview_refresh(force=True)
+        self.canvas.update()
+        self._log_user_action(
+            "module_target_mode_override",
+            ship=ship_id,
+            module=module_id,
+            target_mode=normalized_mode,
+        )
+        return True, normalized_mode
+
+    def _sync_ship_module_controls_to_matching_squad_fit(
+        self,
+        ship_id: str,
+        module_id: str,
+        mode: str,
+        target_mode: str,
+    ) -> tuple[bool, str]:
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
@@ -447,7 +516,18 @@ class MainWindow(QMainWindow):
         if not source_module.can_be_active() or source_module.state == ModuleState.OFFLINE:
             return False, tr(lang, "status_module_mode_unsupported")
 
+        metadata = self.engine.combat._module_static_metadata(source_module)
+        valid_target_modes = self.engine.combat._module_target_mode_choices(source_module, metadata)
         normalized_mode = self._normalize_module_manual_mode(mode)
+        normalized_target_mode = self._normalize_module_target_mode(target_mode)
+        if valid_target_modes:
+            if normalized_target_mode != "auto" and normalized_target_mode not in valid_target_modes:
+                return False, tr(lang, "status_module_target_mode_invalid")
+        else:
+            normalized_target_mode = "auto"
+        source_default_target_mode = self._normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+        requested_target_mode = "auto" if normalized_target_mode == source_default_target_mode else normalized_target_mode
+
         initial_fit_key = self._ship_initial_fit_key(ship)
         updated_ship_ids: list[str] = []
         for candidate in self.engine.world.ships.values():
@@ -461,6 +541,22 @@ class MainWindow(QMainWindow):
             if not target_module.can_be_active() or target_module.state == ModuleState.OFFLINE:
                 continue
             self._apply_ship_module_manual_mode(candidate, module_id, normalized_mode)
+            candidate_metadata = self.engine.combat._module_static_metadata(target_module)
+            candidate_target_modes = self.engine.combat._module_target_mode_choices(target_module, candidate_metadata)
+            if candidate_target_modes:
+                candidate_default_target_mode = self._normalize_module_target_mode(
+                    getattr(candidate_metadata.decision_rule, "target_mode", "auto")
+                )
+                applied_target_mode = (
+                    requested_target_mode
+                    if requested_target_mode in candidate_target_modes or requested_target_mode == "auto"
+                    else "auto"
+                )
+                if applied_target_mode == candidate_default_target_mode:
+                    applied_target_mode = "auto"
+                self._apply_ship_module_target_mode(candidate, module_id, applied_target_mode)
+            else:
+                self._apply_ship_module_target_mode(candidate, module_id, "auto")
             updated_ship_ids.append(candidate.ship_id)
 
         if not updated_ship_ids:
@@ -469,19 +565,23 @@ class MainWindow(QMainWindow):
         self.request_overview_refresh(force=True)
         self.canvas.update()
         self._log_user_action(
-            "module_mode_override_sync",
+            "module_control_override_sync",
             ship=ship_id,
             module=module_id,
             mode=normalized_mode,
+            target_mode=normalized_target_mode,
             squad=ship.squad_id,
             initial_fit_key=initial_fit_key,
             updated_ships=len(updated_ship_ids),
         )
-        return True, tr(
-            lang,
-            "status_module_mode_sync_done",
-            count=len(updated_ship_ids),
-            mode=tr(lang, f"status_module_mode_{normalized_mode}"),
+        return True, tr(lang, "status_module_control_sync_done", count=len(updated_ship_ids))
+
+    def _sync_ship_module_manual_mode_to_matching_squad_fit(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+        return self._sync_ship_module_controls_to_matching_squad_fit(
+            ship_id,
+            module_id,
+            mode,
+            self._get_ship_module_target_mode(ship_id, module_id),
         )
 
     def _sync_manual_setup_fit_text(self, ship_id: str, fit_text: str) -> None:
@@ -587,6 +687,9 @@ class MainWindow(QMainWindow):
         for module_id in list(ship.combat.module_manual_modes.keys()):
             if module_id not in runtime_module_ids:
                 ship.combat.module_manual_modes.pop(module_id, None)
+        for module_id in list(ship.combat.module_target_modes.keys()):
+            if module_id not in runtime_module_ids:
+                ship.combat.module_target_modes.pop(module_id, None)
 
         self._prune_ship_locked_module_charges(ship_id, runtime_module_ids)
         self._ship_fit_texts[ship_id] = fit_text

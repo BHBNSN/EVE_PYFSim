@@ -133,6 +133,17 @@ class _PopupAwareComboBox(QComboBox):
         self.popup_visibility_changed.emit(False)
 
 
+@dataclass(slots=True)
+class _ModuleControlRowContext:
+    module_id: str
+    can_target_override: bool
+    current_target_mode: str
+    target_mode_choices: tuple[str, ...]
+    default_target_mode: str
+    can_mode_override: bool
+    current_mode: str
+
+
 class FleetLibraryDialog(QDialog):
     def __init__(self, templates: dict[str, list[dict]], lang: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -481,9 +492,11 @@ class ShipStatusDialog(QDialog):
         lock_charge_getter: Callable[[str, str], str | None],
         lock_charge_setter: Callable[[str, str, str], tuple[bool, str]],
         lock_charge_clearer: Callable[[str, str], tuple[bool, str]],
+        module_target_mode_getter: Callable[[str, str], str],
+        module_target_mode_setter: Callable[[str, str, str], tuple[bool, str]],
         module_mode_getter: Callable[[str, str], str],
         module_mode_setter: Callable[[str, str, str], tuple[bool, str]],
-        module_mode_sync_setter: Callable[[str, str, str], tuple[bool, str]],
+        module_control_sync_setter: Callable[[str, str, str, str], tuple[bool, str]],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -494,16 +507,18 @@ class ShipStatusDialog(QDialog):
         self._lock_charge_getter = lock_charge_getter
         self._lock_charge_setter = lock_charge_setter
         self._lock_charge_clearer = lock_charge_clearer
+        self._module_target_mode_getter = module_target_mode_getter
+        self._module_target_mode_setter = module_target_mode_setter
         self._module_mode_getter = module_mode_getter
         self._module_mode_setter = module_mode_setter
-        self._module_mode_sync_setter = module_mode_sync_setter
+        self._module_control_sync_setter = module_control_sync_setter
         self._parser = EftFitParser()
         self._runtime_engine = RuntimeStatEngine()
         self._cached_fit_text: str = ""
         self._cached_module_specs: list = []
         self._lock_module_specs: dict[str, ParsedModuleSpec] = {}
         self._lock_ammo_draft_by_module: dict[str, str] = {}
-        self._module_mode_row_contexts: list[tuple[str, bool, str]] = []
+        self._module_control_row_contexts: list[_ModuleControlRowContext] = []
         self._stable_profile_cache = None
         self._stable_profile_cache_key: tuple[Any, ...] | None = None
         self._lock_controls_signature: tuple[Any, ...] | None = None
@@ -569,7 +584,7 @@ class ShipStatusDialog(QDialog):
         cap_target_layout.addWidget(self.targeting_table, 1)
         self.tabs.addTab(cap_target_page, "")
 
-        self.modules_table = self._create_read_only_table(9, stretch_last=False)
+        self.modules_table = self._create_read_only_table(10, stretch_last=False)
         modules_page = QWidget(self)
         modules_layout = QVBoxLayout(modules_page)
         modules_layout.setContentsMargins(0, 0, 0, 0)
@@ -695,6 +710,17 @@ class ShipStatusDialog(QDialog):
             header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        elif len(headers) == 10:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
 
     def _refresh_lock_controls_if_needed(self) -> None:
         lang = self._language_getter()
@@ -897,6 +923,18 @@ class ShipStatusDialog(QDialog):
         return normalized if normalized in {"auto", "active", "online"} else "auto"
 
     @staticmethod
+    def _normalize_module_target_mode(mode: str | None) -> str:
+        normalized = str(mode or "auto").strip().lower()
+        return normalized if normalized in {
+            "auto",
+            "weapon_focus_prefocus",
+            "enemy_nearest",
+            "enemy_random",
+            "ally_repair_queue",
+            "ally_nearest",
+        } else "auto"
+
+    @staticmethod
     def _module_supports_manual_mode(module: ModuleRuntime | None) -> bool:
         if module is None:
             return False
@@ -921,10 +959,68 @@ class ShipStatusDialog(QDialog):
         labels = dict(cls._module_manual_mode_options(lang))
         return labels.get(normalized, labels["auto"])
 
+    @staticmethod
+    def _module_target_mode_base_labels(lang: str) -> dict[str, str]:
+        return {
+            "auto": tr(lang, "status_module_target_mode_auto"),
+            "weapon_focus_prefocus": tr(lang, "status_module_target_mode_weapon_focus_prefocus"),
+            "enemy_nearest": tr(lang, "status_module_target_mode_enemy_nearest"),
+            "enemy_random": tr(lang, "status_module_target_mode_enemy_random"),
+            "ally_repair_queue": tr(lang, "status_module_target_mode_ally_repair_queue"),
+            "ally_nearest": tr(lang, "status_module_target_mode_ally_nearest"),
+        }
+
+    @classmethod
+    def _module_target_mode_label(cls, lang: str, mode: str | None, default_mode: str | None = None) -> str:
+        normalized = cls._effective_module_target_mode(mode, default_mode)
+        normalized_default = cls._normalize_module_target_mode(default_mode)
+        labels = cls._module_target_mode_base_labels(lang)
+        if normalized == "auto" and normalized_default != "auto":
+            normalized = normalized_default
+        return labels.get(normalized, labels.get(normalized_default, labels["auto"]))
+
+    @classmethod
+    def _effective_module_target_mode(cls, mode: str | None, default_mode: str | None) -> str:
+        normalized = cls._normalize_module_target_mode(mode)
+        if normalized != "auto":
+            return normalized
+        normalized_default = cls._normalize_module_target_mode(default_mode)
+        return normalized_default if normalized_default != "auto" else "auto"
+
+    def _module_target_mode_choices(self, module: ModuleRuntime | None) -> tuple[str, ...]:
+        if module is None:
+            return tuple()
+        metadata = self.engine.combat._module_static_metadata(module)
+        return tuple(self.engine.combat._module_target_mode_choices(module, metadata))
+
+    def _module_default_target_mode(self, module: ModuleRuntime | None) -> str:
+        if module is None:
+            return "auto"
+        metadata = self.engine.combat._module_static_metadata(module)
+        return self._normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+
+    def _module_target_mode_options(
+        self,
+        lang: str,
+        choices: tuple[str, ...],
+        default_mode: str,
+    ) -> list[tuple[str, str]]:
+        labels = self._module_target_mode_base_labels(lang)
+        effective_default = self._effective_module_target_mode("auto", default_mode)
+        options: list[tuple[str, str]] = []
+        for mode in choices:
+            normalized = self._normalize_module_target_mode(mode)
+            if normalized == "auto":
+                continue
+            options.append((normalized, labels.get(normalized, normalized)))
+        if effective_default != "auto" and all(mode != effective_default for mode, _label in options):
+            options.insert(0, (effective_default, labels.get(effective_default, effective_default)))
+        return options
+
     def _clear_module_mode_widgets(self) -> None:
         self._module_mode_popup_open = False
         for row in range(max(0, self.modules_table.rowCount())):
-            for column in (7, 8):
+            for column in (7, 8, 9):
                 widget = self.modules_table.cellWidget(row, column)
                 if widget is not None:
                     self.modules_table.removeCellWidget(row, column)
@@ -935,38 +1031,83 @@ class ShipStatusDialog(QDialog):
 
     def _refresh_module_mode_widgets(self, lang: str) -> None:
         self._clear_module_mode_widgets()
-        options = self._module_manual_mode_options(lang)
-        for row_index, (module_id, can_override, current_mode) in enumerate(self._module_mode_row_contexts):
-            if not can_override or not module_id:
+        mode_options = self._module_manual_mode_options(lang)
+        for row_index, context in enumerate(self._module_control_row_contexts):
+            module_id = context.module_id
+            if not module_id:
                 continue
-            combo = _PopupAwareComboBox(self.modules_table)
-            combo.popup_visibility_changed.connect(self._on_module_mode_popup_visibility_changed)
-            for mode_value, label in options:
-                combo.addItem(label, mode_value)
-            selected_index = combo.findData(self._normalize_module_manual_mode(current_mode))
-            if selected_index < 0:
-                selected_index = combo.findData("auto")
-            combo.blockSignals(True)
-            combo.setCurrentIndex(max(0, selected_index))
-            combo.blockSignals(False)
-            combo.currentIndexChanged.connect(
-                lambda _index, c=combo, module_key=module_id: self._on_module_mode_changed(module_key, c)
-            )
-            self.modules_table.setCellWidget(row_index, 7, combo)
-            mode_item = self.modules_table.item(row_index, 7)
-            if mode_item is not None:
-                mode_item.setText("")
 
-            sync_button = QPushButton(tr(lang, "status_module_mode_sync_button"), self.modules_table)
-            sync_button.setAutoDefault(False)
-            sync_button.setDefault(False)
-            sync_button.clicked.connect(
-                lambda _checked=False, c=combo, module_key=module_id: self._on_module_mode_sync_clicked(module_key, c)
-            )
-            self.modules_table.setCellWidget(row_index, 8, sync_button)
-            sync_item = self.modules_table.item(row_index, 8)
-            if sync_item is not None:
-                sync_item.setText("")
+            target_combo: QComboBox | None = None
+            mode_combo: QComboBox | None = None
+
+            if context.can_target_override:
+                target_combo = _PopupAwareComboBox(self.modules_table)
+                target_combo.popup_visibility_changed.connect(self._on_module_mode_popup_visibility_changed)
+                for mode_value, label in self._module_target_mode_options(
+                    lang,
+                    context.target_mode_choices,
+                    context.default_target_mode,
+                ):
+                    target_combo.addItem(label, mode_value)
+                selected_target_index = target_combo.findData(
+                    self._effective_module_target_mode(context.current_target_mode, context.default_target_mode)
+                )
+                if selected_target_index < 0:
+                    selected_target_index = 0
+                target_combo.blockSignals(True)
+                target_combo.setCurrentIndex(max(0, selected_target_index))
+                target_combo.blockSignals(False)
+                target_combo.currentIndexChanged.connect(
+                    lambda _index, c=target_combo, module_key=module_id: self._on_module_target_mode_changed(module_key, c)
+                )
+                self.modules_table.setCellWidget(row_index, 7, target_combo)
+                target_item = self.modules_table.item(row_index, 7)
+                if target_item is not None:
+                    target_item.setText("")
+
+            if context.can_mode_override:
+                mode_combo = _PopupAwareComboBox(self.modules_table)
+                mode_combo.popup_visibility_changed.connect(self._on_module_mode_popup_visibility_changed)
+                for mode_value, label in mode_options:
+                    mode_combo.addItem(label, mode_value)
+                selected_mode_index = mode_combo.findData(self._normalize_module_manual_mode(context.current_mode))
+                if selected_mode_index < 0:
+                    selected_mode_index = mode_combo.findData("auto")
+                mode_combo.blockSignals(True)
+                mode_combo.setCurrentIndex(max(0, selected_mode_index))
+                mode_combo.blockSignals(False)
+                mode_combo.currentIndexChanged.connect(
+                    lambda _index, c=mode_combo, module_key=module_id: self._on_module_mode_changed(module_key, c)
+                )
+                self.modules_table.setCellWidget(row_index, 8, mode_combo)
+                mode_item = self.modules_table.item(row_index, 8)
+                if mode_item is not None:
+                    mode_item.setText("")
+
+            if context.can_target_override or context.can_mode_override:
+                sync_button = QPushButton(tr(lang, "status_module_mode_sync_button"), self.modules_table)
+                sync_button.setAutoDefault(False)
+                sync_button.setDefault(False)
+                sync_button.clicked.connect(
+                    lambda _checked=False, module_key=module_id, tc=target_combo, mc=mode_combo: self._on_module_controls_sync_clicked(module_key, tc, mc)
+                )
+                self.modules_table.setCellWidget(row_index, 9, sync_button)
+                sync_item = self.modules_table.item(row_index, 9)
+                if sync_item is not None:
+                    sync_item.setText("")
+
+    def _on_module_target_mode_changed(self, module_id: str, combo: QComboBox) -> None:
+        lang = self._language_getter()
+        requested_mode = self._normalize_module_target_mode(str(combo.currentData() or "auto"))
+        ok, message = self._module_target_mode_setter(self.ship_id, module_id, requested_mode)
+        self._module_mode_popup_open = False
+        if ok:
+            self._tab_signatures.pop("modules", None)
+            self.refresh_status(force=True)
+            return
+        QMessageBox.warning(self, tr(lang, "ship_status_title"), tr(lang, "status_lock_failed", error=message))
+        self._tab_signatures.pop("modules", None)
+        self.refresh_status(force=True)
 
     def _on_module_mode_changed(self, module_id: str, combo: QComboBox) -> None:
         lang = self._language_getter()
@@ -981,10 +1122,20 @@ class ShipStatusDialog(QDialog):
         self._tab_signatures.pop("modules", None)
         self.refresh_status(force=True)
 
-    def _on_module_mode_sync_clicked(self, module_id: str, combo: QComboBox) -> None:
+    def _on_module_controls_sync_clicked(
+        self,
+        module_id: str,
+        target_combo: QComboBox | None,
+        mode_combo: QComboBox | None,
+    ) -> None:
         lang = self._language_getter()
-        requested_mode = self._normalize_module_manual_mode(str(combo.currentData() or "auto"))
-        ok, message = self._module_mode_sync_setter(self.ship_id, module_id, requested_mode)
+        requested_target_mode = self._normalize_module_target_mode(
+            str(target_combo.currentData() if target_combo is not None else self._module_target_mode_getter(self.ship_id, module_id))
+        )
+        requested_mode = self._normalize_module_manual_mode(
+            str(mode_combo.currentData() if mode_combo is not None else self._module_mode_getter(self.ship_id, module_id))
+        )
+        ok, message = self._module_control_sync_setter(self.ship_id, module_id, requested_mode, requested_target_mode)
         self._module_mode_popup_open = False
         if ok:
             if message:
@@ -1370,7 +1521,7 @@ class ShipStatusDialog(QDialog):
         module_specs = self._get_module_specs_cached(fit_text)
         runtime_by_slot, runtime_module_by_slot, projected_by_slot, projected_by_module, reactivation_by_module = self._runtime_maps(ship)
         rows: list[tuple[str, ...]] = []
-        self._module_mode_row_contexts = []
+        self._module_control_row_contexts = []
 
         if module_specs:
             for idx, spec in enumerate(module_specs, start=1):
@@ -1383,11 +1534,25 @@ class ShipStatusDialog(QDialog):
                 target_label = "-"
                 charge_label = "-"
                 timer_label = "-"
-                can_override = self._module_supports_manual_mode(runtime_module)
+                can_mode_override = self._module_supports_manual_mode(runtime_module)
+                can_target_override = runtime_module is not None and bool(self._module_target_mode_choices(runtime_module))
+                current_mode = self._module_mode_getter(self.ship_id, runtime_module.module_id) if can_mode_override and runtime_module is not None else "auto"
+                current_target_mode = (
+                    self._module_target_mode_getter(self.ship_id, runtime_module.module_id)
+                    if can_target_override and runtime_module is not None
+                    else "auto"
+                )
+                default_target_mode = self._module_default_target_mode(runtime_module)
+                target_mode_choices = self._module_target_mode_choices(runtime_module) if runtime_module is not None else tuple()
                 manual_mode = self._module_manual_mode_label(
                     lang,
-                    self._module_mode_getter(self.ship_id, runtime_module.module_id) if can_override and runtime_module is not None else None,
-                ) if can_override else "-"
+                    current_mode if can_mode_override else None,
+                ) if can_mode_override else "-"
+                target_mode_label = (
+                    self._module_target_mode_label(lang, current_target_mode, default_target_mode)
+                    if can_target_override
+                    else "-"
+                )
                 if runtime_module is not None:
                     has_projected = self._module_has_projected_effects(runtime_module)
                     is_area_effect = self._is_area_effect_group(runtime_module.group)
@@ -1415,11 +1580,15 @@ class ShipStatusDialog(QDialog):
                         target_label = str(ship.combat.current_target or tr(lang, "status_target_none"))
                 else:
                     state_label = tr(lang, f"state_{state_key}")
-                self._module_mode_row_contexts.append(
-                    (
-                        str(runtime_module.module_id) if runtime_module is not None else "",
-                        can_override,
-                        self._module_mode_getter(self.ship_id, runtime_module.module_id) if can_override and runtime_module is not None else "auto",
+                self._module_control_row_contexts.append(
+                    _ModuleControlRowContext(
+                        module_id=str(runtime_module.module_id) if runtime_module is not None else "",
+                        can_target_override=can_target_override,
+                        current_target_mode=current_target_mode,
+                        target_mode_choices=target_mode_choices,
+                        default_target_mode=default_target_mode,
+                        can_mode_override=can_mode_override,
+                        current_mode=current_mode,
                     )
                 )
                 rows.append(
@@ -1431,15 +1600,18 @@ class ShipStatusDialog(QDialog):
                         target_label,
                         charge_label,
                         timer_label,
+                        target_mode_label,
                         manual_mode,
-                        tr(lang, "status_module_mode_sync_button") if can_override else "-",
+                        tr(lang, "status_module_mode_sync_button") if (can_target_override or can_mode_override) else "-",
                     )
                 )
             return rows
 
         if ship.runtime is None:
-            self._module_mode_row_contexts = [("", False, "auto")]
-            return [(tr(lang, "status_module_none"), "-", "-", "-", "-", "-", "-", "-", "-")]
+            self._module_control_row_contexts = [
+                _ModuleControlRowContext("", False, "auto", tuple(), "auto", False, "auto")
+            ]
+            return [(tr(lang, "status_module_none"), "-", "-", "-", "-", "-", "-", "-", "-", "-")]
 
         ordered_modules = sorted(
             ship.runtime.modules,
@@ -1465,17 +1637,31 @@ class ShipStatusDialog(QDialog):
                 target_label = str(projected_by_module.get(module.module_id) or tr(lang, "status_target_none"))
             elif self._is_weapon_group(module.group):
                 target_label = str(ship.combat.current_target or tr(lang, "status_target_none"))
-            can_override = self._module_supports_manual_mode(module)
+            can_mode_override = self._module_supports_manual_mode(module)
+            target_mode_choices = self._module_target_mode_choices(module)
+            can_target_override = bool(target_mode_choices)
+            current_mode = self._module_mode_getter(self.ship_id, module.module_id) if can_mode_override else "auto"
+            current_target_mode = self._module_target_mode_getter(self.ship_id, module.module_id) if can_target_override else "auto"
+            default_target_mode = self._module_default_target_mode(module)
             manual_mode = (
-                self._module_manual_mode_label(lang, self._module_mode_getter(self.ship_id, module.module_id))
-                if can_override
+                self._module_manual_mode_label(lang, current_mode)
+                if can_mode_override
                 else "-"
             )
-            self._module_mode_row_contexts.append(
-                (
-                    str(module.module_id),
-                    can_override,
-                    self._module_mode_getter(self.ship_id, module.module_id) if can_override else "auto",
+            target_mode_label = (
+                self._module_target_mode_label(lang, current_target_mode, default_target_mode)
+                if can_target_override
+                else "-"
+            )
+            self._module_control_row_contexts.append(
+                _ModuleControlRowContext(
+                    module_id=str(module.module_id),
+                    can_target_override=can_target_override,
+                    current_target_mode=current_target_mode,
+                    target_mode_choices=target_mode_choices,
+                    default_target_mode=default_target_mode,
+                    can_mode_override=can_mode_override,
+                    current_mode=current_mode,
                 )
             )
             rows.append(
@@ -1491,8 +1677,9 @@ class ShipStatusDialog(QDialog):
                         else "-"
                     ),
                     self._module_timer_label(lang, ship, module, effective_state, cooldown_left),
+                    target_mode_label,
                     manual_mode,
-                    tr(lang, "status_module_mode_sync_button") if can_override else "-",
+                    tr(lang, "status_module_mode_sync_button") if (can_target_override or can_mode_override) else "-",
                 )
             )
         return rows
@@ -1652,6 +1839,7 @@ class ShipStatusDialog(QDialog):
             tr(lang, "status_col_target"),
             tr(lang, "status_col_charge"),
             tr(lang, "status_col_timer"),
+            tr(lang, "status_col_target_rule"),
             tr(lang, "status_col_mode"),
             tr(lang, "status_col_sync"),
         )
@@ -1694,7 +1882,7 @@ class ShipStatusDialog(QDialog):
 
     def _clear_views_for_missing_ship(self, lang: str) -> None:
         self._clear_module_mode_widgets()
-        self._module_mode_row_contexts = []
+        self._module_control_row_contexts = []
         metric_headers = [tr(lang, "status_metric"), tr(lang, "status_value")]
         missing_rows = [(tr(lang, "ship_missing"), "-")]
         self._apply_table(self.overview_table, metric_headers, missing_rows)
@@ -1717,10 +1905,11 @@ class ShipStatusDialog(QDialog):
                 tr(lang, "status_col_target"),
                 tr(lang, "status_col_charge"),
                 tr(lang, "status_col_timer"),
+                tr(lang, "status_col_target_rule"),
                 tr(lang, "status_col_mode"),
                 tr(lang, "status_col_sync"),
             ],
-            [(tr(lang, "ship_missing"), "-", "-", "-", "-", "-", "-", "-", "-")],
+            [(tr(lang, "ship_missing"), "-", "-", "-", "-", "-", "-", "-", "-", "-")],
         )
         self.info.setPlainText(tr(lang, "ship_missing"))
 

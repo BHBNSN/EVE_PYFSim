@@ -517,7 +517,7 @@ class CombatSystem:
                 decision_rule = ModuleDecisionRule(
                     rule_id="projected_support_generic",
                     activation_mode="always",
-                    target_mode="ally_lowest_hp",
+                    target_mode="ally_nearest",
                 )
             else:
                 decision_rule = ModuleDecisionRule(
@@ -744,7 +744,7 @@ class CombatSystem:
         now_value = self._decision_now(world, now)
         enqueue_control_signal_modules(
             ship,
-            runtime_decision_rule_groups(runtime, self._runtime_module_buckets(runtime).controlled_entries),
+            self._ship_decision_rule_groups(ship, runtime),
             propulsion_active=bool(ship.nav.propulsion_command_active),
             recent_enemy_weapon_damage_active=(
                 (
@@ -803,7 +803,7 @@ class CombatSystem:
     ) -> bool:
         if self._manual_module_mode(ship, str(module.module_id)) != "auto":
             return module.state != module.state.OFFLINE
-        decision_rule = metadata.decision_rule
+        decision_rule = self._effective_module_decision_rule(ship, module, metadata)
         return module_keeps_decision_pending(
             ship,
             module,
@@ -822,6 +822,60 @@ class CombatSystem:
             return "auto"
         normalized = str(raw_modes.get(str(module_id), "auto") or "auto").strip().lower()
         return normalized if normalized in {"auto", "active", "online"} else "auto"
+
+    @staticmethod
+    def _normalize_module_target_mode(mode: str | None) -> str:
+        normalized = str(mode or "auto").strip().lower()
+        return normalized if normalized in {
+            "auto",
+            "weapon_focus_prefocus",
+            "enemy_nearest",
+            "enemy_random",
+            "ally_repair_queue",
+            "ally_nearest",
+        } else "auto"
+
+    @staticmethod
+    def _manual_module_target_mode(ship, module_id: str) -> str:
+        raw_modes = getattr(ship.combat, "module_target_modes", {})
+        if not isinstance(raw_modes, dict):
+            return "auto"
+        return CombatSystem._normalize_module_target_mode(raw_modes.get(str(module_id), "auto"))
+
+    def _module_target_mode_choices(self, module, metadata: ModuleStaticMetadata) -> tuple[str, ...]:
+        if not metadata.has_projected or metadata.is_area_effect:
+            return tuple()
+        if metadata.target_side == "ally":
+            choices: list[str] = []
+            if metadata.has_projected_rep:
+                choices.append("ally_repair_queue")
+            if "ally_nearest" not in choices:
+                choices.append("ally_nearest")
+            return tuple(choices)
+        return ("weapon_focus_prefocus", "enemy_nearest", "enemy_random")
+
+    def _effective_module_decision_rule(self, ship, module, metadata: ModuleStaticMetadata) -> ModuleDecisionRule:
+        override = self._manual_module_target_mode(ship, str(module.module_id))
+        if override == "auto":
+            return metadata.decision_rule
+        if override not in self._module_target_mode_choices(module, metadata):
+            return metadata.decision_rule
+        if override == metadata.decision_rule.target_mode:
+            return metadata.decision_rule
+        return replace(metadata.decision_rule, target_mode=override)
+
+    def _ship_decision_rule_groups(self, ship, runtime) -> dict[str, dict[str, tuple[str, ...]]]:
+        activation_groups: dict[str, list[str]] = {}
+        target_groups: dict[str, list[str]] = {}
+        for module, metadata in self._runtime_module_buckets(runtime).controlled_entries:
+            module_id = str(module.module_id)
+            decision_rule = self._effective_module_decision_rule(ship, module, metadata)
+            activation_groups.setdefault(str(decision_rule.activation_mode), []).append(module_id)
+            target_groups.setdefault(str(decision_rule.target_mode), []).append(module_id)
+        return {
+            "activation": {key: tuple(values) for key, values in activation_groups.items()},
+            "target": {key: tuple(values) for key, values in target_groups.items()},
+        }
 
     def _requested_module_mode(
         self,
@@ -3089,23 +3143,12 @@ class CombatSystem:
     def _ship_id_in_pool(ship_id: str, pool: list) -> bool:
         return any(candidate.ship_id == ship_id and candidate.vital.alive for candidate in pool)
 
-    def _is_lowest_hp_ally_target(self, source, module, allies_pool: list, target_id: str) -> bool:
-        candidates = [
+    def _ally_candidates_in_projected_range(self, source, module, allies_pool: list) -> list:
+        return [
             ally
             for ally in self._candidates_in_projected_range(source, module, allies_pool)
             if ally.ship_id != source.ship_id
         ]
-        if not candidates:
-            return False
-
-        wounded = [ally for ally in candidates if self._hp_ratio(ally) < 0.999]
-        pool = wounded if wounded else candidates
-        target = next((ally for ally in pool if ally.ship_id == target_id), None)
-        if target is None:
-            return False
-
-        lowest_hp_ratio = min(self._hp_ratio(ally) for ally in pool)
-        return self._hp_ratio(target) <= lowest_hp_ratio + 1e-6
 
     def _can_reuse_projected_target(
         self,
@@ -3143,10 +3186,8 @@ class CombatSystem:
             metadata = self._module_static_metadata(module)
             return target_id == self._select_repair_queue_target(world, source, module, metadata)
 
-        if rule.target_mode == "ally_lowest_hp":
-            if target_id == source.ship_id:
-                return False
-            return self._is_lowest_hp_ally_target(source, module, allies_pool, target_id)
+        if rule.target_mode == "ally_nearest":
+            return target_id != source.ship_id and target_id in ally_ids
 
         if rule.target_mode in {"enemy_random", "enemy_nearest"}:
             return target_id in enemy_ids
@@ -3174,19 +3215,13 @@ class CombatSystem:
             return existing_target_id
         return min(candidates, key=lambda enemy: source.nav.position.distance_to(enemy.nav.position)).ship_id
 
-    def _select_ally_lowest_hp_in_range(self, source, module, allies_pool: list, existing_target_id: str | None) -> str | None:
-        candidates = [
-            ally
-            for ally in self._candidates_in_projected_range(source, module, allies_pool)
-            if ally.ship_id != source.ship_id
-        ]
+    def _select_ally_nearest_in_range(self, source, module, allies_pool: list, existing_target_id: str | None) -> str | None:
+        candidates = self._ally_candidates_in_projected_range(source, module, allies_pool)
         if not candidates:
             return None
-        wounded = [ally for ally in candidates if self._hp_ratio(ally) < 0.999]
-        pool = wounded if wounded else candidates
-        if existing_target_id and any(ally.ship_id == existing_target_id for ally in pool):
+        if existing_target_id and any(ally.ship_id == existing_target_id for ally in candidates):
             return existing_target_id
-        return min(pool, key=self._hp_ratio).ship_id
+        return min(candidates, key=lambda ally: source.nav.position.distance_to(ally.nav.position)).ship_id
 
     def _select_weapon_focus_target(self, world: WorldState, source, module, existing_target_id: str | None) -> str | None:
         focus_queue = world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), [])
@@ -3265,8 +3300,8 @@ class CombatSystem:
             return self._select_weapon_focus_target(world, source, module, existing_target_id)
         if rule.target_mode == "ally_repair_queue":
             return self._select_repair_queue_target(world, source, module, self._module_static_metadata(module))
-        if rule.target_mode == "ally_lowest_hp":
-            return self._select_ally_lowest_hp_in_range(source, module, allies_pool, existing_target_id)
+        if rule.target_mode == "ally_nearest":
+            return self._select_ally_nearest_in_range(source, module, allies_pool, existing_target_id)
         if rule.target_mode == "enemy_random":
             return self._select_enemy_random_in_range(source, module, enemies_pool, existing_target_id)
         if rule.target_mode == "enemy_nearest":
@@ -3274,7 +3309,7 @@ class CombatSystem:
 
         side = self._module_static_metadata(module).target_side
         if side == "ally":
-            return self._select_ally_lowest_hp_in_range(source, module, allies_pool, existing_target_id)
+            return self._select_ally_nearest_in_range(source, module, allies_pool, existing_target_id)
         return self._select_enemy_nearest_in_range(source, module, enemies_pool, existing_target_id)
 
     @staticmethod
@@ -3649,7 +3684,7 @@ class CombatSystem:
                             ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
                             ammo_reload_started_this_tick = True
 
-                decision_rule = metadata.decision_rule
+                decision_rule = self._effective_module_decision_rule(ship, module, metadata)
                 requested_mode = self._requested_module_mode(
                     ship,
                     module,
@@ -3662,7 +3697,12 @@ class CombatSystem:
                 cycle_started = False
 
                 if has_projected:
-                    if requested_mode == "active" and metadata.is_weapon and not metadata.is_area_effect:
+                    if (
+                        requested_mode == "active"
+                        and metadata.is_weapon
+                        and not metadata.is_area_effect
+                        and self._manual_module_target_mode(ship, module_id) == "auto"
+                    ):
                         projected_target_id = self._manual_weapon_target(world, ship, module, previous_projected_target)
                     else:
                         if (not force_target_reselect) and self._can_reuse_projected_target(
