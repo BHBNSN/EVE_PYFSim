@@ -805,8 +805,23 @@ class CombatSystem:
         recent_enemy_weapon_damage_active: bool,
         has_focus_queue: bool,
     ) -> bool:
-        if self._manual_module_mode(ship, str(module.module_id)) != "auto":
-            return module.state != module.state.OFFLINE
+        module_id = str(module.module_id)
+        module_max_state = self._runtime_module_max_state(ship.runtime, module_id)
+        if (
+            module.state != module.state.ACTIVE
+            and self._runtime_state_rank(module_max_state) < self._runtime_state_rank(ModuleState.ACTIVE)
+        ):
+            # Dynamic pyfa constraints such as scram/group limits only change on refresh events.
+            # Sleep blocked modules until a refresh updates the max-state map and re-queues them.
+            return False
+
+        manual_mode = self._manual_module_mode(ship, module_id)
+        if manual_mode != "auto":
+            if module.state == module.state.OFFLINE:
+                return False
+            if manual_mode == "online":
+                return module.state == module.state.ACTIVE
+            return True
         decision_rule = self._effective_module_decision_rule(ship, module, metadata)
         return module_keeps_decision_pending(
             ship,
@@ -1163,6 +1178,10 @@ class CombatSystem:
             source_module = source_by_module_id.get(module_id)
             if source_module is None:
                 continue
+            source_max_state = self._runtime_module_max_state(source_runtime, module_id)
+            target_max_state = self._runtime_module_max_state(target_runtime, module_id)
+            if source_max_state != target_max_state:
+                ship.combat.module_decision_pending.add(module_id)
             if source_module.state not in {ModuleState.ACTIVE, ModuleState.OVERHEATED}:
                 continue
             if target_module.state in {ModuleState.ACTIVE, ModuleState.OVERHEATED}:
