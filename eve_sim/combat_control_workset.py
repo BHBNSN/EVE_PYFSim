@@ -19,13 +19,15 @@ def runtime_controlled_entry_lookup(
     controlled_ids: tuple[str, ...],
 ) -> dict[str, tuple[Any, Any]]:
     cached = runtime.diagnostics.get("runtime_controlled_entry_lookup")
-    if isinstance(cached, dict) and len(cached) == len(controlled_ids) and all(module_id in cached for module_id in controlled_ids):
+    cached_signature = runtime.diagnostics.get("runtime_controlled_entry_lookup_signature")
+    if isinstance(cached, dict) and cached_signature == controlled_ids:
         return cached
     lookup = {
         str(module.module_id): (module, metadata)
         for module, metadata in controlled_entries
     }
     runtime.diagnostics["runtime_controlled_entry_lookup"] = lookup
+    runtime.diagnostics["runtime_controlled_entry_lookup_signature"] = controlled_ids
     return lookup
 
 
@@ -63,7 +65,8 @@ def ensure_ship_module_decision_pending(ship, controlled_ids: tuple[str, ...]) -
 
 
 def ship_candidate_module_ids(ship) -> set[str]:
-    return set(ship.combat.module_decision_pending)
+    pending = ship.combat.module_decision_pending
+    return pending if isinstance(pending, set) else set(pending)
 
 
 def enqueue_control_signal_modules(

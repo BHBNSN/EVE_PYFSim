@@ -316,6 +316,15 @@ class CombatSystem:
         blueprint = runtime.diagnostics.get("pyfa_blueprint")
         if not isinstance(blueprint, dict):
             return None
+        observed_signature = runtime.diagnostics.get("runtime_observed_module_state_signature")
+        cached_observed_signature = runtime.diagnostics.get("runtime_local_state_observed_signature")
+        cached_signature = runtime.diagnostics.get("runtime_local_state_signature")
+        if (
+            isinstance(observed_signature, tuple)
+            and cached_observed_signature == observed_signature
+            and isinstance(cached_signature, tuple)
+        ):
+            return cached_signature
         tracked_ids = runtime.diagnostics.get("runtime_local_stateful_module_ids")
         if isinstance(tracked_ids, tuple):
             tracked_id_set = {str(module_id) for module_id in tracked_ids}
@@ -331,6 +340,8 @@ class CombatSystem:
                 if self._module_static_metadata(module).affects_local_pyfa_profile
             )
         runtime.diagnostics["runtime_local_state_signature"] = signature
+        if isinstance(observed_signature, tuple):
+            runtime.diagnostics["runtime_local_state_observed_signature"] = observed_signature
         return signature
 
     @staticmethod
@@ -619,6 +630,18 @@ class CombatSystem:
         )
 
     @classmethod
+    def _projected_impact_signature(cls, impacts: list[ProjectedImpact]) -> tuple[tuple[Any, ...], ...]:
+        return tuple(
+            (
+                str(impact.source_ship_id or ""),
+                str(impact.target_ship_id or ""),
+                cls._round_projection_signature_value(float(impact.strength or 0.0)),
+                cls._projected_effect_signature(impact.effect),
+            )
+            for impact in impacts
+        )
+
+    @classmethod
     def _projected_module_runtime_signature(
         cls,
         module,
@@ -749,6 +772,8 @@ class CombatSystem:
 
         if not candidate_ids:
             return ()
+        if len(candidate_ids) >= len(controlled_ids):
+            return controlled_entries
 
         lookup = runtime_controlled_entry_lookup(runtime, controlled_entries, controlled_ids)
         ordered_entries: list[tuple[Any, ModuleStaticMetadata]] = []
@@ -949,18 +974,34 @@ class CombatSystem:
         return metadata.is_command_burst or metadata.uses_pyfa_projected_profile
 
     def _runtime_has_active_pyfa_remote_inputs(self, runtime) -> bool:
+        observed_signature = runtime.diagnostics.get("runtime_observed_module_state_signature")
+        cached_signature = runtime.diagnostics.get("runtime_has_active_pyfa_remote_inputs_signature")
+        cached_value = runtime.diagnostics.get("runtime_has_active_pyfa_remote_inputs")
+        if (
+            isinstance(observed_signature, tuple)
+            and cached_signature == observed_signature
+            and isinstance(cached_value, bool)
+        ):
+            return cached_value
+
         buckets = self._runtime_module_buckets(runtime)
         for module, _metadata in buckets.command_entries:
             if str(module.state.value or "ONLINE").upper() not in {"ACTIVE", "OVERHEATED"}:
                 continue
             runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = True
+            if isinstance(observed_signature, tuple):
+                runtime.diagnostics["runtime_has_active_pyfa_remote_inputs_signature"] = observed_signature
             return True
         for module, _metadata in buckets.pyfa_projected_entries:
             if str(module.state.value or "ONLINE").upper() not in {"ACTIVE", "OVERHEATED"}:
                 continue
             runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = True
+            if isinstance(observed_signature, tuple):
+                runtime.diagnostics["runtime_has_active_pyfa_remote_inputs_signature"] = observed_signature
             return True
         runtime.diagnostics["runtime_has_active_pyfa_remote_inputs"] = False
+        if isinstance(observed_signature, tuple):
+            runtime.diagnostics["runtime_has_active_pyfa_remote_inputs_signature"] = observed_signature
         return False
 
     def _reconcile_external_module_state_changes(self, world: WorldState, ship, runtime) -> bool:
@@ -1968,6 +2009,8 @@ class CombatSystem:
                 ship.combat.lock_timers.clear()
                 ship.combat.lock_deadlines.clear()
                 continue
+            if not ship.combat.lock_timers and not ship.combat.lock_deadlines:
+                continue
             self._prepare_ship_timer_views(ship, now_value)
             for target_id, left in list(ship.combat.lock_timers.items()):
                 target = world.ships.get(target_id)
@@ -2560,7 +2603,20 @@ class CombatSystem:
         for source in world.ships.values():
             if not source.vital.alive or source.runtime is None or self._ship_in_warp(source):
                 continue
-            for module, metadata in self._runtime_module_buckets(source.runtime).runtime_projected_entries:
+            runtime_projected_entries = self._runtime_module_buckets(source.runtime).runtime_projected_entries
+            if not runtime_projected_entries:
+                continue
+            if not source.combat.projected_targets:
+                has_active_area_effect = False
+                for module, metadata in runtime_projected_entries:
+                    if not metadata.is_area_effect:
+                        continue
+                    if any(module.is_active_for(effect.state_required) for _effect_index, effect in metadata.projected_effects):
+                        has_active_area_effect = True
+                        break
+                if not has_active_area_effect:
+                    continue
+            for module, metadata in runtime_projected_entries:
                 if metadata.is_missile_weapon or metadata.is_bomb_launcher:
                     continue
                 for effect_index, effect in metadata.projected_effects:
@@ -4110,7 +4166,23 @@ class CombatSystem:
         applied = impacts.get(ship.ship_id)
         if not applied:
             return ship.profile
-        return self._apply_runtime_projected_impacts(ship.profile, applied, runtime=ship.runtime)
+
+        runtime = ship.runtime
+        projected_signature = self._projected_impact_signature(applied)
+        cache_signature = (
+            runtime.diagnostics.get("pyfa_resolve_signature"),
+            runtime.diagnostics.get("runtime_local_state_signature"),
+            projected_signature,
+        )
+        cached_signature = runtime.diagnostics.get("runtime_projected_effective_profile_signature")
+        cached_profile = runtime.diagnostics.get("runtime_projected_effective_profile")
+        if cached_signature == cache_signature and isinstance(cached_profile, ShipProfile):
+            return cached_profile
+
+        effective = self._apply_runtime_projected_impacts(ship.profile, applied, runtime=runtime)
+        runtime.diagnostics["runtime_projected_effective_profile_signature"] = cache_signature
+        runtime.diagnostics["runtime_projected_effective_profile"] = effective
+        return effective
 
     @staticmethod
     def _focus_key(team, squad_id: str) -> str:

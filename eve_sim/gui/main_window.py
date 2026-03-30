@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
         self._overview_refresh_interval_ticks = 3
         self._ui_tick_counter = 0
         self._last_overview_rows: list[dict] = []
+        self._ship_type_display_cache: dict[tuple[str, str], str] = {}
         self._status_dialogs: dict[str, ShipStatusDialog] = {}
         self._step_ms_ema: float = 0.0
         self._pending_tick_ops: list[Callable[[], None]] = []
@@ -778,6 +779,15 @@ class MainWindow(QMainWindow):
         idx = self.lang_combo.findData(target_lang)
         self.lang_combo.setCurrentIndex(0 if idx < 0 else idx)
         self.lang_combo.blockSignals(False)
+
+    def _display_ship_type(self, ship_name: str, *, language: str) -> str:
+        cache_key = (str(language or ""), str(ship_name or ""))
+        cached = self._ship_type_display_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        resolved = get_type_display_name(ship_name, language=language)
+        self._ship_type_display_cache[cache_key] = resolved
+        return resolved
 
     def _create_menu(self) -> None:
         lang = self.current_language()
@@ -1795,6 +1805,7 @@ class MainWindow(QMainWindow):
 
     def _iter_overview_rows(self) -> list[dict]:
         anchor = self._selected_anchor()
+        lang = self.current_language()
         rows: list[dict] = []
         for ship in self.engine.world.ships.values():
             if ship.ship_id in self._undeployed_ship_ids:
@@ -1807,7 +1818,7 @@ class MainWindow(QMainWindow):
                 {
                     "id": ship.ship_id,
                     "ship_type": ship.fit.ship_name,
-                    "ship_type_display": get_type_display_name(ship.fit.ship_name, language=self.current_language()),
+                    "ship_type_display": self._display_ship_type(ship.fit.ship_name, language=lang),
                     "team": ship.team.value,
                     "squad": ship.squad_id,
                     "role": ship.fit.role,
@@ -2769,10 +2780,18 @@ class MainWindow(QMainWindow):
         if refresh_ui:
             self._refresh_propulsion_button_text()
             lang = self.current_language()
-            alive_blue = sum(1 for s in self.engine.world.ships.values() if s.team == Team.BLUE and s.vital.alive)
-            alive_red = sum(1 for s in self.engine.world.ships.values() if s.team == Team.RED and s.vital.alive)
+            alive_blue = 0
+            alive_red = 0
+            total_ships = 0
+            for ship in self.engine.world.ships.values():
+                total_ships += 1
+                if not ship.vital.alive:
+                    continue
+                if ship.team == Team.BLUE:
+                    alive_blue += 1
+                elif ship.team == Team.RED:
+                    alive_red += 1
             tick = self.engine.world.tick
-            total_ships = len(self.engine.world.ships)
             self.status.setText(
                 f"{QCoreApplication.translate("eve_sim", 'Tick')}: {tick} | {QCoreApplication.translate("eve_sim", 'Ships')}: {total_ships} | "
                 f"{QCoreApplication.translate("eve_sim", 'BLUE')}: {alive_blue} | {QCoreApplication.translate("eve_sim", 'RED')}: {alive_red} | "
