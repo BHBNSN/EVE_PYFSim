@@ -28,55 +28,34 @@ from ..fleet_setup import (
 )
 from ..fit_runtime import EffectClass, FitRuntime, ModuleEffect, ModuleRuntime, ModuleState, ProjectedImpact, RuntimeStatEngine
 from ..math2d import Vector2
+from ..module_control import normalize_module_manual_mode, normalize_module_target_mode
 from ..models import ProjectileBlast, ProjectileEntity, ShipProfile, Team
 from ..pyfa_bridge import PyfaBridge
+from ..remote_snapshot_signatures import (
+    normalized_snapshot_projection_signature as shared_normalized_snapshot_projection_signature,
+    projected_snapshot_list_signature as shared_projected_snapshot_list_signature,
+    projected_snapshot_module_signature as shared_projected_snapshot_module_signature,
+)
 from ..sim_logging import log_sim_event
+from ..timer_views import adopt_deadlines_from_remaining_view, deadline_remaining, sync_deadline_view
 from ..timing_wheel import EventType, TimingWheel
 from ..world import WorldState
 
-
-DamageTuple = tuple[float, float, float, float]
-
-_PROFILE_PASSTHROUGH_ATTRS = (
-    "weapon_system",
-    "optimal_sig",
-    "turret_dps",
-    "missile_dps",
-    "turret_cycle",
-    "missile_cycle",
-    "damage_em",
-    "damage_thermal",
-    "damage_kinetic",
-    "damage_explosive",
-    "turret_em_dps",
-    "turret_thermal_dps",
-    "turret_kinetic_dps",
-    "turret_explosive_dps",
-    "missile_em_dps",
-    "missile_thermal_dps",
-    "missile_kinetic_dps",
-    "missile_explosive_dps",
-    "missile_damage_reduction_factor",
-    "warp_speed_au_s",
-    "warp_capacitor_need",
-    "max_warp_distance_au",
-)
-
 _PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
 _REPAIR_QUEUE_LAYERS = ("shield", "armor", "structure")
-
-_RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS = frozenset(
-    {
-        "runtime_module_static_metadata",
-        "runtime_module_buckets",
-        "runtime_controlled_module_ids",
-        "runtime_controlled_entry_lookup",
-        "runtime_decision_rule_groups",
-    }
+from .models import (
+    CycleTargetSnapshot,
+    ModuleDecisionRule,
+    ModuleStaticMetadata,
+    RuntimeModuleBuckets,
+    _FORMULA_PROJECTED_KEYS,
+    _PROFILE_PASSTHROUGH_ATTRS,
+    _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS,
+    _apply_damage_sequence,
+    _layer_effective_damage,
+    _scale_damage,
+    _sum_damage,
 )
-
-from .models import *
-from .models import _FORMULA_PROJECTED_KEYS, _sum_damage, _scale_damage, _layer_effective_damage, _apply_damage_sequence
 
 
 class CombatSystem:
@@ -820,27 +799,14 @@ class CombatSystem:
         raw_modes = getattr(ship.combat, "module_manual_modes", {})
         if not isinstance(raw_modes, dict):
             return "auto"
-        normalized = str(raw_modes.get(str(module_id), "auto") or "auto").strip().lower()
-        return normalized if normalized in {"auto", "active", "online"} else "auto"
-
-    @staticmethod
-    def _normalize_module_target_mode(mode: str | None) -> str:
-        normalized = str(mode or "auto").strip().lower()
-        return normalized if normalized in {
-            "auto",
-            "weapon_focus_prefocus",
-            "enemy_nearest",
-            "enemy_random",
-            "ally_repair_queue",
-            "ally_nearest",
-        } else "auto"
+        return normalize_module_manual_mode(raw_modes.get(str(module_id), "auto"))
 
     @staticmethod
     def _manual_module_target_mode(ship, module_id: str) -> str:
         raw_modes = getattr(ship.combat, "module_target_modes", {})
         if not isinstance(raw_modes, dict):
             return "auto"
-        return CombatSystem._normalize_module_target_mode(raw_modes.get(str(module_id), "auto"))
+        return normalize_module_target_mode(raw_modes.get(str(module_id), "auto"))
 
     def _module_target_mode_choices(self, module, metadata: ModuleStaticMetadata) -> tuple[str, ...]:
         if not metadata.has_projected or metadata.is_area_effect:
@@ -952,28 +918,14 @@ class CombatSystem:
 
     @classmethod
     def _projected_snapshot_list_signature(cls, snapshots: list[dict[str, Any]]) -> tuple[Any, ...]:
-        signature: list[tuple[Any, ...]] = []
-        for snapshot in snapshots:
-            if not isinstance(snapshot, dict):
-                continue
-            projection_key_mode, distance_signature = cls._normalized_snapshot_projection_signature(snapshot)
-            signature.append(
-                (
-                    cls._projected_snapshot_module_signature(snapshot),
-                    projection_key_mode,
-                    distance_signature,
-                )
-            )
-        return tuple(signature)
+        return shared_projected_snapshot_list_signature(
+            snapshots,
+            module_signature_builder=cls._projected_snapshot_module_signature,
+            bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M,
+        )
 
     @staticmethod
-    def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
-        direct_signature = snapshot.get("pyfa_projection_module_signature")
-        if isinstance(direct_signature, tuple):
-            return direct_signature
-        if isinstance(direct_signature, list):
-            return tuple(direct_signature)
-
+    def _projected_snapshot_legacy_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
         state_raw = snapshot.get("state_by_module_id")
         state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
         command_raw = snapshot.get("command_booster_snapshots")
@@ -983,6 +935,13 @@ class CombatSystem:
             str(snapshot.get("fit_key", "") or ""),
             tuple((str(module_id), str(state)) for module_id, state in state_by_module_id.items()),
             CombatSystem._command_snapshot_list_signature(command_snapshots),
+        )
+
+    @staticmethod
+    def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        return shared_projected_snapshot_module_signature(
+            snapshot,
+            legacy_builder=CombatSystem._projected_snapshot_legacy_module_signature,
         )
 
     def _module_affects_pyfa_remote_inputs(self, module) -> bool:
@@ -1067,19 +1026,7 @@ class CombatSystem:
 
     @classmethod
     def _normalized_snapshot_projection_signature(cls, snapshot: dict[str, Any]) -> tuple[str, Any]:
-        projection_key_mode = str(snapshot.get("pyfa_projection_key_mode", "in_range") or "in_range")
-        if projection_key_mode == "exact_range":
-            try:
-                distance_signature: Any = round(
-                    cls._quantize_pyfa_projection_range(
-                        float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0)
-                    ),
-                    3,
-                )
-            except Exception:
-                distance_signature = 0.0
-            return "exact_range", distance_signature
-        return "in_range", None
+        return shared_normalized_snapshot_projection_signature(snapshot, bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M)
 
     def _pyfa_projection_snapshot_params(self, module, target_snapshot: CycleTargetSnapshot) -> tuple[str, float]:
         projected_effects = [
@@ -1281,15 +1228,6 @@ class CombatSystem:
         return float(world.now)
 
     @staticmethod
-    def _deadline_remaining(deadline: float | None, now: float) -> float | None:
-        if deadline is None:
-            return None
-        try:
-            return max(0.0, float(deadline) - float(now))
-        except Exception:
-            return None
-
-    @staticmethod
     def _clear_lock_timer(ship, target_id: str) -> None:
         ship.combat.lock_timers.pop(target_id, None)
         ship.combat.lock_deadlines.pop(target_id, None)
@@ -1378,65 +1316,40 @@ class CombatSystem:
             event_type=EventType.REACTIVATION_END,
         )
 
-    @staticmethod
-    def _sync_deadline_view(deadline_map: dict[str, float], view_map: dict[str, float], now: float) -> None:
-        for key, deadline in list(deadline_map.items()):
-            remaining = CombatSystem._deadline_remaining(deadline, now)
-            if remaining is None:
-                continue
-            view_map[str(key)] = remaining
-
     def _sync_timer_views_for_ship(self, ship, now: float) -> None:
-        self._sync_deadline_view(ship.combat.lock_deadlines, ship.combat.lock_timers, now)
-        self._sync_deadline_view(ship.combat.module_cycle_deadlines, ship.combat.module_cycle_timers, now)
-        self._sync_deadline_view(ship.combat.module_ammo_reload_deadlines, ship.combat.module_ammo_reload_timers, now)
-        self._sync_deadline_view(ship.combat.module_reactivation_deadlines, ship.combat.module_reactivation_timers, now)
+        sync_deadline_view(ship.combat.lock_deadlines, ship.combat.lock_timers, now)
+        sync_deadline_view(ship.combat.module_cycle_deadlines, ship.combat.module_cycle_timers, now)
+        sync_deadline_view(ship.combat.module_ammo_reload_deadlines, ship.combat.module_ammo_reload_timers, now)
+        sync_deadline_view(ship.combat.module_reactivation_deadlines, ship.combat.module_reactivation_timers, now)
 
     def _adopt_legacy_timer_views(self, ship, now: float) -> None:
-        epsilon = 1e-6
-        for target_id, remaining in list(ship.combat.lock_timers.items()):
-            if target_id in ship.combat.lock_deadlines:
-                continue
-            try:
-                remaining_float = max(0.0, float(remaining))
-            except Exception:
-                continue
-            if remaining_float <= epsilon:
-                continue
-            self._schedule_lock_deadline(ship, target_id, duration=remaining_float, now=now)
+        for target_id, deadline in adopt_deadlines_from_remaining_view(
+            ship.combat.lock_deadlines,
+            ship.combat.lock_timers,
+            now,
+        ).items():
+            self._schedule_lock_deadline(ship, target_id, deadline=deadline, now=now)
 
-        for module_id, remaining in list(ship.combat.module_cycle_timers.items()):
-            if module_id in ship.combat.module_cycle_deadlines:
-                continue
-            try:
-                remaining_float = max(0.0, float(remaining))
-            except Exception:
-                continue
-            if remaining_float <= epsilon:
-                continue
-            self._schedule_module_cycle_deadline(ship, module_id, duration=remaining_float, now=now)
+        for module_id, deadline in adopt_deadlines_from_remaining_view(
+            ship.combat.module_cycle_deadlines,
+            ship.combat.module_cycle_timers,
+            now,
+        ).items():
+            self._schedule_module_cycle_deadline(ship, module_id, deadline=deadline, now=now)
 
-        for module_id, remaining in list(ship.combat.module_ammo_reload_timers.items()):
-            if module_id in ship.combat.module_ammo_reload_deadlines:
-                continue
-            try:
-                remaining_float = max(0.0, float(remaining))
-            except Exception:
-                continue
-            if remaining_float <= epsilon:
-                continue
-            self._schedule_module_reload_deadline(ship, module_id, duration=remaining_float, now=now)
+        for module_id, deadline in adopt_deadlines_from_remaining_view(
+            ship.combat.module_ammo_reload_deadlines,
+            ship.combat.module_ammo_reload_timers,
+            now,
+        ).items():
+            self._schedule_module_reload_deadline(ship, module_id, deadline=deadline, now=now)
 
-        for module_id, remaining in list(ship.combat.module_reactivation_timers.items()):
-            if module_id in ship.combat.module_reactivation_deadlines:
-                continue
-            try:
-                remaining_float = max(0.0, float(remaining))
-            except Exception:
-                continue
-            if remaining_float <= epsilon:
-                continue
-            self._schedule_module_reactivation_deadline(ship, module_id, duration=remaining_float, now=now)
+        for module_id, deadline in adopt_deadlines_from_remaining_view(
+            ship.combat.module_reactivation_deadlines,
+            ship.combat.module_reactivation_timers,
+            now,
+        ).items():
+            self._schedule_module_reactivation_deadline(ship, module_id, deadline=deadline, now=now)
 
     def _prepare_ship_timer_views(self, ship, now: float) -> None:
         self._sync_timer_views_for_ship(ship, now)
@@ -2075,9 +1988,9 @@ class CombatSystem:
                             )
                         continue
                 else:
-                    left = float(left) - dt
+                    left = max(0.0, float(left) or 0.0)
                     if left > 0.0:
-                        ship.combat.lock_timers[target_id] = left
+                        self._schedule_lock_deadline(ship, target_id, duration=left, now=now_value)
                         if self.detailed_logging and self.logger is not None:
                             self.logger.debug(
                                 f"lock_progress attacker={ship.ship_id} target={target_id} remaining={left:.2f}"
@@ -3312,6 +3225,166 @@ class CombatSystem:
             return self._select_ally_nearest_in_range(source, module, allies_pool, existing_target_id)
         return self._select_enemy_nearest_in_range(source, module, enemies_pool, existing_target_id)
 
+    def _resolve_projected_target_id(
+        self,
+        world: WorldState,
+        ship,
+        module,
+        metadata: ModuleStaticMetadata,
+        decision_rule: ModuleDecisionRule,
+        *,
+        requested_mode: str,
+        previous_projected_target: str | None,
+        allies_pool: list,
+        enemies_alive: list,
+        ally_ids: set[str],
+        enemy_ids: set[str],
+        force_target_reselect: bool,
+        synced_weapon_fire_delay_pairs: set[tuple[str | None, str | None]],
+        now: float,
+    ) -> str | None:
+        module_id = str(module.module_id)
+        if (
+            requested_mode == "active"
+            and metadata.is_weapon
+            and not metadata.is_area_effect
+            and self._manual_module_target_mode(ship, module_id) == "auto"
+        ):
+            projected_target_id = self._manual_weapon_target(world, ship, module, previous_projected_target)
+        elif (not force_target_reselect) and self._can_reuse_projected_target(
+            world,
+            ship,
+            module,
+            decision_rule,
+            previous_projected_target,
+            allies_pool,
+            enemies_alive,
+            ally_ids,
+            enemy_ids,
+        ):
+            projected_target_id = previous_projected_target
+        else:
+            projected_target_id = self._select_projected_target(
+                world,
+                ship,
+                module,
+                allies_pool=allies_pool,
+                enemies_pool=enemies_alive,
+                rule=decision_rule,
+                existing_target_id=None,
+            )
+
+        if decision_rule.target_mode == "weapon_focus_prefocus":
+            delay_pair = (previous_projected_target, projected_target_id)
+            if delay_pair not in synced_weapon_fire_delay_pairs:
+                self._sync_weapon_fire_delay(
+                    ship,
+                    previous_target_id=previous_projected_target,
+                    new_target_id=projected_target_id,
+                    now=now,
+                )
+                synced_weapon_fire_delay_pairs.add(delay_pair)
+        return projected_target_id
+
+    def _apply_module_reload_gating(
+        self,
+        ship,
+        module,
+        module_id: str,
+        *,
+        desired_active: bool,
+        now: float,
+    ) -> bool:
+        ammo_reload_left = max(
+            0.0,
+            float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
+        )
+        active_reload_timer_present = module_id in ship.combat.module_ammo_reload_timers
+        if ammo_reload_left > 0.0:
+            if module_id not in ship.combat.module_ammo_reload_deadlines:
+                self._schedule_module_reload_deadline(
+                    ship,
+                    module_id,
+                    duration=ammo_reload_left,
+                    now=now,
+                )
+            desired_active = False
+        elif active_reload_timer_present and module_id not in ship.combat.module_ammo_reload_deadlines:
+            self._clear_module_reload_timer(ship, module_id)
+            if module.charge_capacity > 0:
+                module.charge_remaining = float(module.charge_capacity)
+
+        if module_id in ship.combat.module_ammo_reload_timers:
+            desired_active = False
+
+        pending_ammo_reload_left = max(
+            0.0,
+            float(ship.combat.module_pending_ammo_reload_timers.get(module_id, 0.0) or 0.0),
+        )
+        active_ammo_reload_left = max(
+            0.0,
+            float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
+        )
+        current_cycle_left = max(
+            0.0,
+            float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0),
+        )
+        if active_ammo_reload_left <= 0.0 and pending_ammo_reload_left > 0.0 and current_cycle_left <= 0.0:
+            self._schedule_module_reload_deadline(
+                ship,
+                module_id,
+                duration=pending_ammo_reload_left,
+                now=now,
+            )
+            ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
+            desired_active = False
+
+        if module.charge_capacity > 0 and module.charge_rate > 0.0 and module.charge_remaining <= 0.0:
+            if module_id not in ship.combat.module_ammo_reload_timers:
+                auto_reload_time = max(0.0, float(module.charge_reload_time))
+                if auto_reload_time > 0.0:
+                    self._schedule_module_reload_deadline(
+                        ship,
+                        module_id,
+                        duration=auto_reload_time,
+                        now=now,
+                    )
+                else:
+                    module.charge_remaining = float(module.charge_capacity)
+            desired_active = False
+
+        return desired_active
+
+    def _apply_module_reactivation_gating(
+        self,
+        ship,
+        module_id: str,
+        *,
+        desired_active: bool,
+        now: float,
+    ) -> bool:
+        cooldown_left = ship.combat.module_reactivation_timers.get(module_id)
+        if cooldown_left is None:
+            return desired_active
+        if module_id in ship.combat.module_reactivation_deadlines:
+            if float(cooldown_left) > 0.0:
+                return False
+            self._clear_module_reactivation_timer(ship, module_id)
+            return desired_active
+
+        cooldown_left = max(0.0, float(cooldown_left) or 0.0)
+        if cooldown_left > 0.0:
+            self._schedule_module_reactivation_deadline(
+                ship,
+                module_id,
+                duration=cooldown_left,
+                now=now,
+            )
+            return False
+
+        self._clear_module_reactivation_timer(ship, module_id)
+        return desired_active
+
     @staticmethod
     def _ecm_strength_from_effect(effect) -> dict[str, float]:
         return {
@@ -3628,8 +3701,6 @@ class CombatSystem:
                 cycle_cost = metadata.cycle_cost
                 cycle_time = metadata.cycle_time
                 reactivation_delay = metadata.reactivation_delay
-                cycle_just_completed = False
-                ammo_reload_started_this_tick = False
 
                 if module.state == module.state.ACTIVE and cycle_time > 0:
                     if active_timer is not None:
@@ -3637,14 +3708,18 @@ class CombatSystem:
                             if float(active_timer) > 0.0:
                                 continue
                         else:
-                            timer_left = float(active_timer) - dt
+                            timer_left = max(0.0, float(active_timer) or 0.0)
                             if timer_left > 0:
-                                ship.combat.module_cycle_timers[module_id] = timer_left
+                                self._schedule_module_cycle_deadline(
+                                    ship,
+                                    module_id,
+                                    duration=timer_left,
+                                    now=now_value,
+                                )
                                 continue
                         self._clear_module_cycle_timer(ship, module_id)
                         self._flush_projected_cycle_total(world, ship.ship_id, module, previous_projected_target)
                         self._clear_module_cycle_snapshots(ship.ship_id, module_id)
-                        cycle_just_completed = True
                         if reactivation_delay > 0.0:
                             self._schedule_module_reactivation_deadline(
                                 ship,
@@ -3670,7 +3745,6 @@ class CombatSystem:
                                             duration=auto_reload_time,
                                             now=now_value,
                                         )
-                                        ammo_reload_started_this_tick = True
                                     else:
                                         module.charge_remaining = float(module.charge_capacity)
 
@@ -3682,7 +3756,6 @@ class CombatSystem:
                                 now=now_value,
                             )
                             ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
-                            ammo_reload_started_this_tick = True
 
                 decision_rule = self._effective_module_decision_rule(ship, module, metadata)
                 requested_mode = self._requested_module_mode(
@@ -3697,46 +3770,22 @@ class CombatSystem:
                 cycle_started = False
 
                 if has_projected:
-                    if (
-                        requested_mode == "active"
-                        and metadata.is_weapon
-                        and not metadata.is_area_effect
-                        and self._manual_module_target_mode(ship, module_id) == "auto"
-                    ):
-                        projected_target_id = self._manual_weapon_target(world, ship, module, previous_projected_target)
-                    else:
-                        if (not force_target_reselect) and self._can_reuse_projected_target(
-                            world,
-                            ship,
-                            module,
-                            decision_rule,
-                            previous_projected_target,
-                            allies_pool,
-                            enemies_alive,
-                            ally_ids,
-                            enemy_ids,
-                        ):
-                            projected_target_id = previous_projected_target
-                        else:
-                            projected_target_id = self._select_projected_target(
-                                world,
-                                ship,
-                                module,
-                                allies_pool=allies_pool,
-                                enemies_pool=enemies_alive,
-                                rule=decision_rule,
-                                existing_target_id=None,
-                            )
-                    if decision_rule.target_mode == "weapon_focus_prefocus":
-                        delay_pair = (previous_projected_target, projected_target_id)
-                        if delay_pair not in synced_weapon_fire_delay_pairs:
-                            self._sync_weapon_fire_delay(
-                                ship,
-                                previous_target_id=previous_projected_target,
-                                new_target_id=projected_target_id,
-                                now=now_value,
-                            )
-                            synced_weapon_fire_delay_pairs.add(delay_pair)
+                    projected_target_id = self._resolve_projected_target_id(
+                        world,
+                        ship,
+                        module,
+                        metadata,
+                        decision_rule,
+                        requested_mode=requested_mode,
+                        previous_projected_target=previous_projected_target,
+                        allies_pool=allies_pool,
+                        enemies_alive=enemies_alive,
+                        ally_ids=ally_ids,
+                        enemy_ids=enemy_ids,
+                        force_target_reselect=force_target_reselect,
+                        synced_weapon_fire_delay_pairs=synced_weapon_fire_delay_pairs,
+                        now=now_value,
+                    )
 
                 if requested_mode == "active":
                     desired_active = True
@@ -3753,83 +3802,20 @@ class CombatSystem:
                 if has_projected and projected_target_id is None and not metadata.is_area_effect:
                     desired_active = False
 
-                ammo_reload_left = max(
-                    0.0,
-                    float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
+                desired_active = self._apply_module_reload_gating(
+                    ship,
+                    module,
+                    module_id,
+                    desired_active=desired_active,
+                    now=now_value,
                 )
-                active_reload_timer_present = module_id in ship.combat.module_ammo_reload_timers
-                if ammo_reload_left > 0.0:
-                    if module_id in ship.combat.module_ammo_reload_deadlines:
-                        desired_active = False
-                    else:
-                        if not ammo_reload_started_this_tick:
-                            ammo_reload_left = max(0.0, ammo_reload_left - dt)
-                        if ammo_reload_left > 0.0:
-                            ship.combat.module_ammo_reload_timers[module_id] = ammo_reload_left
-                            desired_active = False
-                        else:
-                            self._clear_module_reload_timer(ship, module_id)
-                            if module.charge_capacity > 0:
-                                module.charge_remaining = float(module.charge_capacity)
-                elif active_reload_timer_present and module_id not in ship.combat.module_ammo_reload_deadlines:
-                    self._clear_module_reload_timer(ship, module_id)
-                    if module.charge_capacity > 0:
-                        module.charge_remaining = float(module.charge_capacity)
 
-                if module_id in ship.combat.module_ammo_reload_timers:
-                    desired_active = False
-
-                pending_ammo_reload_left = max(
-                    0.0,
-                    float(ship.combat.module_pending_ammo_reload_timers.get(module_id, 0.0) or 0.0),
+                desired_active = self._apply_module_reactivation_gating(
+                    ship,
+                    module_id,
+                    desired_active=desired_active,
+                    now=now_value,
                 )
-                active_ammo_reload_left = max(
-                    0.0,
-                    float(ship.combat.module_ammo_reload_timers.get(module_id, 0.0) or 0.0),
-                )
-                current_cycle_left = max(
-                    0.0,
-                    float(ship.combat.module_cycle_timers.get(module_id, 0.0) or 0.0),
-                )
-                if active_ammo_reload_left <= 0.0 and pending_ammo_reload_left > 0.0 and current_cycle_left <= 0.0:
-                    self._schedule_module_reload_deadline(
-                        ship,
-                        module_id,
-                        duration=pending_ammo_reload_left,
-                        now=now_value,
-                    )
-                    ship.combat.module_pending_ammo_reload_timers.pop(module_id, None)
-                    desired_active = False
-
-                if module.charge_capacity > 0 and module.charge_rate > 0.0 and module.charge_remaining <= 0.0:
-                    if module_id not in ship.combat.module_ammo_reload_timers:
-                        auto_reload_time = max(0.0, float(module.charge_reload_time))
-                        if auto_reload_time > 0.0:
-                            self._schedule_module_reload_deadline(
-                                ship,
-                                module_id,
-                                duration=auto_reload_time,
-                                now=now_value,
-                            )
-                        else:
-                            module.charge_remaining = float(module.charge_capacity)
-                    desired_active = False
-
-                cooldown_left = ship.combat.module_reactivation_timers.get(module_id)
-                if cooldown_left is not None:
-                    if module_id in ship.combat.module_reactivation_deadlines:
-                        if float(cooldown_left) > 0.0:
-                            desired_active = False
-                        else:
-                            self._clear_module_reactivation_timer(ship, module_id)
-                    else:
-                        if not cycle_just_completed:
-                            cooldown_left = float(cooldown_left) - dt
-                        if cooldown_left > 0.0:
-                            ship.combat.module_reactivation_timers[module_id] = cooldown_left
-                            desired_active = False
-                        else:
-                            self._clear_module_reactivation_timer(ship, module_id)
 
                 module_max_state = self._runtime_module_max_state(ship.runtime, module_id)
                 if desired_active and self._runtime_state_rank(module_max_state) < self._runtime_state_rank(ModuleState.ACTIVE):

@@ -7,6 +7,7 @@ from .main_window import MainWindow
 from ..agents import CommanderAgent
 from ..config import UiConfig
 from ..fleet_setup import build_world_from_manual_setup
+from ..i18n import install_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..models import Team
 from ..pyfa_bridge import PyfaBridge
@@ -15,6 +16,7 @@ from ..systems import CombatSystem
 
 def run_gui() -> None:
     app = QApplication.instance() or QApplication([])
+    install_language("zh_CN")
 
     mode_options = ["Local", "Host LAN", "Join LAN"]
     mode, ok = QInputDialog.getItem(None, "Battle Mode", "Select mode", mode_options, 0, False)

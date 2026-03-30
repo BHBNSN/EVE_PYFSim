@@ -1,282 +1,56 @@
 from __future__ import annotations
 
-STRINGS: dict[str, dict[str, str]] = {
-    "app_title": {"zh_CN": "EVE SIM - 连续空间战斗模拟", "en_US": "EVE SIM - Continuous Space Wargame"},
-    "setup_title": {"zh_CN": "战斗开始前舰队配置", "en_US": "Pre-Battle Fleet Setup"},
-    "setup_hint": {"zh_CN": "每行代表一艘船。下方粘贴 EVE 标准 EFT 文本（[Ship, Fit]）。允许重复同装配，内部会做缓存。", "en_US": "Each row is one ship. Paste EFT text below ([Ship, Fit]). Duplicate fits are cached."},
-    "setup_backend": {"zh_CN": "计算后端", "en_US": "Backend"},
-    "setup_blue_fleet": {"zh_CN": "蓝队舰队", "en_US": "Blue Fleet"},
-    "setup_red_fleet": {"zh_CN": "红队舰队", "en_US": "Red Fleet"},
-    "setup_save_blue_fleet": {"zh_CN": "保存蓝队", "en_US": "Save Blue"},
-    "setup_save_red_fleet": {"zh_CN": "保存红队", "en_US": "Save Red"},
-    "setup_fleet_name_title": {"zh_CN": "保存舰队配置", "en_US": "Save Fleet Configuration"},
-    "setup_fleet_name_label": {"zh_CN": "舰队名称", "en_US": "Fleet Name"},
-    "setup_fleet_empty_title": {"zh_CN": "无法保存", "en_US": "Cannot Save"},
-    "setup_fleet_empty_msg": {"zh_CN": "该队当前没有舰船可保存。", "en_US": "This side has no ships to save."},
-    "setup_blue_preview": {"zh_CN": "蓝队预览", "en_US": "Blue Preview"},
-    "setup_red_preview": {"zh_CN": "红队预览", "en_US": "Red Preview"},
-    "setup_tab_preview": {"zh_CN": "舰队预览", "en_US": "Fleet Preview"},
-    "setup_tab_settings": {"zh_CN": "仿真设置", "en_US": "Simulation Settings"},
-    "setup_cfg_tick_rate": {"zh_CN": "仿真 Tick 率 (Hz)", "en_US": "Tick Rate (Hz)"},
-    "setup_cfg_physics_substeps": {"zh_CN": "物理子步数", "en_US": "Physics Substeps"},
-    "setup_cfg_battlefield_radius": {"zh_CN": "战场半径 (m)", "en_US": "Battlefield Radius (m)"},
-    "setup_cfg_lockstep": {"zh_CN": "锁步模式", "en_US": "Lockstep"},
-    "setup_cfg_detailed_logging": {"zh_CN": "详细日志", "en_US": "Detailed Logging"},
-    "setup_cfg_hotspot_logging": {"zh_CN": "热点耗时记录", "en_US": "Hotspot Timing Logging"},
-    "setup_cfg_log_file": {"zh_CN": "日志文件", "en_US": "Log File"},
-    "setup_cfg_hotspot_log_file": {"zh_CN": "热点日志文件", "en_US": "Hotspot Log File"},
-    "setup_cfg_log_merge_window": {"zh_CN": "日志聚合窗口(秒)", "en_US": "Log Merge Window (sec)"},
-    "setup_cfg_local_persist": {
-        "zh_CN": "以下参数会保存在本机偏好中，下次启动自动带入。",
-        "en_US": "These settings are saved locally and will be restored on next launch."
-    },
-    "setup_cfg_host_authority": {
-        "zh_CN": "联机客户端参数以 Host 为准；当前不可编辑，仅显示本机偏好。",
-        "en_US": "In LAN client mode, Host settings are authoritative. Values are read-only local preferences."
-    },
-    "setup_preview_empty": {"zh_CN": "未选择舰队", "en_US": "No fleet selected"},
-    "setup_preview_invalid": {"zh_CN": "配装无效", "en_US": "Invalid Fit"},
-    "setup_validate_need_fleets": {"zh_CN": "请先为蓝队和红队各选择一个舰队。", "en_US": "Please select one fleet for both Blue and Red."},
-    "fleet_lib_open": {"zh_CN": "打开舰队库", "en_US": "Open Fleet Library"},
-    "fleet_lib_title": {"zh_CN": "舰队库", "en_US": "Fleet Library"},
-    "fleet_lib_name": {"zh_CN": "舰队", "en_US": "Fleet"},
-    "fleet_lib_new": {"zh_CN": "新建", "en_US": "New"},
-    "fleet_lib_exists_title": {"zh_CN": "新建失败", "en_US": "Cannot Create"},
-    "fleet_lib_exists_msg": {"zh_CN": "舰队“{name}”已存在，请使用其他名称。", "en_US": "Fleet '{name}' already exists. Please use a different name."},
-    "fleet_lib_delete": {"zh_CN": "删除", "en_US": "Delete"},
-    "fleet_lib_save": {"zh_CN": "保存", "en_US": "Save"},
-    "fleet_lib_confirm": {"zh_CN": "确定", "en_US": "OK"},
-    "fleet_lib_add_row": {"zh_CN": "新增舰船", "en_US": "Add Ship"},
-    "fleet_lib_remove_row": {"zh_CN": "删除舰船", "en_US": "Remove Ship"},
-    "setup_add_blue": {"zh_CN": "新增蓝方舰船", "en_US": "Add Blue Ship"},
-    "setup_add_red": {"zh_CN": "新增红方舰船", "en_US": "Add Red Ship"},
-    "setup_delete": {"zh_CN": "删除选中舰船", "en_US": "Delete Selected"},
-    "setup_validate": {"zh_CN": "校验全部配装", "en_US": "Validate All Fits"},
-    "setup_validate_fail_title": {"zh_CN": "校验失败", "en_US": "Validation Failed"},
-    "setup_validate_ok_title": {"zh_CN": "校验成功", "en_US": "Validation Passed"},
-    "setup_validate_need_ship": {"zh_CN": "至少需要一艘舰船", "en_US": "At least one ship is required."},
-    "setup_validate_row_invalid": {"zh_CN": "第 {row} 行配装无效：{error}", "en_US": "Invalid fit on row {row}: {error}"},
-    "setup_validate_all_ok": {"zh_CN": "全部舰船配装可解析", "en_US": "All fits are valid."},
-    "ammo_title": {"zh_CN": "弹药配置", "en_US": "Ammo Configuration"},
-    "ammo_no_replace": {"zh_CN": "当前舰队中没有可替换的该装备条目。", "en_US": "No matching module entries were found in the current fleet."},
-    "ammo_rebuild_failed": {"zh_CN": "舰船 {ship} 重新装配失败：{error}", "en_US": "Failed to rebuild fit for ship {ship}: {error}"},
-    "ammo_switch_done": {"zh_CN": "已将 {module} 切换为 {ammo}（更新 {count} 艘）。战场不重置，按重装填时间 {reload:.1f}s 后继续生效。", "en_US": "Switched {module} to {ammo} (updated {count} ships). Battle state is preserved; effect resumes after reload {reload:.1f}s."},
-    "status_lock_module": {"zh_CN": "锁定装备", "en_US": "Lock Module"},
-    "status_lock_ammo": {"zh_CN": "锁定填充", "en_US": "Lock Charge"},
-    "status_lock_apply": {"zh_CN": "锁定当前填充", "en_US": "Lock Current Charge"},
-    "status_lock_clear": {"zh_CN": "解除锁定", "en_US": "Unlock"},
-    "status_lock_none": {"zh_CN": "<无可锁定填充装备>", "en_US": "<No chargeable module to lock>"},
-    "status_lock_set_done": {"zh_CN": "已锁定 {module} 的填充物为 {ammo}", "en_US": "Locked {module} charge to {ammo}"},
-    "status_lock_clear_done": {"zh_CN": "已解除 {module} 的填充物锁定", "en_US": "Unlocked charge lock for {module}"},
-    "status_lock_failed": {"zh_CN": "操作失败：{error}", "en_US": "Operation failed: {error}"},
-    "status_lock_module_missing": {"zh_CN": "未找到该装备槽位", "en_US": "Module slot not found"},
-    "status_lock_module_not_chargeable": {"zh_CN": "该装备不可填充", "en_US": "Module is not charge-loadable"},
-    "status_lock_ammo_invalid": {"zh_CN": "填充物不匹配该装备", "en_US": "Charge does not match this module"},
-    "status_lock_team_denied": {"zh_CN": "当前模式下不可修改该舰船填充配置", "en_US": "Cannot modify this ship's charge in current mode"},
-    "err_pyfa_chain_unavailable": {"zh_CN": "pyfa Fit 计算链不可用。", "en_US": "pyfa Fit calculation chain is unavailable."},
-    "err_pyfa_chain_incomplete": {"zh_CN": "pyfa Fit 计算链初始化不完整。", "en_US": "pyfa Fit calculation chain is not fully initialized."},
-    "err_pyfa_ship_not_found": {"zh_CN": "pyfa 中未找到舰船：{name}", "en_US": "Ship not found in pyfa: {name}"},
-    "err_pyfa_module_not_found": {"zh_CN": "pyfa 中未找到模块：{name}", "en_US": "Module not found in pyfa: {name}"},
-    "err_pyfa_charge_not_found": {"zh_CN": "pyfa 中未找到弹药：{name}", "en_US": "Charge not found in pyfa: {name}"},
-    "err_weapon_no_ammo": {"zh_CN": "武器缺少可解析弹药：{name}", "en_US": "Weapon has no resolvable ammo: {name}"},
-    "err_ammo_mismatch": {"zh_CN": "弹药与武器口径/类型不匹配：{detail}", "en_US": "Ammo does not match weapon caliber/type: {detail}"},
-    "setup_start": {"zh_CN": "开始模拟", "en_US": "Start Simulation"},
-    "setup_cancel": {"zh_CN": "取消", "en_US": "Cancel"},
-    "setup_fit_placeholder": {"zh_CN": "在这里粘贴选中舰船的 EFT 配装文本", "en_US": "Paste EFT fit text for selected ship here"},
-    "setup_col_team": {"zh_CN": "队伍", "en_US": "Team"},
-    "setup_col_squad": {"zh_CN": "小队", "en_US": "Squad"},
-    "setup_col_quality": {"zh_CN": "素养", "en_US": "Quality"},
-    "setup_col_quantity": {"zh_CN": "数量", "en_US": "Count"},
-    "setup_col_leader": {"zh_CN": "队长", "en_US": "Leader"},
-    "setup_col_fit": {"zh_CN": "配装名", "en_US": "Fit Name"},
-    "lang_label": {"zh_CN": "语言", "en_US": "Language"},
-    "controlled_side": {"zh_CN": "当前持方", "en_US": "Controlled Side"},
-    "btn_switch_controlled_team": {"zh_CN": "切换到 {team}", "en_US": "Switch to {team}"},
-    "yes_short": {"zh_CN": "是", "en_US": "Y"},
-    "no_short": {"zh_CN": "否", "en_US": "N"},
-    "selected_squad": {"zh_CN": "当前己方小队", "en_US": "Selected Squad"},
-    "btn_clear_focus": {"zh_CN": "清除集火目标", "en_US": "Clear Focus Targets"},
-    "btn_prop_on": {"zh_CN": "点击开启推进", "en_US": "Click to Enable Prop"},
-    "btn_prop_off": {"zh_CN": "点击关闭推进", "en_US": "Click to Disable Prop"},
-    "leader_speed_limit": {"zh_CN": "队长最大速度(0=不限):", "en_US": "Leader Max Speed (0=Unlimited):"},
-    "freq_charge_module": {"zh_CN": "高频可装填装备(全量, 按数量排序):", "en_US": "Common Charge-Loadable Modules (all, sorted by count):"},
-    "ammo": {"zh_CN": "弹药:", "en_US": "Ammo:"},
-    "apply_all": {"zh_CN": "应用到全舰队", "en_US": "Apply to Fleet"},
-    "tab_overview": {"zh_CN": "总览", "en_US": "Overview"},
-    "tab_fleet": {"zh_CN": "己方编组", "en_US": "Fleet"},
-    "menu_overview_filter": {"zh_CN": "筛选...", "en_US": "Filters..."},
-    "menu_overview_reset": {"zh_CN": "重置筛选", "en_US": "Reset Filters"},
-    "overview_filter_title": {"zh_CN": "总览筛选", "en_US": "Overview Filters"},
-    "filter_all": {"zh_CN": "全部", "en_US": "All"},
-    "filter_blue": {"zh_CN": "蓝方", "en_US": "Blue"},
-    "filter_red": {"zh_CN": "红方", "en_US": "Red"},
-    "filter_friendly": {"zh_CN": "己方", "en_US": "Friendly"},
-    "filter_enemy_team": {"zh_CN": "敌方", "en_US": "Enemy"},
-    "filter_alive": {"zh_CN": "存活", "en_US": "Alive"},
-    "filter_destroyed": {"zh_CN": "已毁", "en_US": "Destroyed"},
-    "filter_enemy_only": {"zh_CN": "仅敌方", "en_US": "Enemy Only"},
-    "filter_team": {"zh_CN": "过滤阵营", "en_US": "Team"},
-    "filter_role": {"zh_CN": "过滤角色", "en_US": "Role"},
-    "filter_status": {"zh_CN": "过滤状态", "en_US": "Status"},
-    "filter_squad_contains": {"zh_CN": "小队包含", "en_US": "Squad Contains"},
-    "filter_enemy": {"zh_CN": "敌方筛选", "en_US": "Enemy Filter"},
-    "overview_col_name": {"zh_CN": "名字", "en_US": "Name"},
-    "overview_col_type": {"zh_CN": "船型", "en_US": "Ship Type"},
-    "overview_col_distance": {"zh_CN": "距离(km)", "en_US": "Distance (km)"},
-    "overview_col_team": {"zh_CN": "队伍", "en_US": "Team"},
-    "fleet_col_ship": {"zh_CN": "舰船ID", "en_US": "Ship ID"},
-    "fleet_col_squad": {"zh_CN": "小队", "en_US": "Squad"},
-    "fleet_col_role": {"zh_CN": "角色", "en_US": "Role"},
-    "fleet_col_alive": {"zh_CN": "存活", "en_US": "Alive"},
-    "fleet_col_hp": {"zh_CN": "HP%", "en_US": "HP%"},
-    "overview_hint": {"zh_CN": "双击空地=前往该点，双击舰船=持续接近该船，右键打开指令菜单", "en_US": "Double-click space: move there; double-click ship: continuously approach; right-click opens command menu"},
-    "focus_none": {"zh_CN": "无", "en_US": "None"},
-    "canvas_focus_current": {"zh_CN": "{squad} 当前集火: {target}", "en_US": "{squad} Current Focus: {target}"},
-    "canvas_focus_queue": {"zh_CN": "预集火队列: {targets}", "en_US": "Pre-focus Queue: {targets}"},
-    "fleet_tip": {"zh_CN": "多选舰船后分配到任意小队；直接修改小队名可新建队伍", "en_US": "Multi-select ships to assign squad; edit name to create squad"},
-    "target_squad": {"zh_CN": "目标小队", "en_US": "Target Squad"},
-    "assign_btn": {"zh_CN": "将选中舰船分配到该小队", "en_US": "Assign Selected Ships"},
-    "status_prefix": {"zh_CN": "Tick", "en_US": "Tick"},
-    "ship_status_title": {"zh_CN": "舰船状态", "en_US": "Ship Status"},
-    "menu_show_status": {"zh_CN": "查看 {ship} 当前状态", "en_US": "View {ship} Status"},
-    "menu_warp_ship": {"zh_CN": "{squad} 跃迁至 {ship}", "en_US": "{squad} Warp To {ship}"},
-    "menu_warp_beacon": {"zh_CN": "{squad} 跃迁至 {beacon}", "en_US": "{squad} Warp To {beacon}"},
-    "menu_focus": {"zh_CN": "{squad} 集火 {ship}", "en_US": "{squad} Focus {ship}"},
-    "menu_prefocus": {"zh_CN": "{squad} 预集火 {ship}", "en_US": "{squad} Pre-focus {ship}"},
-    "menu_cancel_prefocus": {"zh_CN": "{squad} 取消预锁定 {ship}", "en_US": "{squad} Cancel Pre-lock {ship}"},
-    "ship_missing": {"zh_CN": "舰船不存在", "en_US": "Ship not found"},
-    "status_ship": {"zh_CN": "舰船", "en_US": "Ship"},
-    "status_type": {"zh_CN": "船型(DB)", "en_US": "Ship Type (DB)"},
-    "status_team_squad": {"zh_CN": "阵营/小队", "en_US": "Team/Squad"},
-    "status_alive": {"zh_CN": "存活", "en_US": "Alive"},
-    "status_speed": {"zh_CN": "速度", "en_US": "Speed"},
-    "status_facing": {"zh_CN": "朝向", "en_US": "Facing"},
-    "status_dph": {"zh_CN": "DPH", "en_US": "DPH"},
-    "status_dps": {"zh_CN": "DPS", "en_US": "DPS"},
-    "status_hp": {"zh_CN": "血量", "en_US": "HP"},
-    "status_shield": {"zh_CN": "护盾", "en_US": "Shield"},
-    "status_armor": {"zh_CN": "装甲", "en_US": "Armor"},
-    "status_structure": {"zh_CN": "结构", "en_US": "Structure"},
-    "status_cap": {"zh_CN": "电容", "en_US": "Cap"},
-    "status_ecm_incoming": {"zh_CN": "被谁ECM", "en_US": "Incoming ECM"},
-    "status_ecm_last_attempt": {"zh_CN": "ECM最近尝试", "en_US": "Last ECM Attempt"},
-    "status_ecm_none": {"zh_CN": "无", "en_US": "None"},
-    "status_ecm_attempt_none": {"zh_CN": "无尝试记录", "en_US": "No Attempts"},
-    "status_ecm_result_success": {"zh_CN": "成功", "en_US": "Success"},
-    "status_ecm_result_failed": {"zh_CN": "失败", "en_US": "Failed"},
-    "status_ecm_result_unknown": {"zh_CN": "未知", "en_US": "Unknown"},
-    "status_ecm_cycle_result": {"zh_CN": "本轮ECM", "en_US": "ECM This Cycle"},
-    "status_ecm_chance": {"zh_CN": "概率", "en_US": "Chance"},
-    "status_ecm_elapsed": {"zh_CN": "距今", "en_US": "Ago"},
-    "status_res": {"zh_CN": "抗性(%)", "en_US": "Resist(%)"},
-    "status_modules": {"zh_CN": "模块", "en_US": "Modules"},
-    "status_module_none": {"zh_CN": "<无 runtime>", "en_US": "<no runtime>"},
-    "status_modules_fitted": {"zh_CN": "配装模块总数", "en_US": "Fitted Modules"},
-    "status_modules_runtime": {"zh_CN": "运行时模块数", "en_US": "Runtime Modules"},
-    "status_state": {"zh_CN": "状态", "en_US": "State"},
-    "status_charge": {"zh_CN": "余量/容量", "en_US": "Charge"},
-    "status_cycle_time": {"zh_CN": "循环时间", "en_US": "Cycle Time"},
-    "status_reload_time": {"zh_CN": "填充时间", "en_US": "Reload Time"},
-    "status_reactivation_time": {"zh_CN": "延时时间", "en_US": "Reactivation Time"},
-    "status_reloading_fmt": {"zh_CN": "填充中 {seconds:.1f}s", "en_US": "Reloading {seconds:.1f}s"},
-    "status_reload_pending_fmt": {"zh_CN": "待开始填充 {seconds:.1f}s", "en_US": "Pending Reload {seconds:.1f}s"},
-    "status_target": {"zh_CN": "目标", "en_US": "Target"},
-    "status_target_none": {"zh_CN": "无", "en_US": "None"},
-    "state_ACTIVE": {"zh_CN": "启用", "en_US": "ACTIVE"},
-    "state_ONLINE": {"zh_CN": "在线", "en_US": "ONLINE"},
-    "state_OFFLINE": {"zh_CN": "离线", "en_US": "OFFLINE"},
-    "state_OVERHEATED": {"zh_CN": "过热", "en_US": "OVERHEATED"},
-    "state_UNMODELED": {"zh_CN": "未建模", "en_US": "UNMODELED"},
-    "state_REACTIVATING": {"zh_CN": "启用延迟", "en_US": "REACTIVATING"},
-    "state_REACTIVATING_FMT": {"zh_CN": "启用延迟 {seconds:.1f}s", "en_US": "Reactivating in {seconds:.1f}s"},
-    "status_tab_overview": {"zh_CN": "概览", "en_US": "Overview"},
-    "status_tab_combat": {"zh_CN": "火力与支援", "en_US": "Combat"},
-    "status_tab_defense": {"zh_CN": "防御", "en_US": "Defense"},
-    "status_tab_cap_target": {"zh_CN": "电容与目标", "en_US": "Capacitor & Targeting"},
-    "status_tab_modules": {"zh_CN": "模块", "en_US": "Modules"},
-    "status_tab_debug": {"zh_CN": "调试", "en_US": "Debug"},
-    "status_metric": {"zh_CN": "项目", "en_US": "Metric"},
-    "status_value": {"zh_CN": "数值", "en_US": "Value"},
-    "status_backend": {"zh_CN": "后端", "en_US": "Backend"},
-    "status_locked_targets": {"zh_CN": "已锁定目标", "en_US": "Locked Targets"},
-    "status_targets": {"zh_CN": "最大锁定数", "en_US": "Targets"},
-    "status_target_range": {"zh_CN": "锁定距离", "en_US": "Target Range"},
-    "status_scan_resolution": {"zh_CN": "扫描分辨率", "en_US": "Scan Resolution"},
-    "status_sensor_strengths": {"zh_CN": "传感器强度", "en_US": "Sensor Strengths"},
-    "status_signature_radius": {"zh_CN": "信号半径", "en_US": "Signature Radius"},
-    "status_align_time": {"zh_CN": "对齐时间", "en_US": "Align Time"},
-    "status_mass": {"zh_CN": "质量", "en_US": "Mass"},
-    "status_agility": {"zh_CN": "敏捷", "en_US": "Agility"},
-    "status_warp_stability": {"zh_CN": "核心稳定", "en_US": "Warp Stability"},
-    "status_warp_scramble": {"zh_CN": "扰频状态", "en_US": "Warp Scramble"},
-    "status_current_target": {"zh_CN": "当前锁定目标", "en_US": "Current Target"},
-    "status_locked_targets_detail": {"zh_CN": "已锁定目标详情", "en_US": "Locked Target Details"},
-    "status_locking_targets": {"zh_CN": "锁定中目标", "en_US": "Locking Targets"},
-    "status_locked_by": {"zh_CN": "被以下舰船锁定", "en_US": "Locked By"},
-    "status_locking_by": {"zh_CN": "被以下舰船锁定中", "en_US": "Locking By"},
-    "status_turret_dps": {"zh_CN": "炮台DPS", "en_US": "Turret DPS"},
-    "status_missile_dps": {"zh_CN": "导弹DPS", "en_US": "Missile DPS"},
-    "status_optimal": {"zh_CN": "最佳射程", "en_US": "Optimal"},
-    "status_falloff_short": {"zh_CN": "失准距离", "en_US": "Falloff"},
-    "status_tracking_short": {"zh_CN": "跟踪", "en_US": "Tracking"},
-    "status_optimal_sig": {"zh_CN": "最佳信号", "en_US": "Optimal Sig"},
-    "status_missile_range": {"zh_CN": "导弹射程", "en_US": "Missile Range"},
-    "status_explosion_radius": {"zh_CN": "爆炸半径", "en_US": "Explosion Radius"},
-    "status_explosion_velocity": {"zh_CN": "爆炸速度", "en_US": "Explosion Velocity"},
-    "status_damage_split": {"zh_CN": "伤害分布", "en_US": "Damage Split"},
-    "status_remote_shield_rep_ps": {"zh_CN": "远程摇盾/秒", "en_US": "Remote Shield Rep/s"},
-    "status_remote_armor_rep_ps": {"zh_CN": "远程修甲/秒", "en_US": "Remote Armor Rep/s"},
-    "status_cap_warfare_ps": {"zh_CN": "能量战/秒", "en_US": "Cap Warfare/s"},
-    "status_total_raw_hp": {"zh_CN": "总原始HP", "en_US": "Total Raw HP"},
-    "status_total_ehp": {"zh_CN": "总全抗EHP", "en_US": "Total Omni EHP"},
-    "status_layer": {"zh_CN": "层", "en_US": "Layer"},
-    "status_omni_ehp": {"zh_CN": "全抗EHP", "en_US": "Omni EHP"},
-    "status_cap_peak_recharge": {"zh_CN": "峰值回电", "en_US": "Peak Recharge"},
-    "status_cap_recharge_time": {"zh_CN": "回电时间", "en_US": "Recharge Time"},
-    "status_cap_resistance": {"zh_CN": "能量战抗性", "en_US": "Cap Warfare Resist"},
-    "status_col_slot": {"zh_CN": "槽位", "en_US": "Slot"},
-    "status_col_module": {"zh_CN": "模块", "en_US": "Module"},
-    "status_col_group": {"zh_CN": "分组", "en_US": "Group"},
-    "status_col_state": {"zh_CN": "状态", "en_US": "State"},
-    "status_col_target": {"zh_CN": "目标", "en_US": "Target"},
-    "status_col_charge": {"zh_CN": "弹药/余量", "en_US": "Charge"},
-    "status_col_timer": {"zh_CN": "计时", "en_US": "Timer"},
-    "status_col_mode": {"zh_CN": "模式", "en_US": "Mode"},
-    "status_col_sync": {"zh_CN": "同步", "en_US": "Sync"},
-    "status_module_mode_auto": {"zh_CN": "自动", "en_US": "Auto"},
-    "status_module_mode_active": {"zh_CN": "启用", "en_US": "Activate"},
-    "status_module_mode_online": {"zh_CN": "在线", "en_US": "Online"},
-    "status_module_mode_team_denied": {"zh_CN": "当前模式下不可修改该舰船模块模式", "en_US": "Cannot modify this ship's module mode in current mode"},
-    "status_module_mode_unsupported": {"zh_CN": "该模块当前不支持手动模式切换", "en_US": "This module does not currently support manual mode overrides"},
-    "status_module_mode_sync_button": {"zh_CN": "同步", "en_US": "Sync"},
-    "status_module_mode_sync_done": {"zh_CN": "已同步 {count} 艘同小队同初始装配舰船为“{mode}”", "en_US": "Synced {count} matching squad ships to \"{mode}\""},
-    "status_module_mode_sync_none": {"zh_CN": "没有找到可同步的同小队同初始装配舰船", "en_US": "No matching squad ships with the same initial fit could be synced"},
-    "canvas_zoom_pan": {"zh_CN": "缩放: {zoom:.5f}  平移: ({x:.0f}, {y:.0f})", "en_US": "Zoom: {zoom:.5f}  Pan: ({x:.0f}, {y:.0f})"},
-    "canvas_help": {"zh_CN": "左键选择己方小队/敌方目标 | 双击空地前往 | 双击舰船持续接近 | 右键菜单诱导部署/集火 | 中键平移 | 滚轮缩放", "en_US": "Left click: select friendly squad/enemy target | Double-click space: move | Double-click ship: continuous approach | Right-click menu: induce deploy/focus | Middle drag: pan | Wheel: zoom"},
-    "menu_induce_squad_here": {"zh_CN": "将小队诱导至此", "en_US": "Induce Squad Here"},
-    "menu_induce_fleet_here": {"zh_CN": "将舰队诱导至此", "en_US": "Induce Fleet Here"},
-    "menu_approach": {"zh_CN": "{squad} 持续接近 {ship}", "en_US": "{squad} Continuously Approach {ship}"},
-    "status_ships": {"zh_CN": "舰船", "en_US": "Ships"},
-    "status_blue": {"zh_CN": "蓝方", "en_US": "BLUE"},
-    "status_red": {"zh_CN": "红方", "en_US": "RED"},
-    "status_zoom": {"zh_CN": "缩放", "en_US": "Zoom"},
-    "status_step_ms": {"zh_CN": "步耗时ms", "en_US": "Step ms"},
-    "status_col_target_rule": {"zh_CN": "目标规则", "en_US": "Target Rule"},
-    "status_module_target_mode_auto": {"zh_CN": "自动", "en_US": "Auto"},
-    "status_module_target_mode_weapon_focus_prefocus": {"zh_CN": "集火/预集火", "en_US": "Focus / Prefocus"},
-    "status_module_target_mode_enemy_nearest": {"zh_CN": "最近敌人", "en_US": "Nearest Enemy"},
-    "status_module_target_mode_enemy_random": {"zh_CN": "随机敌人", "en_US": "Random Enemy"},
-    "status_module_target_mode_ally_repair_queue": {"zh_CN": "维修队列", "en_US": "Repair Queue"},
-    "status_module_target_mode_ally_nearest": {"zh_CN": "最近友军", "en_US": "Nearest Ally"},
-    "status_module_target_mode_unsupported": {"zh_CN": "该模块当前不支持目标规则覆盖", "en_US": "This module does not currently support target rule overrides"},
-    "status_module_target_mode_invalid": {"zh_CN": "该目标规则不适用于当前模块", "en_US": "This target rule is not valid for the current module"},
-    "status_module_control_sync_done": {"zh_CN": "已同步 {count} 艘同小队同初始装配舰船的模块控制", "en_US": "Synced module controls to {count} matching squad ships"},
-}
+from pathlib import Path
+
+from PySide6.QtCore import QCoreApplication, QTranslator
+from PySide6.QtWidgets import QApplication
+
+_INSTALLED_LANGUAGE = "en_US"
+_APP_TRANSLATOR: QTranslator | None = None
 
 
-def tr(lang: str, key: str, **kwargs) -> str:
-    table = STRINGS.get(key, {})
-    text = table.get(lang) or table.get("zh_CN") or key
-    if kwargs:
-        return text.format(**kwargs)
-    return text
+def _translations_dir() -> Path:
+    return Path(__file__).resolve().parent / "translations"
+
+
+def _ensure_qt_application() -> QCoreApplication | None:
+    app = QApplication.instance()
+    if app is not None:
+        return app
+    return QCoreApplication.instance()
+
+
+def install_language(lang: str) -> str:
+    global _APP_TRANSLATOR, _INSTALLED_LANGUAGE
+
+    normalized = str(lang or "en_US").strip() or "en_US"
+    if normalized not in {"zh_CN", "en_US"}:
+        normalized = "en_US"
+
+    app = _ensure_qt_application()
+    if app is None:
+        _INSTALLED_LANGUAGE = normalized
+        return normalized
+
+    if _APP_TRANSLATOR is not None:
+        app.removeTranslator(_APP_TRANSLATOR)
+        _APP_TRANSLATOR = None
+
+    if normalized == "zh_CN":
+        translator = QTranslator(app)
+        qm_path = _translations_dir() / "eve_sim_zh_CN.qm"
+        if translator.load(str(qm_path)):
+            app.installTranslator(translator)
+            _APP_TRANSLATOR = translator
+        else:
+            normalized = "en_US"
+
+    _INSTALLED_LANGUAGE = normalized
+    return normalized
+
+
+def current_language() -> str:
+    return _INSTALLED_LANGUAGE
+
+
+__all__ = ["current_language", "install_language"]

@@ -38,17 +38,15 @@ from ..models import (
     Team,
     VitalState,
 )
+from ..remote_snapshot_signatures import (
+    normalized_snapshot_projection_signature as shared_normalized_snapshot_projection_signature,
+    projected_snapshot_list_signature as shared_projected_snapshot_list_signature,
+    projected_snapshot_module_signature as shared_projected_snapshot_module_signature,
+)
+from ..user_errors import UserFacingError
 from ..world import WorldState
-
-
-QUALITY_PRESETS = {
-    QualityLevel.ELITE: QualityState(QualityLevel.ELITE, reaction_delay=0.0, ignore_order_probability=0.0, formation_jitter=0.0),
-    QualityLevel.REGULAR: QualityState(QualityLevel.REGULAR, reaction_delay=0.0, ignore_order_probability=0.0, formation_jitter=0.0),
-    QualityLevel.IRREGULAR: QualityState(QualityLevel.IRREGULAR, reaction_delay=0.0, ignore_order_probability=0.0, formation_jitter=0.0),
-}
-
-from .models import *
-from .eft_parser import *
+from .eft_parser import EftFitParser
+from .models import ManualShipSetup, ParsedEftFit, ParsedModuleSpec, QUALITY_PRESETS
 
 class RuntimeFromEftFactory:
     def __init__(self) -> None:
@@ -1312,7 +1310,7 @@ class RuntimeFromEftFactory:
         ignore_offline_specs: bool = False,
     ) -> tuple[Any, list[tuple[ParsedModuleSpec, Any, str | None]]]:
         if not self._pyfa.fit_engine_ready:
-            raise ValueError("pyfa static database unavailable")
+            raise UserFacingError("pyfa Fit calculation chain is unavailable.")
 
         fit_cls = self._pyfa._fit_cls
         ship_cls = self._pyfa._ship_cls
@@ -1333,7 +1331,7 @@ class RuntimeFromEftFactory:
         ship_name = self._pyfa.resolve_type_name(parsed.ship_name)
         ship_item = self._pyfa.get_item(ship_name)
         if ship_item is None:
-            raise ValueError(f"pyfa ship not found: {parsed.ship_name}")
+            raise UserFacingError("Ship not found in pyfa: {name}", name=parsed.ship_name)
 
         fit = fit_cls(ship=ship_cls(ship_item), name=parsed.fit_name)
         try:
@@ -1347,7 +1345,7 @@ class RuntimeFromEftFactory:
             module_name = self._pyfa.resolve_type_name(spec.module_name)
             module_item = self._pyfa.get_item(module_name)
             if module_item is None:
-                raise ValueError(f"pyfa module not found: {spec.module_name}")
+                raise UserFacingError("Module not found in pyfa: {name}", name=spec.module_name)
             module = module_cls(module_item)
             module.owner = fit
             module_id = f"mod-{idx}"
@@ -1355,11 +1353,11 @@ class RuntimeFromEftFactory:
             group_name = (module_item.group.name or "").lower()
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
             if self._is_weapon_like_group(group_name) and not charge_name:
-                raise ValueError(f"武器缺少可解析弹药：{spec.module_name}")
+                raise UserFacingError("Weapon has no resolvable ammo: {name}", name=spec.module_name)
             if charge_name:
                 charge_item = self._pyfa.get_item(self._pyfa.resolve_type_name(charge_name))
                 if charge_item is None:
-                    raise ValueError(f"pyfa charge not found: {charge_name}")
+                    raise UserFacingError("Charge not found in pyfa: {name}", name=charge_name)
                 module.charge = charge_item
 
             default_runtime_state = "ONLINE" if default_online else ("ACTIVE" if self._is_weapon_like_group(group_name) else "ONLINE")
@@ -1883,7 +1881,7 @@ class RuntimeFromEftFactory:
 
     def build(self, parsed: ParsedEftFit) -> tuple[FitRuntime, FitDescriptor]:
         if not self._pyfa.available:
-            raise ValueError("pyfa static database unavailable")
+            raise UserFacingError("pyfa Fit calculation chain is unavailable.")
 
         cached_runtime = self._runtime_cache.get(parsed.fit_key)
         cached_fit = self._fit_cache.get(parsed.fit_key)
@@ -1903,7 +1901,7 @@ class RuntimeFromEftFactory:
         self.build(parsed)
         cached = self._profile_cache.get(parsed.fit_key)
         if cached is None:
-            raise ValueError("missing cached fit profile")
+            raise UserFacingError("Missing cached pyfa profile result.")
         return replace(cached)
 
     @property
@@ -2325,7 +2323,7 @@ def _copy_fitted_modules_from_template(
 ) -> list[tuple[ParsedModuleSpec, Any, str | None]]:
     fit_modules = list(cast(list[Any], fit.modules))
     if len(parsed.module_specs) != len(fit_modules) or len(parsed.module_specs) != len(charge_names):
-        raise ValueError("pyfa fit template/module mismatch")
+        raise UserFacingError("pyfa fit template/module mismatch.")
     return [
         (spec, fitted_module, charge_name)
         for spec, fitted_module, charge_name in zip(parsed.module_specs, fit_modules, charge_names, strict=True)
@@ -2397,7 +2395,7 @@ def _ensure_precalculated_local_base_fit(
     _store_precalculated_local_base_fit(parsed, None, base_fit, fitted_modules)
     cached = _get_precalculated_local_base_fit(parsed, None)
     if cached is None:
-        raise ValueError("pyfa鏈湴鍩虹Fit缂撳瓨鏋勫缓澶辫触")
+        raise UserFacingError("pyfa local base fit cache build failed.")
     return cached
 
 
@@ -2745,44 +2743,11 @@ def _normalized_command_booster_snapshots(
     return [snap for snap in snapshots if isinstance(snap, dict)]
 
 
-def _quantize_pyfa_projection_range(distance: float) -> float:
-    safe_distance = max(0.0, float(distance or 0.0))
-    if _PYFA_PROJECTION_RANGE_BUCKET_M <= 0.0:
-        return safe_distance
-    return math.floor(safe_distance / _PYFA_PROJECTION_RANGE_BUCKET_M) * _PYFA_PROJECTION_RANGE_BUCKET_M
-
-
 def _normalized_snapshot_projection_signature(snapshot: dict[str, Any]) -> tuple[str, Any]:
-    projection_key_mode = str(snapshot.get("pyfa_projection_key_mode", "in_range") or "in_range")
-    if projection_key_mode == "exact_range":
-        try:
-            distance_signature: Any = round(
-                _quantize_pyfa_projection_range(
-                    float(snapshot.get("pyfa_projection_range", snapshot.get("projection_range", 0.0)) or 0.0)
-                ),
-                3,
-            )
-        except Exception:
-            distance_signature = 0.0
-        return "exact_range", distance_signature
-    return "in_range", None
+    return shared_normalized_snapshot_projection_signature(snapshot, bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M)
 
 
-def _normalized_projection_effect_signature(raw: Any) -> tuple[Any, ...] | None:
-    if not isinstance(raw, (tuple, list)):
-        return None
-    try:
-        return tuple(raw)
-    except Exception:
-        _rollback_pyfa_saveddata_session()
-        return None
-
-
-def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
-    direct_signature = _normalized_projection_effect_signature(snapshot.get("pyfa_projection_module_signature"))
-    if direct_signature is not None:
-        return direct_signature
-
+def _projected_snapshot_legacy_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     blueprint_raw = snapshot.get("blueprint")
     blueprint: dict[str, Any] = blueprint_raw if isinstance(blueprint_raw, dict) else {}
     state_raw = snapshot.get("state_by_module_id")
@@ -2797,12 +2762,10 @@ def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any,
     )
 
 
-def _projected_snapshot_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
-    projection_key_mode, distance_signature = _normalized_snapshot_projection_signature(snapshot)
-    return (
-        _projected_snapshot_module_signature(snapshot),
-        projection_key_mode,
-        distance_signature,
+def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    return shared_projected_snapshot_module_signature(
+        snapshot,
+        legacy_builder=_projected_snapshot_legacy_module_signature,
     )
 
 
@@ -2836,7 +2799,15 @@ def get_runtime_resolve_cache_key(
         blueprint_signature,
         _runtime_local_profile_state_signature(runtime),
         tuple(sorted(_command_snapshot_signature(snapshot) for snapshot in snapshots)),
-        tuple(sorted(_projected_snapshot_signature(snapshot) for snapshot in projected_snapshots)),
+        tuple(
+            sorted(
+                shared_projected_snapshot_list_signature(
+                    projected_snapshots,
+                    module_signature_builder=_projected_snapshot_module_signature,
+                    bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M,
+                )
+            )
+        ),
     )
 
 

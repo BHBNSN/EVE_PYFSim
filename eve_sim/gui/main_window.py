@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,7 +55,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import tr
+from ..i18n import install_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -73,6 +73,7 @@ from ..lan_commands import (
     SQUAD_FOCUS_COMMANDS,
 )
 from ..math2d import Vector2
+from ..module_control import normalize_module_manual_mode, normalize_module_target_mode, stored_module_target_mode
 from ..models import (
     CombatState,
     FitDescriptor,
@@ -89,44 +90,21 @@ from ..models import (
 from ..pyfa_bridge import PyfaBridge
 from ..sim_logging import get_sim_logger, log_sim_event
 from ..simulation_engine import SimulationEngine
+from ..timer_views import deadline_map_from_remaining_view
 from ..systems import CombatSystem
+from ..user_errors import display_user_error
+from .battle_canvas import BattleCanvas
+from .dialogs import ShipStatusDialog
+from .fleet_setup_dialog import FleetSetupDialog
+from .models import PreferencesStore, UiPreferences, UiState
+from .table_models import BlueRosterTableModel, OverviewFilterProxyModel, OverviewTableModel
 
-
-def _localize_fit_error(lang: str, error: Exception | str) -> str:
-    msg = str(error).strip()
-
-    def tail(text: str) -> str:
-        return text.split("：", 1)[1].strip() if "：" in text else ""
-
-    if msg.startswith("pyfa Fit计算链不可用"):
-        return tr(lang, "err_pyfa_chain_unavailable")
-    if msg.startswith("pyfa Fit计算链初始化不完整"):
-        return tr(lang, "err_pyfa_chain_incomplete")
-    if msg.startswith("pyfa中未找到舰船"):
-        return tr(lang, "err_pyfa_ship_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到模块"):
-        return tr(lang, "err_pyfa_module_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到弹药"):
-        return tr(lang, "err_pyfa_charge_not_found", name=tail(msg))
-    if msg.startswith("武器缺少可解析弹药"):
-        return tr(lang, "err_weapon_no_ammo", name=tail(msg))
-    if msg.startswith("弹药与武器口径/类型不匹配"):
-        return tr(lang, "err_ammo_mismatch", detail=tail(msg))
-    return msg
-
-
-
-from .models import *
-from .table_models import *
-from .dialogs import *
-from .fleet_setup_dialog import *
-from .battle_canvas import *
 class MainWindow(QMainWindow):
     """
-    主窗口类 (Main Window)
+    涓荤獥鍙ｇ被 (Main Window)
     
-    该类负责组织整个应用的图形界面 (GUI)，连接各个子模块 (如概览面板、战斗画布等)，
-    并管理其生命周期。
+    璇ョ被璐熻矗缁勭粐鏁翠釜搴旂敤鐨勫浘褰㈢晫闈?(GUI)锛岃繛鎺ュ悇涓瓙妯″潡 (濡傛瑙堥潰鏉裤€佹垬鏂楃敾甯冪瓑)锛?
+    骞剁鐞嗗叾鐢熷懡鍛ㄦ湡銆?
     """
     def __init__(
         self,
@@ -167,6 +145,7 @@ class MainWindow(QMainWindow):
         self._seed_ship_initial_fit_keys()
         self.store = PreferencesStore()
         self.prefs = self.store.load()
+        install_language(self.current_language())
         if self.prefs.filter_team in ("BLUE", "RED"):
             if self.prefs.filter_team == self.controlled_team.value:
                 self.prefs.filter_team = "FRIENDLY"
@@ -179,7 +158,7 @@ class MainWindow(QMainWindow):
         self._initialize_deployment_state()
 
         self.ui_state = UiState(selected_squad=self.prefs.selected_squad, selected_enemy_target=None)
-        self.setWindowTitle(tr(self.current_language(), "app_title"))
+        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'EVE SIM - Continuous Space Wargame'))
         self.resize(ui_cfg.width + 560, ui_cfg.height)
         self._ui_refresh_interval_ticks = 3
         self._overview_refresh_interval_ticks = 3
@@ -366,23 +345,6 @@ class MainWindow(QMainWindow):
         if not locked:
             self._ship_locked_module_charges.pop(ship_id, None)
 
-    @staticmethod
-    def _normalize_module_manual_mode(mode: str | None) -> str:
-        normalized = str(mode or "auto").strip().lower()
-        return normalized if normalized in {"auto", "active", "online"} else "auto"
-
-    @staticmethod
-    def _normalize_module_target_mode(mode: str | None) -> str:
-        normalized = str(mode or "auto").strip().lower()
-        return normalized if normalized in {
-            "auto",
-            "weapon_focus_prefocus",
-            "enemy_nearest",
-            "enemy_random",
-            "ally_repair_queue",
-            "ally_nearest",
-        } else "auto"
-
     def _seed_ship_initial_fit_keys(self) -> None:
         for ship in self.engine.world.ships.values():
             self._ship_initial_fit_key(ship)
@@ -422,31 +384,31 @@ class MainWindow(QMainWindow):
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return "auto"
-        return self._normalize_module_manual_mode(ship.combat.module_manual_modes.get(module_id))
+        return normalize_module_manual_mode(ship.combat.module_manual_modes.get(module_id))
 
     def _get_ship_module_target_mode(self, ship_id: str, module_id: str) -> str:
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return "auto"
-        return self._normalize_module_target_mode(ship.combat.module_target_modes.get(module_id))
+        return normalize_module_target_mode(ship.combat.module_target_modes.get(module_id))
 
     def _set_ship_module_manual_mode(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
-            return False, tr(lang, "ship_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Ship not found')
         if not self._is_ammo_configurable_team(ship.team):
-            return False, tr(lang, "status_module_mode_team_denied")
+            return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's module mode in current mode")
         if ship.runtime is None:
-            return False, tr(lang, "status_module_none")
+            return False, QCoreApplication.translate("eve_sim", '<no runtime>')
 
         module = self._find_ship_runtime_module(ship, module_id)
         if module is None:
-            return False, tr(lang, "status_lock_module_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
         if not module.can_be_active() or module.state == ModuleState.OFFLINE:
-            return False, tr(lang, "status_module_mode_unsupported")
+            return False, QCoreApplication.translate("eve_sim", 'This module does not currently support manual mode overrides')
 
-        normalized_mode = self._normalize_module_manual_mode(mode)
+        normalized_mode = normalize_module_manual_mode(mode)
         self._apply_ship_module_manual_mode(ship, module_id, normalized_mode)
         self.request_overview_refresh(force=True)
         self.canvas.update()
@@ -462,26 +424,26 @@ class MainWindow(QMainWindow):
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
-            return False, tr(lang, "ship_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Ship not found')
         if not self._is_ammo_configurable_team(ship.team):
-            return False, tr(lang, "status_module_mode_team_denied")
+            return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's module mode in current mode")
         if ship.runtime is None:
-            return False, tr(lang, "status_module_none")
+            return False, QCoreApplication.translate("eve_sim", '<no runtime>')
 
         module = self._find_ship_runtime_module(ship, module_id)
         if module is None:
-            return False, tr(lang, "status_lock_module_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
 
         metadata = self.engine.combat._module_static_metadata(module)
         valid_modes = self.engine.combat._module_target_mode_choices(module, metadata)
         if not valid_modes:
-            return False, tr(lang, "status_module_target_mode_unsupported")
+            return False, QCoreApplication.translate("eve_sim", 'This module does not currently support target rule overrides')
 
-        normalized_mode = self._normalize_module_target_mode(mode)
+        normalized_mode = normalize_module_target_mode(mode)
         if normalized_mode != "auto" and normalized_mode not in valid_modes:
-            return False, tr(lang, "status_module_target_mode_invalid")
-        default_mode = self._normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
-        applied_mode = "auto" if normalized_mode == default_mode else normalized_mode
+            return False, QCoreApplication.translate("eve_sim", 'This target rule is not valid for the current module')
+        default_mode = normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+        applied_mode = stored_module_target_mode(normalized_mode, default_mode)
 
         self._apply_ship_module_target_mode(ship, module_id, applied_mode)
         self.request_overview_refresh(force=True)
@@ -504,29 +466,29 @@ class MainWindow(QMainWindow):
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
-            return False, tr(lang, "ship_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Ship not found')
         if not self._is_ammo_configurable_team(ship.team):
-            return False, tr(lang, "status_module_mode_team_denied")
+            return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's module mode in current mode")
         if ship.runtime is None:
-            return False, tr(lang, "status_module_none")
+            return False, QCoreApplication.translate("eve_sim", '<no runtime>')
 
         source_module = self._find_ship_runtime_module(ship, module_id)
         if source_module is None:
-            return False, tr(lang, "status_lock_module_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
         if not source_module.can_be_active() or source_module.state == ModuleState.OFFLINE:
-            return False, tr(lang, "status_module_mode_unsupported")
+            return False, QCoreApplication.translate("eve_sim", 'This module does not currently support manual mode overrides')
 
         metadata = self.engine.combat._module_static_metadata(source_module)
         valid_target_modes = self.engine.combat._module_target_mode_choices(source_module, metadata)
-        normalized_mode = self._normalize_module_manual_mode(mode)
-        normalized_target_mode = self._normalize_module_target_mode(target_mode)
+        normalized_mode = normalize_module_manual_mode(mode)
+        normalized_target_mode = normalize_module_target_mode(target_mode)
         if valid_target_modes:
             if normalized_target_mode != "auto" and normalized_target_mode not in valid_target_modes:
-                return False, tr(lang, "status_module_target_mode_invalid")
+                return False, QCoreApplication.translate("eve_sim", 'This target rule is not valid for the current module')
         else:
             normalized_target_mode = "auto"
-        source_default_target_mode = self._normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
-        requested_target_mode = "auto" if normalized_target_mode == source_default_target_mode else normalized_target_mode
+        source_default_target_mode = normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+        requested_target_mode = stored_module_target_mode(normalized_target_mode, source_default_target_mode)
 
         initial_fit_key = self._ship_initial_fit_key(ship)
         updated_ship_ids: list[str] = []
@@ -544,7 +506,7 @@ class MainWindow(QMainWindow):
             candidate_metadata = self.engine.combat._module_static_metadata(target_module)
             candidate_target_modes = self.engine.combat._module_target_mode_choices(target_module, candidate_metadata)
             if candidate_target_modes:
-                candidate_default_target_mode = self._normalize_module_target_mode(
+                candidate_default_target_mode = normalize_module_target_mode(
                     getattr(candidate_metadata.decision_rule, "target_mode", "auto")
                 )
                 applied_target_mode = (
@@ -552,15 +514,14 @@ class MainWindow(QMainWindow):
                     if requested_target_mode in candidate_target_modes or requested_target_mode == "auto"
                     else "auto"
                 )
-                if applied_target_mode == candidate_default_target_mode:
-                    applied_target_mode = "auto"
+                applied_target_mode = stored_module_target_mode(applied_target_mode, candidate_default_target_mode)
                 self._apply_ship_module_target_mode(candidate, module_id, applied_target_mode)
             else:
                 self._apply_ship_module_target_mode(candidate, module_id, "auto")
             updated_ship_ids.append(candidate.ship_id)
 
         if not updated_ship_ids:
-            return False, tr(lang, "status_module_mode_sync_none")
+            return False, QCoreApplication.translate("eve_sim", 'No matching squad ships with the same initial fit could be synced')
 
         self.request_overview_refresh(force=True)
         self.canvas.update()
@@ -574,15 +535,7 @@ class MainWindow(QMainWindow):
             initial_fit_key=initial_fit_key,
             updated_ships=len(updated_ship_ids),
         )
-        return True, tr(lang, "status_module_control_sync_done", count=len(updated_ship_ids))
-
-    def _sync_ship_module_manual_mode_to_matching_squad_fit(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
-        return self._sync_ship_module_controls_to_matching_squad_fit(
-            ship_id,
-            module_id,
-            mode,
-            self._get_ship_module_target_mode(ship_id, module_id),
-        )
+        return True, QCoreApplication.translate("eve_sim", 'Synced module controls to {count} matching squad ships').format(count=len(updated_ship_ids))
 
     def _sync_manual_setup_fit_text(self, ship_id: str, fit_text: str) -> None:
         ship_ids = list(self.engine.world.ships.keys())
@@ -658,7 +611,7 @@ class MainWindow(QMainWindow):
     def _rebuild_ship_from_fit_text(self, ship_id: str, fit_text: str, lang: str) -> tuple[bool, str, object | None]:
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
-            return False, tr(lang, "ship_missing"), None
+            return False, QCoreApplication.translate("eve_sim", 'Ship not found'), None
         initial_fit_key = self._ship_initial_fit_key(ship)
         try:
             parsed = self._parser.parse(fit_text)
@@ -666,7 +619,7 @@ class MainWindow(QMainWindow):
             runtime = deepcopy(runtime_template)
             profile = self._factory.build_profile(parsed)
         except Exception as exc:
-            return False, _localize_fit_error(lang, exc), None
+            return False, display_user_error(exc), None
 
         ship.runtime = runtime
         ship.fit = fit
@@ -712,34 +665,34 @@ class MainWindow(QMainWindow):
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
-            return False, tr(lang, "ship_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Ship not found')
         if not self._is_ammo_configurable_team(ship.team):
-            return False, tr(lang, "status_lock_team_denied")
+            return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's charge in current mode")
 
         old_text = self.get_ship_fit_text(ship_id) or ""
         if not old_text.strip():
-            return False, tr(lang, "status_lock_module_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
 
         try:
             parsed_old = self._parser.parse(old_text)
         except Exception as exc:
-            return False, _localize_fit_error(lang, exc)
+            return False, display_user_error(exc)
 
         module_idx = self._module_index_from_id(module_id)
         if module_idx is None or module_idx > len(parsed_old.module_specs):
-            return False, tr(lang, "status_lock_module_missing")
+            return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
 
         spec = parsed_old.module_specs[module_idx - 1]
         ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
         if not ammo_options:
-            return False, tr(lang, "status_lock_module_not_chargeable")
+            return False, QCoreApplication.translate("eve_sim", 'Module is not charge-loadable')
 
         canonical_ammo = resolve_module_type_name(ammo_name).strip()
         if not canonical_ammo:
-            return False, tr(lang, "status_lock_ammo_invalid")
+            return False, QCoreApplication.translate("eve_sim", 'Charge does not match this module')
         option_keys = {resolve_module_type_name(opt).strip().lower() for opt in ammo_options}
         if canonical_ammo.strip().lower() not in option_keys:
-            return False, tr(lang, "status_lock_ammo_invalid")
+            return False, QCoreApplication.translate("eve_sim", 'Charge does not match this module')
 
         locked_map = self._ship_locked_module_charges.setdefault(ship_id, {})
         locked_map[module_id] = canonical_ammo
@@ -769,7 +722,7 @@ class MainWindow(QMainWindow):
 
         module_name = get_type_display_name(spec.module_name, language=lang)
         ammo_display = get_type_display_name(canonical_ammo, language=lang)
-        return True, tr(lang, "status_lock_set_done", module=module_name, ammo=ammo_display)
+        return True, QCoreApplication.translate("eve_sim", 'Locked {module} charge to {ammo}').format(module=module_name, ammo=ammo_display)
 
     def _clear_ship_module_charge_lock(self, ship_id: str, module_id: str) -> tuple[bool, str]:
         lang = self.current_language()
@@ -785,26 +738,55 @@ class MainWindow(QMainWindow):
 
         locked_map = self._ship_locked_module_charges.get(ship_id)
         if not locked_map or module_id not in locked_map:
-            return True, tr(lang, "status_lock_clear_done", module=module_label)
+            return True, QCoreApplication.translate("eve_sim", 'Unlocked charge lock for {module}').format(module=module_label)
 
         locked_map.pop(module_id, None)
         if not locked_map:
             self._ship_locked_module_charges.pop(ship_id, None)
 
-        return True, tr(lang, "status_lock_clear_done", module=module_label)
+        return True, QCoreApplication.translate("eve_sim", 'Unlocked charge lock for {module}').format(module=module_label)
 
     def current_language(self) -> str:
         lang = (self.prefs.language or "zh_CN").strip()
         return lang if lang in ("zh_CN", "en_US") else "zh_CN"
 
+    @staticmethod
+    def _language_options() -> tuple[tuple[str, str], ...]:
+        return (
+            ("简体中文", "zh_CN"),
+            ("English", "en_US"),
+        )
+
+    def _refresh_language_combo(self, selected_lang: str | None = None) -> None:
+        options = self._language_options()
+        self.lang_combo.blockSignals(True)
+        self.lang_combo.clear()
+        for label, lang_code in options:
+            self.lang_combo.addItem(label, lang_code)
+        self.lang_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        widest_label = max(
+            (self.lang_combo.fontMetrics().horizontalAdvance(label) for label, _lang_code in options),
+            default=0,
+        )
+        combo_width = max(140, widest_label + 56)
+        self.lang_combo.setMinimumContentsLength(max((len(label) for label, _lang_code in options), default=10))
+        self.lang_combo.setMinimumWidth(combo_width)
+        view = self.lang_combo.view()
+        if view is not None:
+            view.setMinimumWidth(combo_width)
+        target_lang = selected_lang if selected_lang in {"zh_CN", "en_US"} else self.current_language()
+        idx = self.lang_combo.findData(target_lang)
+        self.lang_combo.setCurrentIndex(0 if idx < 0 else idx)
+        self.lang_combo.blockSignals(False)
+
     def _create_menu(self) -> None:
         lang = self.current_language()
-        self.menu_overview = self.menuBar().addMenu(tr(lang, "tab_overview"))
-        self.act_overview_filter = QAction(tr(lang, "menu_overview_filter"), self)
+        self.menu_overview = self.menuBar().addMenu(QCoreApplication.translate("eve_sim", 'Overview'))
+        self.act_overview_filter = QAction(QCoreApplication.translate("eve_sim", 'Filters...'), self)
         self.act_overview_filter.triggered.connect(self.open_overview_options)
         self.menu_overview.addAction(self.act_overview_filter)
 
-        self.act_overview_reset = QAction(tr(lang, "menu_overview_reset"), self)
+        self.act_overview_reset = QAction(QCoreApplication.translate("eve_sim", 'Reset Filters'), self)
         self.act_overview_reset.triggered.connect(self.reset_overview_options)
         self.menu_overview.addAction(self.act_overview_reset)
 
@@ -814,7 +796,7 @@ class MainWindow(QMainWindow):
         side.setMinimumWidth(520)
 
         header = QHBoxLayout()
-        self.lbl_selected_squad = QLabel(tr(self.current_language(), "selected_squad"))
+        self.lbl_selected_squad = QLabel(QCoreApplication.translate("eve_sim", 'Selected Squad'))
         header.addWidget(self.lbl_selected_squad)
         self.squad_combo = QComboBox()
         self.squad_combo.setEditable(False)
@@ -827,18 +809,16 @@ class MainWindow(QMainWindow):
         self.btn_switch_controlled_team = QPushButton("")
         self.btn_switch_controlled_team.clicked.connect(self.toggle_local_controlled_team)
         header.addWidget(self.btn_switch_controlled_team)
-        self.lbl_language = QLabel(tr(self.current_language(), "lang_label"))
+        self.lbl_language = QLabel(QCoreApplication.translate("eve_sim", 'Language'))
         header.addWidget(self.lbl_language)
         self.lang_combo = QComboBox()
-        self.lang_combo.addItem("中文", "zh_CN")
-        self.lang_combo.addItem("English", "en_US")
-        self.lang_combo.setCurrentIndex(0 if self.current_language() == "zh_CN" else 1)
+        self._refresh_language_combo()
         self.lang_combo.currentIndexChanged.connect(self.on_language_changed)
         header.addWidget(self.lang_combo)
         side_layout.addLayout(header)
 
         leader_limit_row = QHBoxLayout()
-        self.lbl_leader_speed_limit = QLabel(tr(self.current_language(), "leader_speed_limit"))
+        self.lbl_leader_speed_limit = QLabel(QCoreApplication.translate("eve_sim", 'Leader Max Speed (0=Unlimited):'))
         leader_limit_row.addWidget(self.lbl_leader_speed_limit)
         self.spin_leader_speed_limit = QDoubleSpinBox(self)
         self.spin_leader_speed_limit.setDecimals(1)
@@ -849,15 +829,15 @@ class MainWindow(QMainWindow):
         side_layout.addLayout(leader_limit_row)
 
         buttons_top2 = QHBoxLayout()
-        self.btn_propulsion_toggle = QPushButton(tr(self.current_language(), "btn_prop_on"))
+        self.btn_propulsion_toggle = QPushButton(QCoreApplication.translate("eve_sim", 'Click to Enable Prop'))
         buttons_top2.addWidget(self.btn_propulsion_toggle)
-        self.btn_clear_focus = QPushButton(tr(self.current_language(), "btn_clear_focus"))
+        self.btn_clear_focus = QPushButton(QCoreApplication.translate("eve_sim", 'Clear Focus Targets'))
         buttons_top2.addWidget(self.btn_clear_focus)
         side_layout.addLayout(buttons_top2)
 
         ammo_layout = QVBoxLayout()
         ammo_row1 = QHBoxLayout()
-        self.lbl_freq_charge_module = QLabel(tr(self.current_language(), "freq_charge_module"))
+        self.lbl_freq_charge_module = QLabel(QCoreApplication.translate("eve_sim", 'Common Charge-Loadable Modules (all, sorted by count):'))
         ammo_row1.addWidget(self.lbl_freq_charge_module)
         self.charge_module_combo = QComboBox()
         self.charge_module_combo.setMinimumWidth(260)
@@ -865,22 +845,22 @@ class MainWindow(QMainWindow):
         ammo_layout.addLayout(ammo_row1)
 
         ammo_row2 = QHBoxLayout()
-        self.lbl_ammo = QLabel(tr(self.current_language(), "ammo"))
+        self.lbl_ammo = QLabel(QCoreApplication.translate("eve_sim", 'Ammo:'))
         ammo_row2.addWidget(self.lbl_ammo)
         self.ammo_combo = QComboBox()
         self.ammo_combo.setMinimumWidth(260)
         ammo_row2.addWidget(self.ammo_combo, 1)
-        self.apply_ammo_btn = QPushButton(tr(self.current_language(), "apply_all"))
+        self.apply_ammo_btn = QPushButton(QCoreApplication.translate("eve_sim", 'Apply to Fleet'))
         ammo_row2.addWidget(self.apply_ammo_btn)
         ammo_layout.addLayout(ammo_row2)
         side_layout.addLayout(ammo_layout)
 
         self.tabs = QTabWidget(self)
-        self.tabs.addTab(self._build_overview_tab(), tr(self.current_language(), "tab_overview"))
-        self.tabs.addTab(self._build_fleet_tab(), tr(self.current_language(), "tab_fleet"))
+        self.tabs.addTab(self._build_overview_tab(), QCoreApplication.translate("eve_sim", 'Overview'))
+        self.tabs.addTab(self._build_fleet_tab(), QCoreApplication.translate("eve_sim", 'Fleet'))
         side_layout.addWidget(self.tabs, 1)
 
-        self.status = QLabel(f"{tr(self.current_language(), 'status_prefix')}: 0")
+        self.status = QLabel(f"{QCoreApplication.translate("eve_sim", 'Tick')}: 0")
         side_layout.addWidget(self.status)
 
         self.btn_propulsion_toggle.clicked.connect(self.toggle_selected_squad_propulsion)
@@ -898,7 +878,7 @@ class MainWindow(QMainWindow):
         return self._get_team_propulsion_state(self.controlled_team, squad_id)
 
     def _team_display_text(self, team: Team) -> str:
-        return tr(self.current_language(), "status_blue" if team == Team.BLUE else "status_red")
+        return QCoreApplication.translate("eve_sim", "BLUE") if team == Team.BLUE else QCoreApplication.translate("eve_sim", "RED")
 
     def _refresh_controlled_team_widgets(self) -> None:
         if not hasattr(self, "lbl_controlled_side"):
@@ -909,15 +889,11 @@ class MainWindow(QMainWindow):
         self.btn_switch_controlled_team.setVisible(is_local_mode)
         if not is_local_mode:
             return
-        self.lbl_controlled_side.setText(tr(self.current_language(), "controlled_side"))
+        self.lbl_controlled_side.setText(QCoreApplication.translate("eve_sim", 'Controlled Side'))
         self.lbl_controlled_team_value.setText(self._team_display_text(self.controlled_team))
         next_team = Team.RED if self.controlled_team == Team.BLUE else Team.BLUE
         self.btn_switch_controlled_team.setText(
-            tr(
-                self.current_language(),
-                "btn_switch_controlled_team",
-                team=self._team_display_text(next_team),
-            )
+            QCoreApplication.translate("eve_sim", 'Switch to {team}').format(team=self._team_display_text(next_team))
         )
 
     def _clear_selected_enemy_if_not_enemy(self) -> None:
@@ -973,29 +949,31 @@ class MainWindow(QMainWindow):
         lang = str(self.lang_combo.currentData() or "zh_CN")
         self.prefs.language = lang
         self.store.save(self.prefs)
+        install_language(lang)
         self.retranslate_ui()
         self._refresh_common_charge_modules()
         self.request_overview_refresh(force=True)
 
     def retranslate_ui(self) -> None:
         lang = self.current_language()
-        self.setWindowTitle(tr(lang, "app_title"))
-        self.menu_overview.setTitle(tr(lang, "tab_overview"))
-        self.act_overview_filter.setText(tr(lang, "menu_overview_filter"))
-        self.act_overview_reset.setText(tr(lang, "menu_overview_reset"))
-        self.lbl_selected_squad.setText(tr(lang, "selected_squad"))
-        self.lbl_language.setText(tr(lang, "lang_label"))
-        self.lbl_leader_speed_limit.setText(tr(lang, "leader_speed_limit"))
-        self.btn_clear_focus.setText(tr(lang, "btn_clear_focus"))
-        self.lbl_freq_charge_module.setText(tr(lang, "freq_charge_module"))
-        self.lbl_ammo.setText(tr(lang, "ammo"))
-        self.apply_ammo_btn.setText(tr(lang, "apply_all"))
-        self.tabs.setTabText(0, tr(lang, "tab_overview"))
-        self.tabs.setTabText(1, tr(lang, "tab_fleet"))
-        self.lbl_overview_hint.setText(tr(lang, "overview_hint"))
-        self.lbl_fleet_tip.setText(tr(lang, "fleet_tip"))
-        self.lbl_target_squad.setText(tr(lang, "target_squad"))
-        self.btn_assign.setText(tr(lang, "assign_btn"))
+        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'EVE SIM - Continuous Space Wargame'))
+        self.menu_overview.setTitle(QCoreApplication.translate("eve_sim", 'Overview'))
+        self.act_overview_filter.setText(QCoreApplication.translate("eve_sim", 'Filters...'))
+        self.act_overview_reset.setText(QCoreApplication.translate("eve_sim", 'Reset Filters'))
+        self.lbl_selected_squad.setText(QCoreApplication.translate("eve_sim", 'Selected Squad'))
+        self.lbl_language.setText(QCoreApplication.translate("eve_sim", 'Language'))
+        self._refresh_language_combo(self.lang_combo.currentData())
+        self.lbl_leader_speed_limit.setText(QCoreApplication.translate("eve_sim", 'Leader Max Speed (0=Unlimited):'))
+        self.btn_clear_focus.setText(QCoreApplication.translate("eve_sim", 'Clear Focus Targets'))
+        self.lbl_freq_charge_module.setText(QCoreApplication.translate("eve_sim", 'Common Charge-Loadable Modules (all, sorted by count):'))
+        self.lbl_ammo.setText(QCoreApplication.translate("eve_sim", 'Ammo:'))
+        self.apply_ammo_btn.setText(QCoreApplication.translate("eve_sim", 'Apply to Fleet'))
+        self.tabs.setTabText(0, QCoreApplication.translate("eve_sim", 'Overview'))
+        self.tabs.setTabText(1, QCoreApplication.translate("eve_sim", 'Fleet'))
+        self.lbl_overview_hint.setText(QCoreApplication.translate("eve_sim", 'Double-click space: move there; double-click ship: continuously approach; right-click opens command menu'))
+        self.lbl_fleet_tip.setText(QCoreApplication.translate("eve_sim", 'Multi-select ships to assign squad; edit name to create squad'))
+        self.lbl_target_squad.setText(QCoreApplication.translate("eve_sim", 'Target Squad'))
+        self.btn_assign.setText(QCoreApplication.translate("eve_sim", 'Assign Selected Ships'))
         self.overview_model.notify_headers_changed()
         self.blue_roster_model.notify_headers_changed()
         self._refresh_propulsion_button_text()
@@ -1004,7 +982,7 @@ class MainWindow(QMainWindow):
     def _refresh_propulsion_button_text(self) -> None:
         active = self._get_squad_propulsion_state(self.ui_state.selected_squad)
         lang = self.current_language()
-        self.btn_propulsion_toggle.setText(tr(lang, "btn_prop_off") if active else tr(lang, "btn_prop_on"))
+        self.btn_propulsion_toggle.setText(QCoreApplication.translate("eve_sim", 'Click to Disable Prop') if active else QCoreApplication.translate("eve_sim", 'Click to Enable Prop'))
 
     def _is_ammo_configurable_team(self, team: Team) -> bool:
         if self.network_mode == "local":
@@ -1130,8 +1108,8 @@ class MainWindow(QMainWindow):
             if not ok:
                 QMessageBox.warning(
                     self,
-                    tr(lang, "ammo_title"),
-                    tr(lang, "ammo_rebuild_failed", ship=ship_id, error=message),
+                    QCoreApplication.translate("eve_sim", 'Ammo Configuration'),
+                    QCoreApplication.translate("eve_sim", 'Failed to rebuild fit for ship {ship}: {error}').format(ship=ship_id, error=display_user_error(message)),
                 )
                 continue
 
@@ -1152,12 +1130,12 @@ class MainWindow(QMainWindow):
         self.request_overview_refresh(force=True)
         self.canvas.update()
         if updated_ships <= 0:
-            QMessageBox.information(self, tr(lang, "ammo_title"), tr(lang, "ammo_no_replace"))
+            QMessageBox.information(self, QCoreApplication.translate("eve_sim", 'Ammo Configuration'), QCoreApplication.translate("eve_sim", 'No matching module entries were found in the current fleet.'))
             return
         QMessageBox.information(
             self,
-            tr(lang, "ammo_title"),
-            tr(lang, "ammo_switch_done", module=module_name, ammo=ammo_name, count=updated_ships, reload=reload_sec),
+            QCoreApplication.translate("eve_sim", 'Ammo Configuration'),
+            QCoreApplication.translate("eve_sim", 'Switched {module} to {ammo} (updated {count} ships). Battle state is preserved; effect resumes after reload {reload:.1f}s.').format(module=module_name, ammo=ammo_name, count=updated_ships, reload=reload_sec),
         )
         self._log_user_action(
             "apply_ammo",
@@ -1171,7 +1149,7 @@ class MainWindow(QMainWindow):
         page = QWidget(self)
         layout = QVBoxLayout(page)
 
-        self.lbl_overview_hint = QLabel(tr(self.current_language(), "overview_hint"))
+        self.lbl_overview_hint = QLabel(QCoreApplication.translate("eve_sim", 'Double-click space: move there; double-click ship: continuously approach; right-click opens command menu'))
         layout.addWidget(self.lbl_overview_hint)
 
         self.overview = QTableView(self)
@@ -1202,7 +1180,7 @@ class MainWindow(QMainWindow):
         page = QWidget(self)
         layout = QVBoxLayout(page)
 
-        self.lbl_fleet_tip = QLabel(tr(self.current_language(), "fleet_tip"))
+        self.lbl_fleet_tip = QLabel(QCoreApplication.translate("eve_sim", 'Multi-select ships to assign squad; edit name to create squad'))
         layout.addWidget(self.lbl_fleet_tip)
 
         self.blue_roster = QTableView(self)
@@ -1219,8 +1197,8 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.assign_squad_edit = QLineEdit(self.ui_state.selected_squad)
-        self.btn_assign = QPushButton(tr(self.current_language(), "assign_btn"))
-        self.lbl_target_squad = QLabel(tr(self.current_language(), "target_squad"))
+        self.btn_assign = QPushButton(QCoreApplication.translate("eve_sim", 'Assign Selected Ships'))
+        self.lbl_target_squad = QLabel(QCoreApplication.translate("eve_sim", 'Target Squad'))
         controls.addWidget(self.lbl_target_squad)
         controls.addWidget(self.assign_squad_edit, 1)
         controls.addWidget(self.btn_assign)
@@ -1867,15 +1845,15 @@ class MainWindow(QMainWindow):
 
         lang = self.current_language()
         menu = QMenu(self)
-        action_status = QAction(tr(lang, "menu_show_status", ship=target_id), self)
+        action_status = QAction(QCoreApplication.translate("eve_sim", 'View {ship} Status').format(ship=target_id), self)
         action_status.triggered.connect(lambda: self.show_ship_status(target_id))
         menu.addAction(action_status)
-        action_warp = QAction(tr(lang, "menu_warp_ship", squad=self.ui_state.selected_squad, ship=target_id), self)
+        action_warp = QAction(QCoreApplication.translate("eve_sim", '{squad} Warp To {ship}').format(squad=self.ui_state.selected_squad, ship=target_id), self)
         action_warp.triggered.connect(lambda: self.issue_warp_to_ship(self.ui_state.selected_squad, target_id))
         menu.addAction(action_warp)
         enemy_team = Team.RED.value if self.controlled_team == Team.BLUE else Team.BLUE.value
         if target_team == enemy_team:
-            action_focus = QAction(tr(lang, "menu_focus", squad=self.ui_state.selected_squad, ship=target_id), self)
+            action_focus = QAction(QCoreApplication.translate("eve_sim", '{squad} Focus {ship}').format(squad=self.ui_state.selected_squad, ship=target_id), self)
             action_focus.triggered.connect(lambda: self.issue_focus_target(target_id))
             menu.addAction(action_focus)
         menu.exec(self.overview.mapToGlobal(pos))
@@ -2417,17 +2395,12 @@ class MainWindow(QMainWindow):
 
             module_cycle_timers = raw.get("module_cycle_timers")
             if isinstance(module_cycle_timers, dict):
-                parsed_cycle_timers: dict[str, float] = {}
-                for module_id, timer_left in module_cycle_timers.items():
-                    mid = str(module_id)
-                    if not mid:
-                        continue
-                    try:
-                        parsed_cycle_timers[mid] = max(0.0, float(timer_left))
-                    except Exception:
-                        continue
+                parsed_cycle_timers, parsed_cycle_deadlines = deadline_map_from_remaining_view(
+                    module_cycle_timers,
+                    float(self.engine.world.now),
+                )
                 ship.combat.module_cycle_timers = parsed_cycle_timers
-                ship.combat.module_cycle_deadlines.clear()
+                ship.combat.module_cycle_deadlines = parsed_cycle_deadlines
             else:
                 ship.combat.module_cycle_timers.clear()
                 ship.combat.module_cycle_deadlines.clear()
@@ -2756,13 +2729,13 @@ class MainWindow(QMainWindow):
             if not self.lan_server.client_connected:
                 self._countdown_started_at = None
                 self._match_started = False
-                self.status.setText(f"{tr(self.current_language(), 'status_prefix')}: waiting for red client...")
+                self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: waiting for red client...")
                 self._send_host_state(countdown_left=10.0, started=False)
                 return
             if not has_remote_red:
                 self._countdown_started_at = None
                 self._match_started = False
-                self.status.setText(f"{tr(self.current_language(), 'status_prefix')}: waiting for red fleet sync...")
+                self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: waiting for red fleet sync...")
                 self._send_host_state(countdown_left=10.0, started=False)
                 return
             if not self._match_started:
@@ -2771,7 +2744,7 @@ class MainWindow(QMainWindow):
                     self._countdown_started_at = now
                 left = 10.0 - (now - self._countdown_started_at)
                 if left > 0:
-                    self.status.setText(f"{tr(self.current_language(), 'status_prefix')}: match starts in {left:.1f}s")
+                    self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: match starts in {left:.1f}s")
                     self._send_host_state(countdown_left=left, started=False)
                     return
                 self._match_started = True
@@ -2801,9 +2774,9 @@ class MainWindow(QMainWindow):
             tick = self.engine.world.tick
             total_ships = len(self.engine.world.ships)
             self.status.setText(
-                f"{tr(lang, 'status_prefix')}: {tick} | {tr(lang, 'status_ships')}: {total_ships} | "
-                f"{tr(lang, 'status_blue')}: {alive_blue} | {tr(lang, 'status_red')}: {alive_red} | "
-                f"{tr(lang, 'status_zoom')}: {self.canvas.zoom:.5f} | {tr(lang, 'status_step_ms')}: {self._step_ms_ema:.2f}"
+                f"{QCoreApplication.translate("eve_sim", 'Tick')}: {tick} | {QCoreApplication.translate("eve_sim", 'Ships')}: {total_ships} | "
+                f"{QCoreApplication.translate("eve_sim", 'BLUE')}: {alive_blue} | {QCoreApplication.translate("eve_sim", 'RED')}: {alive_red} | "
+                f"{QCoreApplication.translate("eve_sim", 'Zoom')}: {self.canvas.zoom:.5f} | {QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f}"
             )
 
         if refresh_overview:
@@ -2831,6 +2804,7 @@ class MainWindow(QMainWindow):
         if self.lan_client is not None:
             self.lan_client.close()
         super().closeEvent(event)
+
 
 
 

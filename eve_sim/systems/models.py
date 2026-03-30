@@ -1,37 +1,9 @@
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field, replace
-import math
-import logging
-import random
-import time
+from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
-
-from ..combat_control_workset import (
-    enqueue_control_signal_modules,
-    ensure_ship_module_decision_pending,
-    module_keeps_decision_pending,
-    runtime_decision_rule_groups,
-    runtime_controlled_entry_lookup,
-    runtime_controlled_module_ids,
-    ship_candidate_module_ids,
-)
-from ..fleet_setup import (
-    _module_affects_local_pyfa_profile,
-    _runtime_local_profile_state_signature,
-    get_runtime_resolve_cache_key,
-    resolve_runtime_from_pyfa_runtime,
-)
-from ..fit_runtime import EffectClass, FitRuntime, ModuleEffect, ModuleRuntime, ModuleState, ProjectedImpact, RuntimeStatEngine
-from ..math2d import Vector2
-from ..models import ShipProfile, Team
-from ..pyfa_bridge import PyfaBridge
-from ..sim_logging import log_sim_event
-from ..world import WorldState
-
+from ..fit_runtime import ModuleEffect
 
 DamageTuple = tuple[float, float, float, float]
 
@@ -55,6 +27,9 @@ _PROFILE_PASSTHROUGH_ATTRS = (
     "missile_kinetic_dps",
     "missile_explosive_dps",
     "missile_damage_reduction_factor",
+    "warp_speed_au_s",
+    "warp_capacitor_need",
+    "max_warp_distance_au",
 )
 
 _FORMULA_PROJECTED_KEYS = frozenset(
@@ -106,7 +81,6 @@ _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS = frozenset(
         "runtime_decision_rule_groups",
     }
 )
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,12 +155,45 @@ def _layer_effective_damage(dmg: DamageTuple, resonances: DamageTuple) -> float:
     )
 
 
-def _apply_damage_sequence(shield: float, armor: float, structure: float, dmg: DamageTuple, target_profile) -> tuple[float, float, float]:
+def _apply_damage_sequence(
+    shield: float,
+    armor: float,
+    structure: float,
+    dmg: DamageTuple,
+    target_profile,
+) -> tuple[float, float, float]:
     remaining = dmg
     layers = [
-        ("shield", shield, (target_profile.shield_resonance_em, target_profile.shield_resonance_thermal, target_profile.shield_resonance_kinetic, target_profile.shield_resonance_explosive)),
-        ("armor", armor, (target_profile.armor_resonance_em, target_profile.armor_resonance_thermal, target_profile.armor_resonance_kinetic, target_profile.armor_resonance_explosive)),
-        ("structure", structure, (target_profile.structure_resonance_em, target_profile.structure_resonance_thermal, target_profile.structure_resonance_kinetic, target_profile.structure_resonance_explosive)),
+        (
+            "shield",
+            shield,
+            (
+                target_profile.shield_resonance_em,
+                target_profile.shield_resonance_thermal,
+                target_profile.shield_resonance_kinetic,
+                target_profile.shield_resonance_explosive,
+            ),
+        ),
+        (
+            "armor",
+            armor,
+            (
+                target_profile.armor_resonance_em,
+                target_profile.armor_resonance_thermal,
+                target_profile.armor_resonance_kinetic,
+                target_profile.armor_resonance_explosive,
+            ),
+        ),
+        (
+            "structure",
+            structure,
+            (
+                target_profile.structure_resonance_em,
+                target_profile.structure_resonance_thermal,
+                target_profile.structure_resonance_kinetic,
+                target_profile.structure_resonance_explosive,
+            ),
+        ),
     ]
 
     new_vals = {"shield": shield, "armor": armor, "structure": structure}
@@ -206,3 +213,19 @@ def _apply_damage_sequence(shield: float, armor: float, structure: float, dmg: D
         remaining = _scale_damage(remaining, 1.0 - consumed_ratio)
 
     return new_vals["shield"], new_vals["armor"], new_vals["structure"]
+
+
+__all__ = [
+    "CycleTargetSnapshot",
+    "DamageTuple",
+    "ModuleDecisionRule",
+    "ModuleStaticMetadata",
+    "RuntimeModuleBuckets",
+    "_FORMULA_PROJECTED_KEYS",
+    "_PROFILE_PASSTHROUGH_ATTRS",
+    "_RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS",
+    "_apply_damage_sequence",
+    "_layer_effective_damage",
+    "_scale_damage",
+    "_sum_damage",
+]

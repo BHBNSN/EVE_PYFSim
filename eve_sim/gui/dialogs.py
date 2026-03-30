@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, Signal, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -58,7 +58,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import tr
+
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -75,6 +75,7 @@ from ..lan_commands import (
     SQUAD_FOCUS_COMMANDS,
 )
 from ..math2d import Vector2
+from ..module_control import effective_module_target_mode, normalize_module_manual_mode, normalize_module_target_mode
 from ..models import (
     CombatState,
     FitDescriptor,
@@ -91,34 +92,9 @@ from ..pyfa_bridge import PyfaBridge
 from ..sim_logging import get_sim_logger, log_sim_event
 from ..simulation_engine import SimulationEngine
 from ..systems import CombatSystem
-
-
-def _localize_fit_error(lang: str, error: Exception | str) -> str:
-    msg = str(error).strip()
-
-    def tail(text: str) -> str:
-        return text.split("：", 1)[1].strip() if "：" in text else ""
-
-    if msg.startswith("pyfa Fit计算链不可用"):
-        return tr(lang, "err_pyfa_chain_unavailable")
-    if msg.startswith("pyfa Fit计算链初始化不完整"):
-        return tr(lang, "err_pyfa_chain_incomplete")
-    if msg.startswith("pyfa中未找到舰船"):
-        return tr(lang, "err_pyfa_ship_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到模块"):
-        return tr(lang, "err_pyfa_module_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到弹药"):
-        return tr(lang, "err_pyfa_charge_not_found", name=tail(msg))
-    if msg.startswith("武器缺少可解析弹药"):
-        return tr(lang, "err_weapon_no_ammo", name=tail(msg))
-    if msg.startswith("弹药与武器口径/类型不匹配"):
-        return tr(lang, "err_ammo_mismatch", detail=tail(msg))
-    return msg
-
-
-
-from .models import *
-from .table_models import *
+from ..user_errors import display_user_error
+from .models import SetupRow, UiPreferences
+from .table_models import FleetSetupTableModel, SetupRowDelegate
 
 
 class _PopupAwareComboBox(QComboBox):
@@ -153,17 +129,17 @@ class FleetLibraryDialog(QDialog):
         self._parser = EftFitParser()
         self._factory = RuntimeFromEftFactory()
 
-        self.setWindowTitle(tr(lang, "fleet_lib_title"))
+        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'Fleet Library'))
         self.resize(980, 620)
 
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
-        self.lbl_fleet = QLabel(tr(lang, "fleet_lib_name"))
+        self.lbl_fleet = QLabel(QCoreApplication.translate("eve_sim", 'Fleet'))
         self.fleet_combo = QComboBox(self)
-        self.btn_new = QPushButton(tr(lang, "fleet_lib_new"))
-        self.btn_delete = QPushButton(tr(lang, "fleet_lib_delete"))
-        self.btn_save = QPushButton(tr(lang, "fleet_lib_save"))
+        self.btn_new = QPushButton(QCoreApplication.translate("eve_sim", 'New'))
+        self.btn_delete = QPushButton(QCoreApplication.translate("eve_sim", 'Delete'))
+        self.btn_save = QPushButton(QCoreApplication.translate("eve_sim", 'Save'))
         top.addWidget(self.lbl_fleet)
         top.addWidget(self.fleet_combo, 1)
         top.addWidget(self.btn_new)
@@ -183,8 +159,8 @@ class FleetLibraryDialog(QDialog):
         body.addWidget(self.table, 3)
 
         right = QVBoxLayout()
-        self.btn_add_row = QPushButton(tr(lang, "fleet_lib_add_row"))
-        self.btn_remove_row = QPushButton(tr(lang, "fleet_lib_remove_row"))
+        self.btn_add_row = QPushButton(QCoreApplication.translate("eve_sim", 'Add Ship'))
+        self.btn_remove_row = QPushButton(QCoreApplication.translate("eve_sim", 'Remove Ship'))
         right.addWidget(self.btn_add_row)
         right.addWidget(self.btn_remove_row)
         right.addStretch(1)
@@ -192,12 +168,12 @@ class FleetLibraryDialog(QDialog):
         layout.addLayout(body, 2)
 
         self.fit_editor = QPlainTextEdit(self)
-        self.fit_editor.setPlaceholderText(tr(lang, "setup_fit_placeholder"))
+        self.fit_editor.setPlaceholderText(QCoreApplication.translate("eve_sim", 'Paste EFT fit text for selected ship here'))
         layout.addWidget(self.fit_editor, 2)
 
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        actions.button(QDialogButtonBox.StandardButton.Ok).setText(tr(lang, "fleet_lib_confirm"))
-        actions.button(QDialogButtonBox.StandardButton.Cancel).setText(tr(lang, "setup_cancel"))
+        actions.button(QDialogButtonBox.StandardButton.Ok).setText(QCoreApplication.translate("eve_sim", 'OK'))
+        actions.button(QDialogButtonBox.StandardButton.Cancel).setText(QCoreApplication.translate("eve_sim", 'Cancel'))
         layout.addWidget(actions)
 
         self.fleet_combo.currentTextChanged.connect(self._on_fleet_changed)
@@ -301,7 +277,7 @@ class FleetLibraryDialog(QDialog):
             self.fit_editor.blockSignals(False)
 
     def _new_fleet(self) -> None:
-        name, ok = QInputDialog.getText(self, tr(self._lang, "fleet_lib_new"), tr(self._lang, "setup_fleet_name_label"))
+        name, ok = QInputDialog.getText(self, QCoreApplication.translate("eve_sim", 'New'), QCoreApplication.translate("eve_sim", 'Fleet Name'))
         if not ok:
             return
         fleet_name = name.strip()
@@ -310,8 +286,8 @@ class FleetLibraryDialog(QDialog):
         if fleet_name in self._templates:
             QMessageBox.warning(
                 self,
-                tr(self._lang, "fleet_lib_exists_title"),
-                tr(self._lang, "fleet_lib_exists_msg", name=fleet_name),
+                QCoreApplication.translate("eve_sim", 'Cannot Create'),
+                QCoreApplication.translate("eve_sim", "Fleet '{name}' already exists. Please use a different name.").format(name=fleet_name),
             )
             return
         self._templates[fleet_name] = []
@@ -410,7 +386,7 @@ class OverviewOptionsDialog(QDialog):
     def __init__(self, prefs: UiPreferences, lang: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._lang = lang
-        self.setWindowTitle(tr(lang, "overview_filter_title"))
+        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'Overview Filters'))
         self.setModal(True)
         self.resize(420, 220)
 
@@ -418,32 +394,32 @@ class OverviewOptionsDialog(QDialog):
         form = QFormLayout()
 
         self.filter_team = QComboBox()
-        self.filter_team.addItem(tr(lang, "filter_all"), "ALL")
-        self.filter_team.addItem(tr(lang, "filter_friendly"), "FRIENDLY")
-        self.filter_team.addItem(tr(lang, "filter_enemy_team"), "ENEMY")
+        self.filter_team.addItem(QCoreApplication.translate("eve_sim", 'All'), "ALL")
+        self.filter_team.addItem(QCoreApplication.translate("eve_sim", 'Friendly'), "FRIENDLY")
+        self.filter_team.addItem(QCoreApplication.translate("eve_sim", 'Enemy'), "ENEMY")
         team_idx = self.filter_team.findData(prefs.filter_team)
         self.filter_team.setCurrentIndex(0 if team_idx < 0 else team_idx)
 
         self.filter_role = QComboBox()
-        self.filter_role.addItem(tr(lang, "filter_all"), "ALL")
+        self.filter_role.addItem(QCoreApplication.translate("eve_sim", 'All'), "ALL")
         self.filter_role.addItem("DPS", "DPS")
         self.filter_role.addItem("LOGI", "LOGI")
         role_idx = self.filter_role.findData(prefs.filter_role)
         self.filter_role.setCurrentIndex(0 if role_idx < 0 else role_idx)
 
         self.filter_alive = QComboBox()
-        self.filter_alive.addItem(tr(lang, "filter_all"), "ALL")
-        self.filter_alive.addItem(tr(lang, "filter_alive"), "ALIVE")
-        self.filter_alive.addItem(tr(lang, "filter_destroyed"), "DESTROYED")
+        self.filter_alive.addItem(QCoreApplication.translate("eve_sim", 'All'), "ALL")
+        self.filter_alive.addItem(QCoreApplication.translate("eve_sim", 'Alive'), "ALIVE")
+        self.filter_alive.addItem(QCoreApplication.translate("eve_sim", 'Destroyed'), "DESTROYED")
         alive_idx = self.filter_alive.findData(prefs.filter_alive)
         self.filter_alive.setCurrentIndex(0 if alive_idx < 0 else alive_idx)
 
         self.filter_squad = QLineEdit(prefs.filter_squad)
 
-        form.addRow(tr(lang, "filter_team"), self.filter_team)
-        form.addRow(tr(lang, "filter_role"), self.filter_role)
-        form.addRow(tr(lang, "filter_status"), self.filter_alive)
-        form.addRow(tr(lang, "filter_squad_contains"), self.filter_squad)
+        form.addRow(QCoreApplication.translate("eve_sim", 'Team'), self.filter_team)
+        form.addRow(QCoreApplication.translate("eve_sim", 'Role'), self.filter_role)
+        form.addRow(QCoreApplication.translate("eve_sim", 'Status'), self.filter_alive)
+        form.addRow(QCoreApplication.translate("eve_sim", 'Squad Contains'), self.filter_squad)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -525,7 +501,7 @@ class ShipStatusDialog(QDialog):
         self._tab_signatures: dict[str, tuple[Any, ...] | str] = {}
         self._tab_keys = ["overview", "combat", "defense", "cap_target", "modules", "debug"]
         self._module_mode_popup_open: bool = False
-        self.setWindowTitle(f"{tr(self._language_getter(), 'ship_status_title')} - {ship_id}")
+        self.setWindowTitle(f"{QCoreApplication.translate("eve_sim", 'Ship Status')} - {ship_id}")
         self.resize(920, 720)
 
         layout = QVBoxLayout(self)
@@ -628,12 +604,12 @@ class ShipStatusDialog(QDialog):
     def _retitle_tabs(self) -> None:
         lang = self._language_getter()
         titles = [
-            tr(lang, "status_tab_overview"),
-            tr(lang, "status_tab_combat"),
-            tr(lang, "status_tab_defense"),
-            tr(lang, "status_tab_cap_target"),
-            tr(lang, "status_tab_modules"),
-            tr(lang, "status_tab_debug"),
+            QCoreApplication.translate("eve_sim", 'Overview'),
+            QCoreApplication.translate("eve_sim", 'Combat'),
+            QCoreApplication.translate("eve_sim", 'Defense'),
+            QCoreApplication.translate("eve_sim", 'Capacitor & Targeting'),
+            QCoreApplication.translate("eve_sim", 'Modules'),
+            QCoreApplication.translate("eve_sim", 'Debug'),
         ]
         for index, title in enumerate(titles):
             if index < self.tabs.count():
@@ -740,10 +716,10 @@ class ShipStatusDialog(QDialog):
 
     def _refresh_lock_controls(self) -> None:
         lang = self._language_getter()
-        self.lbl_lock_module.setText(tr(lang, "status_lock_module"))
-        self.lbl_lock_ammo.setText(tr(lang, "status_lock_ammo"))
-        self.btn_lock_apply.setText(tr(lang, "status_lock_apply"))
-        self.btn_lock_clear.setText(tr(lang, "status_lock_clear"))
+        self.lbl_lock_module.setText(QCoreApplication.translate("eve_sim", 'Lock Module'))
+        self.lbl_lock_ammo.setText(QCoreApplication.translate("eve_sim", 'Lock Charge'))
+        self.btn_lock_apply.setText(QCoreApplication.translate("eve_sim", 'Lock Current Charge'))
+        self.btn_lock_clear.setText(QCoreApplication.translate("eve_sim", 'Unlock'))
 
         fit_text = self._fit_text_getter(self.ship_id) or ""
         module_specs = self._get_module_specs_cached(fit_text)
@@ -778,7 +754,7 @@ class ShipStatusDialog(QDialog):
         self.lock_module_combo.blockSignals(True)
         self.lock_module_combo.clear()
         if not module_rows:
-            self.lock_module_combo.addItem(tr(lang, "status_lock_none"), "")
+            self.lock_module_combo.addItem(QCoreApplication.translate("eve_sim", '<No chargeable module to lock>'), "")
             self.lock_module_combo.setEnabled(False)
         else:
             self.lock_module_combo.setEnabled(True)
@@ -851,12 +827,12 @@ class ShipStatusDialog(QDialog):
             return
         ok, message = self._lock_charge_setter(self.ship_id, module_id, ammo_name)
         if ok:
-            QMessageBox.information(self, tr(lang, "ammo_title"), message)
+            QMessageBox.information(self, QCoreApplication.translate("eve_sim", 'Ammo Configuration'), message)
             self._lock_controls_signature = None
             self._tab_signatures.pop("modules", None)
             self.refresh_status(force=True)
             return
-        QMessageBox.warning(self, tr(lang, "ammo_title"), tr(lang, "status_lock_failed", error=message))
+        QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Ammo Configuration'), QCoreApplication.translate("eve_sim", 'Operation failed: {error}').format(error=display_user_error(message)))
 
     def _on_lock_clear_clicked(self) -> None:
         lang = self._language_getter()
@@ -865,12 +841,12 @@ class ShipStatusDialog(QDialog):
             return
         ok, message = self._lock_charge_clearer(self.ship_id, module_id)
         if ok:
-            QMessageBox.information(self, tr(lang, "ammo_title"), message)
+            QMessageBox.information(self, QCoreApplication.translate("eve_sim", 'Ammo Configuration'), message)
             self._lock_controls_signature = None
             self._tab_signatures.pop("modules", None)
             self.refresh_status(force=True)
             return
-        QMessageBox.warning(self, tr(lang, "ammo_title"), tr(lang, "status_lock_failed", error=message))
+        QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Ammo Configuration'), QCoreApplication.translate("eve_sim", 'Operation failed: {error}').format(error=display_user_error(message)))
 
     @staticmethod
     def _res_pct(resonance: float) -> float:
@@ -918,21 +894,15 @@ class ShipStatusDialog(QDialog):
         return ShipStatusDialog._module_has_projected_effects(module)
 
     @staticmethod
-    def _normalize_module_manual_mode(mode: str | None) -> str:
-        normalized = str(mode or "auto").strip().lower()
-        return normalized if normalized in {"auto", "active", "online"} else "auto"
-
-    @staticmethod
-    def _normalize_module_target_mode(mode: str | None) -> str:
-        normalized = str(mode or "auto").strip().lower()
-        return normalized if normalized in {
-            "auto",
-            "weapon_focus_prefocus",
-            "enemy_nearest",
-            "enemy_random",
-            "ally_repair_queue",
-            "ally_nearest",
-        } else "auto"
+    def _module_state_label(state_name: str) -> str:
+        labels = {
+            "OFFLINE": "OFFLINE",
+            "ONLINE": "ONLINE",
+            "ACTIVE": "ACTIVE",
+            "OVERHEATED": "OVERHEATED",
+            "REACTIVATING": "REACTIVATING",
+        }
+        return QCoreApplication.translate("eve_sim", labels.get(str(state_name or "").upper(), str(state_name or "ONLINE").upper()))
 
     @staticmethod
     def _module_supports_manual_mode(module: ModuleRuntime | None) -> bool:
@@ -948,44 +918,36 @@ class ShipStatusDialog(QDialog):
     @staticmethod
     def _module_manual_mode_options(lang: str) -> list[tuple[str, str]]:
         return [
-            ("auto", tr(lang, "status_module_mode_auto")),
-            ("active", tr(lang, "status_module_mode_active")),
-            ("online", tr(lang, "status_module_mode_online")),
+            ("auto", QCoreApplication.translate("eve_sim", 'Auto')),
+            ("active", QCoreApplication.translate("eve_sim", 'Activate')),
+            ("online", QCoreApplication.translate("eve_sim", 'Online')),
         ]
 
     @classmethod
     def _module_manual_mode_label(cls, lang: str, mode: str | None) -> str:
-        normalized = cls._normalize_module_manual_mode(mode)
+        normalized = normalize_module_manual_mode(mode)
         labels = dict(cls._module_manual_mode_options(lang))
         return labels.get(normalized, labels["auto"])
 
     @staticmethod
     def _module_target_mode_base_labels(lang: str) -> dict[str, str]:
         return {
-            "auto": tr(lang, "status_module_target_mode_auto"),
-            "weapon_focus_prefocus": tr(lang, "status_module_target_mode_weapon_focus_prefocus"),
-            "enemy_nearest": tr(lang, "status_module_target_mode_enemy_nearest"),
-            "enemy_random": tr(lang, "status_module_target_mode_enemy_random"),
-            "ally_repair_queue": tr(lang, "status_module_target_mode_ally_repair_queue"),
-            "ally_nearest": tr(lang, "status_module_target_mode_ally_nearest"),
+            "weapon_focus_prefocus": QCoreApplication.translate("eve_sim", 'Focus / Prefocus'),
+            "enemy_nearest": QCoreApplication.translate("eve_sim", 'Nearest Enemy'),
+            "enemy_random": QCoreApplication.translate("eve_sim", 'Random Enemy'),
+            "ally_repair_queue": QCoreApplication.translate("eve_sim", 'Repair Queue'),
+            "ally_nearest": QCoreApplication.translate("eve_sim", 'Nearest Ally'),
         }
 
     @classmethod
     def _module_target_mode_label(cls, lang: str, mode: str | None, default_mode: str | None = None) -> str:
-        normalized = cls._effective_module_target_mode(mode, default_mode)
-        normalized_default = cls._normalize_module_target_mode(default_mode)
+        normalized = effective_module_target_mode(mode, default_mode)
+        normalized_default = normalize_module_target_mode(default_mode)
         labels = cls._module_target_mode_base_labels(lang)
         if normalized == "auto" and normalized_default != "auto":
             normalized = normalized_default
-        return labels.get(normalized, labels.get(normalized_default, labels["auto"]))
-
-    @classmethod
-    def _effective_module_target_mode(cls, mode: str | None, default_mode: str | None) -> str:
-        normalized = cls._normalize_module_target_mode(mode)
-        if normalized != "auto":
-            return normalized
-        normalized_default = cls._normalize_module_target_mode(default_mode)
-        return normalized_default if normalized_default != "auto" else "auto"
+        fallback_key = normalized_default if normalized_default in labels else "enemy_nearest"
+        return labels.get(normalized, labels[fallback_key])
 
     def _module_target_mode_choices(self, module: ModuleRuntime | None) -> tuple[str, ...]:
         if module is None:
@@ -997,7 +959,7 @@ class ShipStatusDialog(QDialog):
         if module is None:
             return "auto"
         metadata = self.engine.combat._module_static_metadata(module)
-        return self._normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+        return normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
 
     def _module_target_mode_options(
         self,
@@ -1006,10 +968,10 @@ class ShipStatusDialog(QDialog):
         default_mode: str,
     ) -> list[tuple[str, str]]:
         labels = self._module_target_mode_base_labels(lang)
-        effective_default = self._effective_module_target_mode("auto", default_mode)
+        effective_default = effective_module_target_mode("auto", default_mode)
         options: list[tuple[str, str]] = []
         for mode in choices:
-            normalized = self._normalize_module_target_mode(mode)
+            normalized = normalize_module_target_mode(mode)
             if normalized == "auto":
                 continue
             options.append((normalized, labels.get(normalized, normalized)))
@@ -1050,7 +1012,7 @@ class ShipStatusDialog(QDialog):
                 ):
                     target_combo.addItem(label, mode_value)
                 selected_target_index = target_combo.findData(
-                    self._effective_module_target_mode(context.current_target_mode, context.default_target_mode)
+                    effective_module_target_mode(context.current_target_mode, context.default_target_mode)
                 )
                 if selected_target_index < 0:
                     selected_target_index = 0
@@ -1070,7 +1032,7 @@ class ShipStatusDialog(QDialog):
                 mode_combo.popup_visibility_changed.connect(self._on_module_mode_popup_visibility_changed)
                 for mode_value, label in mode_options:
                     mode_combo.addItem(label, mode_value)
-                selected_mode_index = mode_combo.findData(self._normalize_module_manual_mode(context.current_mode))
+                selected_mode_index = mode_combo.findData(normalize_module_manual_mode(context.current_mode))
                 if selected_mode_index < 0:
                     selected_mode_index = mode_combo.findData("auto")
                 mode_combo.blockSignals(True)
@@ -1085,7 +1047,7 @@ class ShipStatusDialog(QDialog):
                     mode_item.setText("")
 
             if context.can_target_override or context.can_mode_override:
-                sync_button = QPushButton(tr(lang, "status_module_mode_sync_button"), self.modules_table)
+                sync_button = QPushButton(QCoreApplication.translate("eve_sim", 'Sync'), self.modules_table)
                 sync_button.setAutoDefault(False)
                 sync_button.setDefault(False)
                 sync_button.clicked.connect(
@@ -1098,27 +1060,27 @@ class ShipStatusDialog(QDialog):
 
     def _on_module_target_mode_changed(self, module_id: str, combo: QComboBox) -> None:
         lang = self._language_getter()
-        requested_mode = self._normalize_module_target_mode(str(combo.currentData() or "auto"))
+        requested_mode = normalize_module_target_mode(str(combo.currentData() or "auto"))
         ok, message = self._module_target_mode_setter(self.ship_id, module_id, requested_mode)
         self._module_mode_popup_open = False
         if ok:
             self._tab_signatures.pop("modules", None)
             self.refresh_status(force=True)
             return
-        QMessageBox.warning(self, tr(lang, "ship_status_title"), tr(lang, "status_lock_failed", error=message))
+        QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Ship Status'), QCoreApplication.translate("eve_sim", 'Operation failed: {error}').format(error=display_user_error(message)))
         self._tab_signatures.pop("modules", None)
         self.refresh_status(force=True)
 
     def _on_module_mode_changed(self, module_id: str, combo: QComboBox) -> None:
         lang = self._language_getter()
-        requested_mode = self._normalize_module_manual_mode(str(combo.currentData() or "auto"))
+        requested_mode = normalize_module_manual_mode(str(combo.currentData() or "auto"))
         ok, message = self._module_mode_setter(self.ship_id, module_id, requested_mode)
         self._module_mode_popup_open = False
         if ok:
             self._tab_signatures.pop("modules", None)
             self.refresh_status(force=True)
             return
-        QMessageBox.warning(self, tr(lang, "ship_status_title"), tr(lang, "status_lock_failed", error=message))
+        QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Ship Status'), QCoreApplication.translate("eve_sim", 'Operation failed: {error}').format(error=display_user_error(message)))
         self._tab_signatures.pop("modules", None)
         self.refresh_status(force=True)
 
@@ -1129,21 +1091,21 @@ class ShipStatusDialog(QDialog):
         mode_combo: QComboBox | None,
     ) -> None:
         lang = self._language_getter()
-        requested_target_mode = self._normalize_module_target_mode(
+        requested_target_mode = normalize_module_target_mode(
             str(target_combo.currentData() if target_combo is not None else self._module_target_mode_getter(self.ship_id, module_id))
         )
-        requested_mode = self._normalize_module_manual_mode(
+        requested_mode = normalize_module_manual_mode(
             str(mode_combo.currentData() if mode_combo is not None else self._module_mode_getter(self.ship_id, module_id))
         )
         ok, message = self._module_control_sync_setter(self.ship_id, module_id, requested_mode, requested_target_mode)
         self._module_mode_popup_open = False
         if ok:
             if message:
-                QMessageBox.information(self, tr(lang, "ship_status_title"), message)
+                QMessageBox.information(self, QCoreApplication.translate("eve_sim", 'Ship Status'), message)
             self._tab_signatures.pop("modules", None)
             self.refresh_status(force=True)
             return
-        QMessageBox.warning(self, tr(lang, "ship_status_title"), tr(lang, "status_lock_failed", error=message))
+        QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Ship Status'), QCoreApplication.translate("eve_sim", 'Operation failed: {error}').format(error=display_user_error(message)))
         self._tab_signatures.pop("modules", None)
         self.refresh_status(force=True)
 
@@ -1209,7 +1171,7 @@ class ShipStatusDialog(QDialog):
     def _format_ship_id_summary(lang: str, ship_ids: list[str]) -> str:
         normalized = sorted(str(ship_id) for ship_id in ship_ids if str(ship_id).strip())
         if not normalized:
-            return tr(lang, "status_target_none")
+            return QCoreApplication.translate("eve_sim", 'None')
         return ", ".join(normalized)
 
     @staticmethod
@@ -1223,7 +1185,7 @@ class ShipStatusDialog(QDialog):
             if str(ship_id).strip() and max(0.0, float(remaining)) > 0.0
         ]
         if not normalized:
-            return tr(lang, "status_target_none")
+            return QCoreApplication.translate("eve_sim", 'None')
         normalized.sort(key=lambda item: (item[1], item[0]))
         return ", ".join(f"{ship_id} ({remaining:.1f}s)" for ship_id, remaining in normalized)
 
@@ -1343,7 +1305,7 @@ class ShipStatusDialog(QDialog):
 
         remaining = max(0.0, float(module.charge_remaining))
         capacity = max(0, int(module.charge_capacity))
-        return f" | {tr(lang, 'status_charge')}={self._fmt_charge_amount(remaining)}/{capacity}"
+        return f" | {QCoreApplication.translate("eve_sim", 'Charge')}={self._fmt_charge_amount(remaining)}/{capacity}"
 
     def _format_module_time_status(
         self,
@@ -1356,7 +1318,7 @@ class ShipStatusDialog(QDialog):
         cooldown_left = max(0.0, float(cooldown_left))
         if cooldown_left > 0.0:
             delay_total = self._module_reactivation_delay(module)
-            return f" | {tr(lang, 'status_reactivation_time')}={self._fmt_time_pair(cooldown_left, delay_total)}"
+            return f" | {QCoreApplication.translate("eve_sim", 'Reactivation Time')}={self._fmt_time_pair(cooldown_left, delay_total)}"
 
         reloading_left = max(
             0.0,
@@ -1364,13 +1326,13 @@ class ShipStatusDialog(QDialog):
         )
         if reloading_left > 0.0:
             reload_total = max(0.0, float(module.charge_reload_time))
-            return f" | {tr(lang, 'status_reload_time')}={self._fmt_time_pair(reloading_left, reload_total)}"
+            return f" | {QCoreApplication.translate("eve_sim", 'Reload Time')}={self._fmt_time_pair(reloading_left, reload_total)}"
 
         if str(effective_state).upper() == "ACTIVE":
             cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0))
             if cycle_left > 0.0:
                 cycle_total = self._module_cycle_time(module)
-                return f" | {tr(lang, 'status_cycle_time')}={self._fmt_time_pair(cycle_left, cycle_total)}"
+                return f" | {QCoreApplication.translate("eve_sim", 'Cycle Time')}={self._fmt_time_pair(cycle_left, cycle_total)}"
 
         return ""
 
@@ -1381,31 +1343,31 @@ class ShipStatusDialog(QDialog):
             if remaining > 0.0:
                 active_sources.append((str(source_id), remaining))
         if not active_sources:
-            return tr(lang, "status_ecm_none")
+            return QCoreApplication.translate("eve_sim", 'None')
         active_sources.sort(key=lambda item: item[1], reverse=True)
         return ", ".join(f"{source_id}({remaining:.1f}s)" for source_id, remaining in active_sources)
 
     def _format_ecm_attempt_status(self, lang: str, ship, now: float) -> str:
         target_id = str(ship.combat.ecm_last_attempt_target or "").strip()
         if not target_id:
-            return tr(lang, "status_ecm_attempt_none")
+            return QCoreApplication.translate("eve_sim", 'No Attempts')
 
         module_id = str(ship.combat.ecm_last_attempt_module or "").strip()
         success = ship.combat.ecm_last_attempt_success
         if success is True:
-            result_label = tr(lang, "status_ecm_result_success")
+            result_label = QCoreApplication.translate("eve_sim", 'Success')
         elif success is False:
-            result_label = tr(lang, "status_ecm_result_failed")
+            result_label = QCoreApplication.translate("eve_sim", 'Failed')
         else:
-            result_label = tr(lang, "status_ecm_result_unknown")
+            result_label = QCoreApplication.translate("eve_sim", 'Unknown')
 
         chance = max(0.0, min(1.0, float(ship.combat.ecm_last_attempt_chance or 0.0)))
         raw_last_attempt_at = ship.combat.ecm_last_attempt_at
         age = max(0.0, now - float(raw_last_attempt_at if raw_last_attempt_at is not None else -1e9))
         head = f"{module_id} -> {target_id}" if module_id else target_id
         return (
-            f"{head} | {result_label} | {tr(lang, 'status_ecm_chance')}={chance * 100.0:.1f}% | "
-            f"{tr(lang, 'status_ecm_elapsed')}={age:.1f}s"
+            f"{head} | {result_label} | {QCoreApplication.translate("eve_sim", 'Chance')}={chance * 100.0:.1f}% | "
+            f"{QCoreApplication.translate("eve_sim", 'Ago')}={age:.1f}s"
         )
 
     def _format_ecm_cycle_result_for_module(self, lang: str, ship, module_id: str, target_id: str | None) -> str:
@@ -1416,8 +1378,8 @@ class ShipStatusDialog(QDialog):
         shown_target = str(target_id or "").strip()
         if shown_target and module_target and shown_target != module_target:
             return ""
-        result_label = tr(lang, "status_ecm_result_success") if success else tr(lang, "status_ecm_result_failed")
-        return f" | {tr(lang, 'status_ecm_cycle_result')}={result_label}"
+        result_label = QCoreApplication.translate("eve_sim", 'Success') if success else QCoreApplication.translate("eve_sim", 'Failed')
+        return f" | {QCoreApplication.translate("eve_sim", 'ECM This Cycle')}={result_label}"
 
     def _stable_profile(self, ship):
         if ship.runtime is None:
@@ -1498,7 +1460,7 @@ class ShipStatusDialog(QDialog):
         cooldown_left = max(0.0, float(cooldown_left))
         if cooldown_left > 0.0:
             delay_total = self._module_reactivation_delay(module)
-            return f"{tr(lang, 'status_reactivation_time')} {self._fmt_time_pair(cooldown_left, delay_total)}"
+            return f"{QCoreApplication.translate("eve_sim", 'Reactivation Time')} {self._fmt_time_pair(cooldown_left, delay_total)}"
 
         reloading_left = max(
             0.0,
@@ -1506,13 +1468,13 @@ class ShipStatusDialog(QDialog):
         )
         if reloading_left > 0.0:
             reload_total = max(0.0, float(module.charge_reload_time))
-            return f"{tr(lang, 'status_reload_time')} {self._fmt_time_pair(reloading_left, reload_total)}"
+            return f"{QCoreApplication.translate("eve_sim", 'Reload Time')} {self._fmt_time_pair(reloading_left, reload_total)}"
 
         if str(effective_state).upper() == "ACTIVE":
             cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(module.module_id, 0.0) or 0.0))
             if cycle_left > 0.0:
                 cycle_total = self._module_cycle_time(module)
-                return f"{tr(lang, 'status_cycle_time')} {self._fmt_time_pair(cycle_left, cycle_total)}"
+                return f"{QCoreApplication.translate("eve_sim", 'Cycle Time')} {self._fmt_time_pair(cycle_left, cycle_total)}"
 
         return "-"
 
@@ -1565,9 +1527,9 @@ class ShipStatusDialog(QDialog):
                     state_key = self._display_module_state(runtime_module, state_key, current_target_id)
                     cooldown_left = reactivation_by_module.get(runtime_module.module_id, 0.0)
                     if cooldown_left > 0.0:
-                        state_label = tr(lang, "state_REACTIVATING")
+                        state_label = self._module_state_label("REACTIVATING")
                     else:
-                        state_label = tr(lang, f"state_{state_key}")
+                        state_label = self._module_state_label(state_key)
                     charge_label = (
                         f"{self._fmt_charge_amount(runtime_module.charge_remaining)}/{int(runtime_module.charge_capacity)}"
                         if int(runtime_module.charge_capacity) > 0
@@ -1575,11 +1537,11 @@ class ShipStatusDialog(QDialog):
                     )
                     timer_label = self._module_timer_label(lang, ship, runtime_module, state_key, cooldown_left)
                     if has_projected and not is_area_effect:
-                        target_label = str(projected_by_slot.get(idx) or tr(lang, "status_target_none"))
+                        target_label = str(projected_by_slot.get(idx) or QCoreApplication.translate("eve_sim", 'None'))
                     elif self._is_weapon_group(runtime_module.group):
-                        target_label = str(ship.combat.current_target or tr(lang, "status_target_none"))
+                        target_label = str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))
                 else:
-                    state_label = tr(lang, f"state_{state_key}")
+                    state_label = self._module_state_label(state_key)
                 self._module_control_row_contexts.append(
                     _ModuleControlRowContext(
                         module_id=str(runtime_module.module_id) if runtime_module is not None else "",
@@ -1602,7 +1564,7 @@ class ShipStatusDialog(QDialog):
                         timer_label,
                         target_mode_label,
                         manual_mode,
-                        tr(lang, "status_module_mode_sync_button") if (can_target_override or can_mode_override) else "-",
+                        QCoreApplication.translate("eve_sim", 'Sync') if (can_target_override or can_mode_override) else "-",
                     )
                 )
             return rows
@@ -1611,7 +1573,7 @@ class ShipStatusDialog(QDialog):
             self._module_control_row_contexts = [
                 _ModuleControlRowContext("", False, "auto", tuple(), "auto", False, "auto")
             ]
-            return [(tr(lang, "status_module_none"), "-", "-", "-", "-", "-", "-", "-", "-", "-")]
+            return [(QCoreApplication.translate("eve_sim", '<no runtime>'), "-", "-", "-", "-", "-", "-", "-", "-", "-")]
 
         ordered_modules = sorted(
             ship.runtime.modules,
@@ -1630,13 +1592,13 @@ class ShipStatusDialog(QDialog):
             effective_state = self._display_module_state(module, module.normalized_state().value, current_target_id)
             cooldown_left = reactivation_by_module.get(module.module_id, 0.0)
             if cooldown_left > 0.0:
-                state_label = tr(lang, "state_REACTIVATING")
+                state_label = self._module_state_label("REACTIVATING")
             else:
-                state_label = tr(lang, f"state_{effective_state}")
+                state_label = self._module_state_label(effective_state)
             if has_projected and not is_area_effect:
-                target_label = str(projected_by_module.get(module.module_id) or tr(lang, "status_target_none"))
+                target_label = str(projected_by_module.get(module.module_id) or QCoreApplication.translate("eve_sim", 'None'))
             elif self._is_weapon_group(module.group):
-                target_label = str(ship.combat.current_target or tr(lang, "status_target_none"))
+                target_label = str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))
             can_mode_override = self._module_supports_manual_mode(module)
             target_mode_choices = self._module_target_mode_choices(module)
             can_target_override = bool(target_mode_choices)
@@ -1679,7 +1641,7 @@ class ShipStatusDialog(QDialog):
                     self._module_timer_label(lang, ship, module, effective_state, cooldown_left),
                     target_mode_label,
                     manual_mode,
-                    tr(lang, "status_module_mode_sync_button") if (can_target_override or can_mode_override) else "-",
+                    QCoreApplication.translate("eve_sim", 'Sync') if (can_target_override or can_mode_override) else "-",
                 )
             )
         return rows
@@ -1689,24 +1651,24 @@ class ShipStatusDialog(QDialog):
         hp_cur = ship.vital.shield + ship.vital.armor + ship.vital.structure
         hp_max = ship.vital.shield_max + ship.vital.armor_max + ship.vital.structure_max
         rows = [
-            (tr(lang, "status_ship"), ship.ship_id),
-            (tr(lang, "status_type"), get_type_display_name(ship.fit.ship_name, language=lang)),
-            (tr(lang, "status_team_squad"), f"{ship.team.value} / {ship.squad_id}"),
-            (tr(lang, "status_alive"), str(bool(ship.vital.alive))),
-            (tr(lang, "status_backend"), get_fit_backend_status()),
-            (tr(lang, "status_speed"), f"{ship.nav.velocity.length():.1f} / {profile.max_speed:.1f} m/s"),
-            (tr(lang, "status_facing"), f"{ship.nav.facing_deg:.1f} deg"),
-            (tr(lang, "status_hp"), f"{hp_cur:.1f} / {hp_max:.1f} ({hp_cur / max(1.0, hp_max) * 100.0:.1f}%)"),
+            (QCoreApplication.translate("eve_sim", 'Ship'), ship.ship_id),
+            (QCoreApplication.translate("eve_sim", 'Ship Type (DB)'), get_type_display_name(ship.fit.ship_name, language=lang)),
+            (QCoreApplication.translate("eve_sim", 'Team/Squad'), f"{ship.team.value} / {ship.squad_id}"),
+            (QCoreApplication.translate("eve_sim", 'Alive'), str(bool(ship.vital.alive))),
+            (QCoreApplication.translate("eve_sim", 'Backend'), get_fit_backend_status()),
+            (QCoreApplication.translate("eve_sim", 'Speed'), f"{ship.nav.velocity.length():.1f} / {profile.max_speed:.1f} m/s"),
+            (QCoreApplication.translate("eve_sim", 'Facing'), f"{ship.nav.facing_deg:.1f} deg"),
+            (QCoreApplication.translate("eve_sim", 'HP'), f"{hp_cur:.1f} / {hp_max:.1f} ({hp_cur / max(1.0, hp_max) * 100.0:.1f}%)"),
             (
-                tr(lang, "status_cap"),
+                QCoreApplication.translate("eve_sim", 'Cap'),
                 f"{ship.vital.cap:.1f} / {ship.vital.cap_max:.1f} ({ship.vital.cap / max(1.0, ship.vital.cap_max) * 100.0:.1f}%)",
             ),
-            (tr(lang, "status_target"), str(ship.combat.current_target or tr(lang, "status_target_none"))),
-            (tr(lang, "status_locked_targets"), f"{len(ship.combat.lock_targets)} / {max(0, int(profile.max_locked_targets))}"),
-            (tr(lang, "status_ecm_incoming"), self._format_ecm_incoming_status(lang, ship, float(self.engine.world.now))),
-            (tr(lang, "status_ecm_last_attempt"), self._format_ecm_attempt_status(lang, ship, float(self.engine.world.now))),
+            (QCoreApplication.translate("eve_sim", 'Target'), str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))),
+            (QCoreApplication.translate("eve_sim", 'Locked Targets'), f"{len(ship.combat.lock_targets)} / {max(0, int(profile.max_locked_targets))}"),
+            (QCoreApplication.translate("eve_sim", 'Incoming ECM'), self._format_ecm_incoming_status(lang, ship, float(self.engine.world.now))),
+            (QCoreApplication.translate("eve_sim", 'Last ECM Attempt'), self._format_ecm_attempt_status(lang, ship, float(self.engine.world.now))),
         ]
-        headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        headers = (QCoreApplication.translate("eve_sim", 'Metric'), QCoreApplication.translate("eve_sim", 'Value'))
         signature = self._table_signature(rows, headers)
         if not force and self._tab_signatures.get("overview") == signature:
             return
@@ -1717,23 +1679,23 @@ class ShipStatusDialog(QDialog):
         profile = self._stable_profile(ship)
         shield_rep_ps, armor_rep_ps, cap_warfare_ps = self._support_projection_summary(ship.runtime)
         rows = [
-            (tr(lang, "status_dps"), f"{profile.dps:.2f}"),
-            (tr(lang, "status_dph"), f"{profile.volley:.2f}"),
-            (tr(lang, "status_turret_dps"), f"{profile.turret_dps:.2f}"),
-            (tr(lang, "status_missile_dps"), f"{profile.missile_dps:.2f}"),
-            (tr(lang, "status_optimal"), self._fmt_distance(profile.optimal)),
-            (tr(lang, "status_falloff_short"), self._fmt_distance(profile.falloff)),
-            (tr(lang, "status_tracking_short"), f"{profile.tracking:.4f}"),
-            (tr(lang, "status_optimal_sig"), f"{profile.optimal_sig:.1f} m"),
-            (tr(lang, "status_missile_range"), self._fmt_distance(profile.missile_max_range)),
-            (tr(lang, "status_explosion_radius"), f"{profile.missile_explosion_radius:.1f} m"),
-            (tr(lang, "status_explosion_velocity"), f"{profile.missile_explosion_velocity:.1f} m/s"),
-            (tr(lang, "status_damage_split"), self._damage_split(profile)),
-            (tr(lang, "status_remote_shield_rep_ps"), self._fmt_rate(shield_rep_ps, "HP")),
-            (tr(lang, "status_remote_armor_rep_ps"), self._fmt_rate(armor_rep_ps, "HP")),
-            (tr(lang, "status_cap_warfare_ps"), self._fmt_rate(cap_warfare_ps, "GJ")),
+            (QCoreApplication.translate("eve_sim", 'DPS'), f"{profile.dps:.2f}"),
+            (QCoreApplication.translate("eve_sim", 'DPH'), f"{profile.volley:.2f}"),
+            (QCoreApplication.translate("eve_sim", 'Turret DPS'), f"{profile.turret_dps:.2f}"),
+            (QCoreApplication.translate("eve_sim", 'Missile DPS'), f"{profile.missile_dps:.2f}"),
+            (QCoreApplication.translate("eve_sim", 'Optimal'), self._fmt_distance(profile.optimal)),
+            (QCoreApplication.translate("eve_sim", 'Falloff'), self._fmt_distance(profile.falloff)),
+            (QCoreApplication.translate("eve_sim", 'Tracking'), f"{profile.tracking:.4f}"),
+            (QCoreApplication.translate("eve_sim", 'Optimal Sig'), f"{profile.optimal_sig:.1f} m"),
+            (QCoreApplication.translate("eve_sim", 'Missile Range'), self._fmt_distance(profile.missile_max_range)),
+            (QCoreApplication.translate("eve_sim", 'Explosion Radius'), f"{profile.missile_explosion_radius:.1f} m"),
+            (QCoreApplication.translate("eve_sim", 'Explosion Velocity'), f"{profile.missile_explosion_velocity:.1f} m/s"),
+            (QCoreApplication.translate("eve_sim", 'Damage Split'), self._damage_split(profile)),
+            (QCoreApplication.translate("eve_sim", 'Remote Shield Rep/s'), self._fmt_rate(shield_rep_ps, "HP")),
+            (QCoreApplication.translate("eve_sim", 'Remote Armor Rep/s'), self._fmt_rate(armor_rep_ps, "HP")),
+            (QCoreApplication.translate("eve_sim", 'Cap Warfare/s'), self._fmt_rate(cap_warfare_ps, "GJ")),
         ]
-        headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        headers = (QCoreApplication.translate("eve_sim", 'Metric'), QCoreApplication.translate("eve_sim", 'Value'))
         signature = self._table_signature(rows, headers)
         if not force and self._tab_signatures.get("combat") == signature:
             return
@@ -1743,15 +1705,15 @@ class ShipStatusDialog(QDialog):
     def _refresh_defense_tab(self, ship, lang: str, force: bool) -> None:
         profile = self._stable_profile(ship)
         summary_rows = [
-            (tr(lang, "status_shield"), f"{ship.vital.shield:.1f} / {ship.vital.shield_max:.1f}"),
-            (tr(lang, "status_armor"), f"{ship.vital.armor:.1f} / {ship.vital.armor_max:.1f}"),
-            (tr(lang, "status_structure"), f"{ship.vital.structure:.1f} / {ship.vital.structure_max:.1f}"),
-            (tr(lang, "status_total_raw_hp"), f"{profile.shield_hp + profile.armor_hp + profile.structure_hp:.1f}"),
-            (tr(lang, "status_total_ehp"), f"{self._total_omni_ehp(profile):.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Shield'), f"{ship.vital.shield:.1f} / {ship.vital.shield_max:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Armor'), f"{ship.vital.armor:.1f} / {ship.vital.armor_max:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Structure'), f"{ship.vital.structure:.1f} / {ship.vital.structure_max:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Total Raw HP'), f"{profile.shield_hp + profile.armor_hp + profile.structure_hp:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Total Omni EHP'), f"{self._total_omni_ehp(profile):.1f}"),
         ]
         resistance_rows = [
             (
-                tr(lang, "status_shield"),
+                QCoreApplication.translate("eve_sim", 'Shield'),
                 self._fmt_percent(self._res_pct(profile.shield_resonance_em)),
                 self._fmt_percent(self._res_pct(profile.shield_resonance_thermal)),
                 self._fmt_percent(self._res_pct(profile.shield_resonance_kinetic)),
@@ -1759,7 +1721,7 @@ class ShipStatusDialog(QDialog):
                 f"{self._layer_omni_ehp(profile.shield_hp, (profile.shield_resonance_em, profile.shield_resonance_thermal, profile.shield_resonance_kinetic, profile.shield_resonance_explosive)):.1f}",
             ),
             (
-                tr(lang, "status_armor"),
+                QCoreApplication.translate("eve_sim", 'Armor'),
                 self._fmt_percent(self._res_pct(profile.armor_resonance_em)),
                 self._fmt_percent(self._res_pct(profile.armor_resonance_thermal)),
                 self._fmt_percent(self._res_pct(profile.armor_resonance_kinetic)),
@@ -1767,7 +1729,7 @@ class ShipStatusDialog(QDialog):
                 f"{self._layer_omni_ehp(profile.armor_hp, (profile.armor_resonance_em, profile.armor_resonance_thermal, profile.armor_resonance_kinetic, profile.armor_resonance_explosive)):.1f}",
             ),
             (
-                tr(lang, "status_structure"),
+                QCoreApplication.translate("eve_sim", 'Structure'),
                 self._fmt_percent(self._res_pct(profile.structure_resonance_em)),
                 self._fmt_percent(self._res_pct(profile.structure_resonance_thermal)),
                 self._fmt_percent(self._res_pct(profile.structure_resonance_kinetic)),
@@ -1775,8 +1737,8 @@ class ShipStatusDialog(QDialog):
                 f"{self._layer_omni_ehp(profile.structure_hp, (profile.structure_resonance_em, profile.structure_resonance_thermal, profile.structure_resonance_kinetic, profile.structure_resonance_explosive)):.1f}",
             ),
         ]
-        summary_headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
-        resistance_headers = (tr(lang, "status_layer"), "EM", "TH", "KI", "EX", tr(lang, "status_omni_ehp"))
+        summary_headers = (QCoreApplication.translate("eve_sim", 'Metric'), QCoreApplication.translate("eve_sim", 'Value'))
+        resistance_headers = (QCoreApplication.translate("eve_sim", 'Layer'), "EM", "TH", "KI", "EX", QCoreApplication.translate("eve_sim", 'Omni EHP'))
         signature = (
             self._table_signature(summary_rows, summary_headers),
             self._table_signature(resistance_rows, resistance_headers),
@@ -1796,29 +1758,29 @@ class ShipStatusDialog(QDialog):
         ]
         locked_by_text, locking_by_text = self._incoming_lock_status(ship, lang)
         capacitor_rows = [
-            (tr(lang, "status_cap"), f"{ship.vital.cap:.1f} / {ship.vital.cap_max:.1f}"),
-            (tr(lang, "status_cap_peak_recharge"), f"{self._peak_cap_recharge(profile):.2f} GJ/s"),
-            (tr(lang, "status_cap_recharge_time"), f"{profile.cap_recharge_time:.2f}s"),
-            (tr(lang, "status_cap_resistance"), self._fmt_percent((1.0 - float(profile.energy_warfare_resistance or 1.0)) * 100.0)),
+            (QCoreApplication.translate("eve_sim", 'Cap'), f"{ship.vital.cap:.1f} / {ship.vital.cap_max:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Peak Recharge'), f"{self._peak_cap_recharge(profile):.2f} GJ/s"),
+            (QCoreApplication.translate("eve_sim", 'Recharge Time'), f"{profile.cap_recharge_time:.2f}s"),
+            (QCoreApplication.translate("eve_sim", 'Cap Warfare Resist'), self._fmt_percent((1.0 - float(profile.energy_warfare_resistance or 1.0)) * 100.0)),
         ]
         targeting_rows = [
-            (tr(lang, "status_targets"), str(max(0, int(profile.max_locked_targets)))),
-            (tr(lang, "status_target_range"), self._fmt_distance(profile.max_target_range)),
-            (tr(lang, "status_scan_resolution"), f"{profile.scan_resolution:.1f} mm"),
-            (tr(lang, "status_sensor_strengths"), self._sensor_strength_summary(profile)),
-            (tr(lang, "status_signature_radius"), f"{profile.sig_radius:.1f} m"),
-            (tr(lang, "status_align_time"), f"{self._align_time_for_profile(profile):.2f}s"),
-            (tr(lang, "status_mass"), f"{profile.mass:,.0f} kg"),
-            (tr(lang, "status_agility"), f"{profile.agility:.3f}"),
-            (tr(lang, "status_warp_stability"), f"{profile.warp_stability:.1f}"),
-            (tr(lang, "status_warp_scramble"), f"{profile.warp_scramble_status:.1f}"),
-            (tr(lang, "status_current_target"), str(ship.combat.current_target or tr(lang, "status_target_none"))),
-            (tr(lang, "status_locked_targets_detail"), self._format_ship_id_summary(lang, list(ship.combat.lock_targets))),
-            (tr(lang, "status_locking_targets"), self._format_lock_timer_summary(lang, outgoing_locking)),
-            (tr(lang, "status_locked_by"), locked_by_text),
-            (tr(lang, "status_locking_by"), locking_by_text),
+            (QCoreApplication.translate("eve_sim", 'Targets'), str(max(0, int(profile.max_locked_targets)))),
+            (QCoreApplication.translate("eve_sim", 'Target Range'), self._fmt_distance(profile.max_target_range)),
+            (QCoreApplication.translate("eve_sim", 'Scan Resolution'), f"{profile.scan_resolution:.1f} mm"),
+            (QCoreApplication.translate("eve_sim", 'Sensor Strengths'), self._sensor_strength_summary(profile)),
+            (QCoreApplication.translate("eve_sim", 'Signature Radius'), f"{profile.sig_radius:.1f} m"),
+            (QCoreApplication.translate("eve_sim", 'Align Time'), f"{self._align_time_for_profile(profile):.2f}s"),
+            (QCoreApplication.translate("eve_sim", 'Mass'), f"{profile.mass:,.0f} kg"),
+            (QCoreApplication.translate("eve_sim", 'Agility'), f"{profile.agility:.3f}"),
+            (QCoreApplication.translate("eve_sim", 'Warp Stability'), f"{profile.warp_stability:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Warp Scramble'), f"{profile.warp_scramble_status:.1f}"),
+            (QCoreApplication.translate("eve_sim", 'Current Target'), str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))),
+            (QCoreApplication.translate("eve_sim", 'Locked Target Details'), self._format_ship_id_summary(lang, list(ship.combat.lock_targets))),
+            (QCoreApplication.translate("eve_sim", 'Locking Targets'), self._format_lock_timer_summary(lang, outgoing_locking)),
+            (QCoreApplication.translate("eve_sim", 'Locked By'), locked_by_text),
+            (QCoreApplication.translate("eve_sim", 'Locking By'), locking_by_text),
         ]
-        headers = (tr(lang, "status_metric"), tr(lang, "status_value"))
+        headers = (QCoreApplication.translate("eve_sim", 'Metric'), QCoreApplication.translate("eve_sim", 'Value'))
         signature = (
             self._table_signature(capacitor_rows, headers),
             self._table_signature(targeting_rows, headers),
@@ -1832,16 +1794,16 @@ class ShipStatusDialog(QDialog):
     def _refresh_modules_tab(self, ship, lang: str, force: bool) -> None:
         rows = self._module_rows(ship, lang)
         headers = (
-            tr(lang, "status_col_slot"),
-            tr(lang, "status_col_module"),
-            tr(lang, "status_col_group"),
-            tr(lang, "status_col_state"),
-            tr(lang, "status_col_target"),
-            tr(lang, "status_col_charge"),
-            tr(lang, "status_col_timer"),
-            tr(lang, "status_col_target_rule"),
-            tr(lang, "status_col_mode"),
-            tr(lang, "status_col_sync"),
+            QCoreApplication.translate("eve_sim", 'Slot'),
+            QCoreApplication.translate("eve_sim", 'Module'),
+            QCoreApplication.translate("eve_sim", 'Group'),
+            QCoreApplication.translate("eve_sim", 'State'),
+            QCoreApplication.translate("eve_sim", 'Target'),
+            QCoreApplication.translate("eve_sim", 'Charge'),
+            QCoreApplication.translate("eve_sim", 'Timer'),
+            QCoreApplication.translate("eve_sim", 'Target Rule'),
+            QCoreApplication.translate("eve_sim", 'Mode'),
+            QCoreApplication.translate("eve_sim", 'Sync'),
         )
         signature = self._table_signature(rows, headers)
         if not force and self._tab_signatures.get("modules") == signature:
@@ -1860,8 +1822,8 @@ class ShipStatusDialog(QDialog):
             diagnostics["pyfa_command_boosters_count"] = len(ship.runtime.diagnostics.get("pyfa_command_boosters", []))
             diagnostics["pyfa_projected_sources_count"] = len(ship.runtime.diagnostics.get("pyfa_projected_sources", []))
         lines = [
-            f"{tr(lang, 'status_backend')}: {get_fit_backend_status()}",
-            f"{tr(lang, 'status_ship')}: {ship.ship_id}",
+            f"{QCoreApplication.translate("eve_sim", 'Backend')}: {get_fit_backend_status()}",
+            f"{QCoreApplication.translate("eve_sim", 'Ship')}: {ship.ship_id}",
             f"runtime: {'yes' if ship.runtime is not None else 'no'}",
             f"profile: dps={ship.profile.dps:.2f}, volley={ship.profile.volley:.2f}, speed={ship.profile.max_speed:.2f}",
         ]
@@ -1883,8 +1845,8 @@ class ShipStatusDialog(QDialog):
     def _clear_views_for_missing_ship(self, lang: str) -> None:
         self._clear_module_mode_widgets()
         self._module_control_row_contexts = []
-        metric_headers = [tr(lang, "status_metric"), tr(lang, "status_value")]
-        missing_rows = [(tr(lang, "ship_missing"), "-")]
+        metric_headers = [QCoreApplication.translate("eve_sim", 'Metric'), QCoreApplication.translate("eve_sim", 'Value')]
+        missing_rows = [(QCoreApplication.translate("eve_sim", 'Ship not found'), "-")]
         self._apply_table(self.overview_table, metric_headers, missing_rows)
         self._apply_table(self.combat_table, metric_headers, missing_rows)
         self._apply_table(self.defense_summary_table, metric_headers, missing_rows)
@@ -1892,30 +1854,30 @@ class ShipStatusDialog(QDialog):
         self._apply_table(self.targeting_table, metric_headers, missing_rows)
         self._apply_table(
             self.defense_resistance_table,
-            [tr(lang, "status_layer"), "EM", "TH", "KI", "EX", tr(lang, "status_omni_ehp")],
-            [(tr(lang, "ship_missing"), "-", "-", "-", "-", "-")],
+            [QCoreApplication.translate("eve_sim", 'Layer'), "EM", "TH", "KI", "EX", QCoreApplication.translate("eve_sim", 'Omni EHP')],
+            [(QCoreApplication.translate("eve_sim", 'Ship not found'), "-", "-", "-", "-", "-")],
         )
         self._apply_table(
             self.modules_table,
             [
-                tr(lang, "status_col_slot"),
-                tr(lang, "status_col_module"),
-                tr(lang, "status_col_group"),
-                tr(lang, "status_col_state"),
-                tr(lang, "status_col_target"),
-                tr(lang, "status_col_charge"),
-                tr(lang, "status_col_timer"),
-                tr(lang, "status_col_target_rule"),
-                tr(lang, "status_col_mode"),
-                tr(lang, "status_col_sync"),
+                QCoreApplication.translate("eve_sim", 'Slot'),
+                QCoreApplication.translate("eve_sim", 'Module'),
+                QCoreApplication.translate("eve_sim", 'Group'),
+                QCoreApplication.translate("eve_sim", 'State'),
+                QCoreApplication.translate("eve_sim", 'Target'),
+                QCoreApplication.translate("eve_sim", 'Charge'),
+                QCoreApplication.translate("eve_sim", 'Timer'),
+                QCoreApplication.translate("eve_sim", 'Target Rule'),
+                QCoreApplication.translate("eve_sim", 'Mode'),
+                QCoreApplication.translate("eve_sim", 'Sync'),
             ],
-            [(tr(lang, "ship_missing"), "-", "-", "-", "-", "-", "-", "-", "-", "-")],
+            [(QCoreApplication.translate("eve_sim", 'Ship not found'), "-", "-", "-", "-", "-", "-", "-", "-", "-")],
         )
-        self.info.setPlainText(tr(lang, "ship_missing"))
+        self.info.setPlainText(QCoreApplication.translate("eve_sim", 'Ship not found'))
 
     def refresh_status(self, force: bool = False) -> None:
         lang = self._language_getter()
-        self.setWindowTitle(f"{tr(lang, 'ship_status_title')} - {self.ship_id}")
+        self.setWindowTitle(f"{QCoreApplication.translate("eve_sim", 'Ship Status')} - {self.ship_id}")
         self._retitle_tabs()
         self._refresh_lock_controls_if_needed()
         ship = self.engine.world.ships.get(self.ship_id)
@@ -1937,6 +1899,7 @@ class ShipStatusDialog(QDialog):
             self._refresh_modules_tab(ship, lang, force)
         else:
             self._refresh_debug_tab(ship, lang, force)
+
 
 
 

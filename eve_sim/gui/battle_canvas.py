@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,7 +55,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import tr
+
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -90,31 +90,8 @@ from ..simulation_engine import SimulationEngine
 from ..systems import CombatSystem
 
 
-def _localize_fit_error(lang: str, error: Exception | str) -> str:
-    msg = str(error).strip()
 
-    def tail(text: str) -> str:
-        return text.split("：", 1)[1].strip() if "：" in text else ""
-
-    if msg.startswith("pyfa Fit计算链不可用"):
-        return tr(lang, "err_pyfa_chain_unavailable")
-    if msg.startswith("pyfa Fit计算链初始化不完整"):
-        return tr(lang, "err_pyfa_chain_incomplete")
-    if msg.startswith("pyfa中未找到舰船"):
-        return tr(lang, "err_pyfa_ship_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到模块"):
-        return tr(lang, "err_pyfa_module_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到弹药"):
-        return tr(lang, "err_pyfa_charge_not_found", name=tail(msg))
-    if msg.startswith("武器缺少可解析弹药"):
-        return tr(lang, "err_weapon_no_ammo", name=tail(msg))
-    if msg.startswith("弹药与武器口径/类型不匹配"):
-        return tr(lang, "err_ammo_mismatch", detail=tail(msg))
-    return msg
-
-
-
-from .models import *
+from .models import AreaCycleOverlay
 class BattleCanvas(QWidget):
     def __init__(
         self,
@@ -294,20 +271,20 @@ class BattleCanvas(QWidget):
             lang = self.language_getter()
             menu = QMenu(self)
             if clicked is not None and clicked.vital.alive:
-                action_status = QAction(tr(lang, "menu_show_status", ship=clicked.ship_id), self)
+                action_status = QAction(QCoreApplication.translate("eve_sim", 'View {ship} Status').format(ship=clicked.ship_id), self)
                 action_status.triggered.connect(lambda: self.on_show_status(clicked.ship_id))
                 menu.addAction(action_status)
-                action_warp = QAction(tr(lang, "menu_warp_ship", squad=self.selected_squad, ship=clicked.ship_id), self)
+                action_warp = QAction(QCoreApplication.translate("eve_sim", '{squad} Warp To {ship}').format(squad=self.selected_squad, ship=clicked.ship_id), self)
                 action_warp.triggered.connect(lambda: self.on_issue_warp_ship(self.selected_squad, clicked.ship_id))
                 menu.addAction(action_warp)
                 controlled_team = self.controlled_team_getter()
                 if clicked.team != controlled_team:
                     self.selected_enemy_target = clicked.ship_id
                     self.on_select_enemy(clicked.ship_id)
-                    action_focus = QAction(tr(lang, "menu_focus", squad=self.selected_squad, ship=clicked.ship_id), self)
+                    action_focus = QAction(QCoreApplication.translate("eve_sim", '{squad} Focus {ship}').format(squad=self.selected_squad, ship=clicked.ship_id), self)
                     action_focus.triggered.connect(lambda: self.on_issue_focus(clicked.ship_id))
                     menu.addAction(action_focus)
-                    action_prefocus = QAction(tr(lang, "menu_prefocus", squad=self.selected_squad, ship=clicked.ship_id), self)
+                    action_prefocus = QAction(QCoreApplication.translate("eve_sim", '{squad} Pre-focus {ship}').format(squad=self.selected_squad, ship=clicked.ship_id), self)
                     action_prefocus.triggered.connect(lambda: self.on_issue_prefocus(clicked.ship_id))
                     menu.addAction(action_prefocus)
                     focus_key = self._focus_key(controlled_team, self.selected_squad)
@@ -319,14 +296,14 @@ class BattleCanvas(QWidget):
                     prelocking = any(clicked.ship_id in timers for timers in prelock_timers_by_ship.values())
                     if in_prequeue or prelocked or prelocking:
                         action_cancel_prefocus = QAction(
-                            tr(lang, "menu_cancel_prefocus", squad=self.selected_squad, ship=clicked.ship_id),
+                            QCoreApplication.translate("eve_sim", '{squad} Cancel Pre-lock {ship}').format(squad=self.selected_squad, ship=clicked.ship_id),
                             self,
                         )
                         action_cancel_prefocus.triggered.connect(lambda: self.on_cancel_prefocus(clicked.ship_id))
                         menu.addAction(action_cancel_prefocus)
             elif clicked_beacon is not None:
                 action_warp_beacon = QAction(
-                    tr(lang, "menu_warp_beacon", squad=self.selected_squad, beacon=clicked_beacon.beacon_id),
+                    QCoreApplication.translate("eve_sim", '{squad} Warp To {beacon}').format(squad=self.selected_squad, beacon=clicked_beacon.beacon_id),
                     self,
                 )
                 action_warp_beacon.triggered.connect(lambda: self.on_issue_warp_beacon(self.selected_squad, clicked_beacon.beacon_id))
@@ -334,7 +311,7 @@ class BattleCanvas(QWidget):
                 menu.addSeparator()
 
             menu.addSeparator()
-            squad_menu = menu.addMenu(tr(lang, "menu_induce_squad_here"))
+            squad_menu = menu.addMenu(QCoreApplication.translate("eve_sim", 'Induce Squad Here'))
             squads = self.controlled_squads_getter()
             for squad_id in squads:
                 action = QAction(squad_id, self)
@@ -345,7 +322,7 @@ class BattleCanvas(QWidget):
             if not squads:
                 squad_menu.setEnabled(False)
 
-            action_induce_fleet = QAction(tr(lang, "menu_induce_fleet_here"), self)
+            action_induce_fleet = QAction(QCoreApplication.translate("eve_sim", 'Induce Fleet Here'), self)
             action_induce_fleet.triggered.connect(lambda: self.on_induce_fleet_spawn(Vector2(world_target.x, world_target.y)))
             menu.addAction(action_induce_fleet)
 
@@ -604,20 +581,21 @@ class BattleCanvas(QWidget):
             painter.drawLine(start_x, start_y, end_x, end_y)
 
         lang = self.language_getter()
-        info = tr(lang, "canvas_zoom_pan", zoom=self.zoom, x=self.pan_world.x, y=self.pan_world.y)
+        info = QCoreApplication.translate("eve_sim", 'Zoom: {zoom:.5f}  Pan: ({x:.0f}, {y:.0f})').format(zoom=self.zoom, x=self.pan_world.x, y=self.pan_world.y)
         painter.setPen(QPen(QColor(220, 220, 220), 1))
         painter.drawText(12, 20, info)
-        painter.drawText(12, 40, tr(lang, "canvas_help"))
+        painter.drawText(12, 40, QCoreApplication.translate("eve_sim", 'Left click: select friendly squad/enemy target | Double-click space: move | Double-click ship: continuous approach | Right-click menu: induce deploy/focus | Middle drag: pan | Wheel: zoom'))
 
         controlled_team = self.controlled_team_getter()
         focus_queue = list(self.engine.world.squad_focus_queues.get(self._focus_key(controlled_team, self.selected_squad), []))
-        current_focus = focus_queue[0] if focus_queue else tr(lang, "focus_none")
-        prefocus_list = ", ".join(focus_queue[1:]) if len(focus_queue) > 1 else tr(lang, "focus_none")
+        current_focus = focus_queue[0] if focus_queue else QCoreApplication.translate("eve_sim", 'None')
+        prefocus_list = ", ".join(focus_queue[1:]) if len(focus_queue) > 1 else QCoreApplication.translate("eve_sim", 'None')
         right_x = max(12, self.width() - 520)
-        painter.drawText(right_x, 20, tr(lang, "canvas_focus_current", squad=self.selected_squad, target=current_focus))
-        painter.drawText(right_x, 40, tr(lang, "canvas_focus_queue", targets=prefocus_list))
+        painter.drawText(right_x, 20, QCoreApplication.translate("eve_sim", '{squad} Current Focus: {target}').format(squad=self.selected_squad, target=current_focus))
+        painter.drawText(right_x, 40, QCoreApplication.translate("eve_sim", 'Pre-focus Queue: {targets}').format(targets=prefocus_list))
 
         painter.end()
+
 
 
 

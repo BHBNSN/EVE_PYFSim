@@ -1,53 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from collections import Counter
-from copy import deepcopy
 import hashlib
-import importlib
-import math
-import random
 import re
-from pathlib import Path
-import sqlite3
-import sys
-import types
-from typing import Any, cast
 
-from ..config import resolve_pyfa_source_dir
-
-from ..fit_runtime import (
-    EffectClass,
-    FitRuntime,
-    HullProfile,
-    ModuleEffect,
-    ModuleRuntime,
-    ModuleState,
-    SkillProfile,
-)
-from ..math2d import Vector2
-from ..models import (
-    Beacon,
-    CombatState,
-    FitDescriptor,
-    NavigationState,
-    QualityLevel,
-    QualityState,
-    ShipProfile,
-    ShipEntity,
-    Team,
-    VitalState,
-)
-from ..world import WorldState
-
-
-QUALITY_PRESETS = {
-    QualityLevel.ELITE: QualityState(QualityLevel.ELITE, reaction_delay=0.0, ignore_order_probability=0.0, formation_jitter=0.0),
-    QualityLevel.REGULAR: QualityState(QualityLevel.REGULAR, reaction_delay=0.0, ignore_order_probability=0.0, formation_jitter=0.0),
-    QualityLevel.IRREGULAR: QualityState(QualityLevel.IRREGULAR, reaction_delay=0.0, ignore_order_probability=0.0, formation_jitter=0.0),
-}
-
-from .models import *
+from ..user_errors import UserFacingError
+from .models import ParsedEftFit, ParsedModuleSpec
 
 
 class EftFitParser:
@@ -58,14 +15,14 @@ class EftFitParser:
         lines = [line.strip() for line in fit_text.splitlines()]
         lines = [line for line in lines if line]
         if not lines:
-            raise ValueError("配装文本为空")
+            raise UserFacingError("Fit text is empty.")
 
-        m = self._header_re.match(lines[0])
-        if not m:
-            raise ValueError("EFT 头格式无效，需形如 [Ship, Fit Name]")
+        match = self._header_re.match(lines[0])
+        if not match:
+            raise UserFacingError("EFT header is invalid; expected [Ship, Fit Name].")
 
-        ship_name = m.group("ship").strip()
-        fit_name = m.group("name").strip()
+        ship_name = match.group("ship").strip()
+        fit_name = match.group("name").strip()
 
         modules: list[str] = []
         module_specs: list[ParsedModuleSpec] = []
@@ -77,8 +34,7 @@ class EftFitParser:
             if raw.lower().startswith("x-"):
                 continue
             line = raw
-            is_quantity_line = " x" in line
-            if is_quantity_line:
+            if " x" in line:
                 qty_name = line.split(" x", 1)[0].strip()
                 if qty_name:
                     cargo_item_names.append(qty_name)
@@ -113,3 +69,5 @@ class EftFitParser:
             fit_key=f"eft-{fit_key}",
         )
 
+
+__all__ = ["EftFitParser"]

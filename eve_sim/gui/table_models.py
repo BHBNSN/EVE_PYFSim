@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,7 +55,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import tr
+
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -90,39 +90,16 @@ from ..simulation_engine import SimulationEngine
 from ..systems import CombatSystem
 
 
-def _localize_fit_error(lang: str, error: Exception | str) -> str:
-    msg = str(error).strip()
 
-    def tail(text: str) -> str:
-        return text.split("：", 1)[1].strip() if "：" in text else ""
-
-    if msg.startswith("pyfa Fit计算链不可用"):
-        return tr(lang, "err_pyfa_chain_unavailable")
-    if msg.startswith("pyfa Fit计算链初始化不完整"):
-        return tr(lang, "err_pyfa_chain_incomplete")
-    if msg.startswith("pyfa中未找到舰船"):
-        return tr(lang, "err_pyfa_ship_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到模块"):
-        return tr(lang, "err_pyfa_module_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到弹药"):
-        return tr(lang, "err_pyfa_charge_not_found", name=tail(msg))
-    if msg.startswith("武器缺少可解析弹药"):
-        return tr(lang, "err_weapon_no_ammo", name=tail(msg))
-    if msg.startswith("弹药与武器口径/类型不匹配"):
-        return tr(lang, "err_ammo_mismatch", detail=tail(msg))
-    return msg
-
-
-
-from .models import *
+from .models import SetupRow, UiPreferences
 class FleetSetupTableModel(QAbstractTableModel):
-    HEADER_KEYS = [
-        "setup_col_team",
-        "setup_col_squad",
-        "setup_col_quality",
-        "setup_col_quantity",
-        "setup_col_leader",
-        "setup_col_fit",
+    HEADERS = [
+        "Team",
+        "Squad",
+        "Quality",
+        "Count",
+        "Leader",
+        "Fit Name",
     ]
 
     def __init__(self, rows: list[SetupRow], language_getter: Callable[[], str]) -> None:
@@ -131,8 +108,7 @@ class FleetSetupTableModel(QAbstractTableModel):
         self._language_getter = language_getter
 
     def _headers(self) -> list[str]:
-        lang = self._language_getter()
-        return [tr(lang, key) for key in self.HEADER_KEYS]
+        return [QCoreApplication.translate("eve_sim", header) for header in self.HEADERS]
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         del parent
@@ -140,7 +116,7 @@ class FleetSetupTableModel(QAbstractTableModel):
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         del parent
-        return len(self.HEADER_KEYS)
+        return len(self.HEADERS)
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
         if role != Qt.ItemDataRole.DisplayRole:
@@ -180,7 +156,7 @@ class FleetSetupTableModel(QAbstractTableModel):
             if col == 3:
                 return int(max(1, row.quantity))
             if col == 4:
-                return tr(self._language_getter(), "yes_short") if row.is_leader else tr(self._language_getter(), "no_short")
+                return QCoreApplication.translate("eve_sim", 'Y') if row.is_leader else QCoreApplication.translate("eve_sim", 'N')
             if col == 5:
                 return row.fit_name
         return None
@@ -206,7 +182,7 @@ class FleetSetupTableModel(QAbstractTableModel):
                     row.is_leader = False
             elif col == 4:
                 text = str(value).strip().upper()
-                row.is_leader = (row.quantity == 1) and (text in ("1", "Y", "YES", "TRUE", "T", "队长", "LEADER"))
+                row.is_leader = (row.quantity == 1) and (text in ("1", "Y", "YES", "TRUE", "T", "闃熼暱", "LEADER"))
             else:
                 return False
         except Exception:
@@ -260,8 +236,8 @@ class SetupRowDelegate(QStyledItemDelegate):
             combo = QComboBox(parent)
             combo.setFrame(False)
             combo.setStyleSheet("QComboBox { padding-left: 0px; }")
-            combo.addItem(tr(self._language_getter(), "yes_short"), True)
-            combo.addItem(tr(self._language_getter(), "no_short"), False)
+            combo.addItem(QCoreApplication.translate("eve_sim", 'Y'), True)
+            combo.addItem(QCoreApplication.translate("eve_sim", 'N'), False)
             QTimer.singleShot(0, combo.showPopup)
             return combo
         return super().createEditor(parent, option, index)
@@ -276,7 +252,7 @@ class SetupRowDelegate(QStyledItemDelegate):
                 editor.setCurrentIndex(0 if pos < 0 else pos)
                 return
             if col == 4:
-                truthy = str(value).strip().upper() in ("1", "Y", "YES", "TRUE", "T", "是")
+                truthy = str(value).strip().upper() in ("1", "Y", "YES", "TRUE", "T")
                 pos = editor.findData(truthy)
                 editor.setCurrentIndex(0 if pos < 0 else pos)
                 return
@@ -297,7 +273,7 @@ class SetupRowDelegate(QStyledItemDelegate):
 
 
 class OverviewTableModel(QAbstractTableModel):
-    HEADER_KEYS = ["overview_col_name", "overview_col_type", "overview_col_distance", "overview_col_team"]
+    HEADERS = ["Name", "Ship Type", "Distance (km)", "Team"]
 
     def __init__(
         self,
@@ -314,8 +290,7 @@ class OverviewTableModel(QAbstractTableModel):
         self._controlled_team_getter = controlled_team_getter
 
     def _headers(self) -> list[str]:
-        lang = self._language_getter()
-        return [tr(lang, key) for key in self.HEADER_KEYS]
+        return [QCoreApplication.translate("eve_sim", header) for header in self.HEADERS]
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         del parent
@@ -323,7 +298,7 @@ class OverviewTableModel(QAbstractTableModel):
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         del parent
-        return len(self.HEADER_KEYS)
+        return len(self.HEADERS)
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
         if role != Qt.ItemDataRole.DisplayRole:
@@ -381,13 +356,13 @@ class OverviewTableModel(QAbstractTableModel):
         if not self._rows:
             return
         top_left = self.index(0, 0)
-        bottom_right = self.index(len(self._rows) - 1, len(self.HEADER_KEYS) - 1)
+        bottom_right = self.index(len(self._rows) - 1, len(self.HEADERS) - 1)
         self.dataChanged.emit(top_left, bottom_right, [Qt.ItemDataRole.BackgroundRole])
 
 
 
 class BlueRosterTableModel(QAbstractTableModel):
-    HEADER_KEYS = ["fleet_col_ship", "fleet_col_squad", "fleet_col_role", "fleet_col_alive", "fleet_col_hp"]
+    HEADERS = ["Ship ID", "Squad", "Role", "Alive", "HP%"]
 
     def __init__(self, language_getter: Callable[[], str]) -> None:
         super().__init__()
@@ -395,8 +370,7 @@ class BlueRosterTableModel(QAbstractTableModel):
         self._language_getter = language_getter
 
     def _headers(self) -> list[str]:
-        lang = self._language_getter()
-        return [tr(lang, key) for key in self.HEADER_KEYS]
+        return [QCoreApplication.translate("eve_sim", header) for header in self.HEADERS]
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         del parent
@@ -404,7 +378,7 @@ class BlueRosterTableModel(QAbstractTableModel):
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         del parent
-        return len(self.HEADER_KEYS)
+        return len(self.HEADERS)
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
         if role != Qt.ItemDataRole.DisplayRole:
@@ -433,7 +407,7 @@ class BlueRosterTableModel(QAbstractTableModel):
             if col == 2:
                 return row["role"]
             if col == 3:
-                return tr(self._language_getter(), "yes_short") if row["alive"] else tr(self._language_getter(), "no_short")
+                return QCoreApplication.translate("eve_sim", 'Y') if row["alive"] else QCoreApplication.translate("eve_sim", 'N')
             if col == 4:
                 return f"{row['hp']:.1f}"
         return None
@@ -547,6 +521,7 @@ class OverviewFilterProxyModel(QSortFilterProxyModel):
         if not source_idx.isValid():
             return None
         return source.get_row(source_idx.row())
+
 
 
 

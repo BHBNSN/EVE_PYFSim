@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,7 +55,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import tr
+from ..i18n import install_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -88,36 +88,19 @@ from ..pyfa_bridge import PyfaBridge
 from ..sim_logging import get_sim_logger, log_sim_event
 from ..simulation_engine import SimulationEngine
 from ..systems import CombatSystem
-
-
-def _localize_fit_error(lang: str, error: Exception | str) -> str:
-    msg = str(error).strip()
-
-    def tail(text: str) -> str:
-        return text.split("：", 1)[1].strip() if "：" in text else ""
-
-    if msg.startswith("pyfa Fit计算链不可用"):
-        return tr(lang, "err_pyfa_chain_unavailable")
-    if msg.startswith("pyfa Fit计算链初始化不完整"):
-        return tr(lang, "err_pyfa_chain_incomplete")
-    if msg.startswith("pyfa中未找到舰船"):
-        return tr(lang, "err_pyfa_ship_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到模块"):
-        return tr(lang, "err_pyfa_module_not_found", name=tail(msg))
-    if msg.startswith("pyfa中未找到弹药"):
-        return tr(lang, "err_pyfa_charge_not_found", name=tail(msg))
-    if msg.startswith("武器缺少可解析弹药"):
-        return tr(lang, "err_weapon_no_ammo", name=tail(msg))
-    if msg.startswith("弹药与武器口径/类型不匹配"):
-        return tr(lang, "err_ammo_mismatch", detail=tail(msg))
-    return msg
-
-
-
-from .models import *
-from .table_models import *
+from ..user_errors import UserFacingError, display_user_error
+from .models import PreferencesStore, SetupRow
+from .table_models import FleetSetupTableModel
 from .dialogs import FleetLibraryDialog
+
 class FleetSetupDialog(QDialog):
+    @staticmethod
+    def _language_options() -> tuple[tuple[str, str], ...]:
+        return (
+            ("简体中文", "zh_CN"),
+            ("English", "en_US"),
+        )
+
     def __init__(self, network_mode: str = "local", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = PreferencesStore()
@@ -125,7 +108,8 @@ class FleetSetupDialog(QDialog):
         self._network_mode = network_mode
         self._engine_pref_loading = False
         self._lang = self._detect_initial_language()
-        self.setWindowTitle(tr(self._lang, "setup_title"))
+        install_language(self._lang)
+        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'Pre-Battle Fleet Setup'))
         self.resize(1060, 680)
         self._parser = EftFitParser()
         self._factory = RuntimeFromEftFactory()
@@ -138,33 +122,30 @@ class FleetSetupDialog(QDialog):
         layout = QVBoxLayout(self)
 
         lang_row = QHBoxLayout()
-        self.lbl_lang = QLabel(tr(self._lang, "lang_label"))
+        self.lbl_lang = QLabel(QCoreApplication.translate("eve_sim", 'Language'))
         self.lang_combo = QComboBox(self)
-        self.lang_combo.addItem("中文", "zh_CN")
-        self.lang_combo.addItem("English", "en_US")
-        idx = self.lang_combo.findData(self._lang)
-        self.lang_combo.setCurrentIndex(0 if idx < 0 else idx)
+        self._refresh_language_combo(self._lang)
         self.lang_combo.currentIndexChanged.connect(self._on_setup_language_changed)
         lang_row.addWidget(self.lbl_lang)
         lang_row.addWidget(self.lang_combo)
         lang_row.addStretch(1)
         layout.addLayout(lang_row)
 
-        self.hint = QLabel(tr(self._lang, "setup_hint"))
+        self.hint = QLabel(QCoreApplication.translate("eve_sim", 'Each row is one ship. Paste EFT text below ([Ship, Fit]). Duplicate fits are cached.'))
         layout.addWidget(self.hint)
-        self.backend = QLabel(f"{tr(self._lang, 'setup_backend')}: {get_fit_backend_status()}")
+        self.backend = QLabel(f"{QCoreApplication.translate("eve_sim", 'Backend')}: {get_fit_backend_status()}")
         layout.addWidget(self.backend)
 
         manager_row = QHBoxLayout()
-        self.btn_open_fleet_library = QPushButton(tr(self._lang, "fleet_lib_open"))
+        self.btn_open_fleet_library = QPushButton(QCoreApplication.translate("eve_sim", 'Open Fleet Library'))
         manager_row.addWidget(self.btn_open_fleet_library)
         manager_row.addStretch(1)
         layout.addLayout(manager_row)
 
         fleet_row = QHBoxLayout()
-        self.lbl_blue_fleet = QLabel(tr(self._lang, "setup_blue_fleet"))
+        self.lbl_blue_fleet = QLabel(QCoreApplication.translate("eve_sim", 'Blue Fleet'))
         self.blue_fleet_combo = QComboBox(self)
-        self.lbl_red_fleet = QLabel(tr(self._lang, "setup_red_fleet"))
+        self.lbl_red_fleet = QLabel(QCoreApplication.translate("eve_sim", 'Red Fleet'))
         self.red_fleet_combo = QComboBox(self)
         fleet_row.addWidget(self.lbl_blue_fleet)
         fleet_row.addWidget(self.blue_fleet_combo, 1)
@@ -178,20 +159,20 @@ class FleetSetupDialog(QDialog):
         preview_tab = QWidget(self)
         preview_row = QHBoxLayout(preview_tab)
         blue_col = QVBoxLayout()
-        self.lbl_blue_preview = QLabel(tr(self._lang, "setup_blue_preview"))
+        self.lbl_blue_preview = QLabel(QCoreApplication.translate("eve_sim", 'Blue Preview'))
         self.blue_preview = QPlainTextEdit(self)
         self.blue_preview.setReadOnly(True)
         blue_col.addWidget(self.lbl_blue_preview)
         blue_col.addWidget(self.blue_preview)
         red_col = QVBoxLayout()
-        self.lbl_red_preview = QLabel(tr(self._lang, "setup_red_preview"))
+        self.lbl_red_preview = QLabel(QCoreApplication.translate("eve_sim", 'Red Preview'))
         self.red_preview = QPlainTextEdit(self)
         self.red_preview.setReadOnly(True)
         red_col.addWidget(self.lbl_red_preview)
         red_col.addWidget(self.red_preview)
         preview_row.addLayout(blue_col, 1)
         preview_row.addLayout(red_col, 1)
-        self.setup_tabs.addTab(preview_tab, tr(self._lang, "setup_tab_preview"))
+        self.setup_tabs.addTab(preview_tab, QCoreApplication.translate("eve_sim", 'Fleet Preview'))
 
         settings_tab = QWidget(self)
         settings_layout = QVBoxLayout(settings_tab)
@@ -247,7 +228,7 @@ class FleetSetupDialog(QDialog):
         settings_layout.addLayout(settings_form)
         settings_layout.addStretch(1)
 
-        self.setup_tabs.addTab(settings_tab, tr(self._lang, "setup_tab_settings"))
+        self.setup_tabs.addTab(settings_tab, QCoreApplication.translate("eve_sim", 'Simulation Settings'))
         layout.addWidget(self.setup_tabs, 1)
 
         top = QHBoxLayout()
@@ -259,10 +240,10 @@ class FleetSetupDialog(QDialog):
         top.addWidget(self.table, 3)
 
         side = QVBoxLayout()
-        self.btn_add_blue = QPushButton(tr(self._lang, "setup_add_blue"))
-        self.btn_add_red = QPushButton(tr(self._lang, "setup_add_red"))
-        self.btn_delete = QPushButton(tr(self._lang, "setup_delete"))
-        self.btn_validate = QPushButton(tr(self._lang, "setup_validate"))
+        self.btn_add_blue = QPushButton(QCoreApplication.translate("eve_sim", 'Add Blue Ship'))
+        self.btn_add_red = QPushButton(QCoreApplication.translate("eve_sim", 'Add Red Ship'))
+        self.btn_delete = QPushButton(QCoreApplication.translate("eve_sim", 'Delete Selected'))
+        self.btn_validate = QPushButton(QCoreApplication.translate("eve_sim", 'Validate All Fits'))
         side.addWidget(self.btn_add_blue)
         side.addWidget(self.btn_add_red)
         side.addWidget(self.btn_delete)
@@ -277,13 +258,13 @@ class FleetSetupDialog(QDialog):
         self.btn_validate.setVisible(False)
 
         self.fit_editor = QPlainTextEdit()
-        self.fit_editor.setPlaceholderText(tr(self._lang, "setup_fit_placeholder"))
+        self.fit_editor.setPlaceholderText(QCoreApplication.translate("eve_sim", 'Paste EFT fit text for selected ship here'))
         layout.addWidget(self.fit_editor, 2)
         self.fit_editor.setVisible(False)
 
         self.btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.btns.button(QDialogButtonBox.StandardButton.Ok).setText(tr(self._lang, "setup_start"))
-        self.btns.button(QDialogButtonBox.StandardButton.Cancel).setText(tr(self._lang, "setup_cancel"))
+        self.btns.button(QDialogButtonBox.StandardButton.Ok).setText(QCoreApplication.translate("eve_sim", 'Start Simulation'))
+        self.btns.button(QDialogButtonBox.StandardButton.Cancel).setText(QCoreApplication.translate("eve_sim", 'Cancel'))
         layout.addWidget(self.btns)
 
         self.btn_add_blue.clicked.connect(self._add_blue)
@@ -324,7 +305,7 @@ class FleetSetupDialog(QDialog):
                 return data
             raw = json.loads(self._fleet_store_path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
-                raise ValueError("invalid template store")
+                raise UserFacingError("Fleet template store is invalid.")
             out: dict[str, list[dict]] = {}
             for name, entries in raw.items():
                 if not isinstance(name, str) or not isinstance(entries, list):
@@ -376,7 +357,7 @@ class FleetSetupDialog(QDialog):
     def _preview_text_for_fleet(self, fleet_name: str) -> str:
         entries = self._fleet_templates.get(fleet_name, []) if fleet_name else []
         if not entries:
-            return tr(self._lang, "setup_preview_empty")
+            return QCoreApplication.translate("eve_sim", 'No fleet selected')
         lines: list[str] = []
         for idx, item in enumerate(entries, start=1):
             fit_text = str(item.get("fit_text", "")).strip()
@@ -386,7 +367,7 @@ class FleetSetupDialog(QDialog):
                     parsed = self._parser.parse(fit_text)
                     fit_name = f"{parsed.ship_name} / {parsed.fit_name}"
                 except Exception:
-                    fit_name = tr(self._lang, "setup_preview_invalid")
+                    fit_name = QCoreApplication.translate("eve_sim", 'Invalid Fit')
             lines.append(f"{idx:02d}. {item.get('squad_id', 'ALPHA')} | {item.get('quality', 'REGULAR')} | {fit_name}")
         return "\n".join(lines)
 
@@ -463,44 +444,68 @@ class FleetSetupDialog(QDialog):
         self._lang = str(lang) if lang in ("zh_CN", "en_US") else "zh_CN"
         self._pref.language = self._lang
         self._store.save(self._pref)
+        install_language(self._lang)
         self._apply_setup_language()
+
+    def _refresh_language_combo(self, selected_lang: str | None = None) -> None:
+        options = self._language_options()
+        self.lang_combo.blockSignals(True)
+        self.lang_combo.clear()
+        for label, lang_code in options:
+            self.lang_combo.addItem(label, lang_code)
+        self.lang_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        widest_label = max(
+            (self.lang_combo.fontMetrics().horizontalAdvance(label) for label, _lang_code in options),
+            default=0,
+        )
+        combo_width = max(140, widest_label + 56)
+        self.lang_combo.setMinimumContentsLength(max((len(label) for label, _lang_code in options), default=10))
+        self.lang_combo.setMinimumWidth(combo_width)
+        view = self.lang_combo.view()
+        if view is not None:
+            view.setMinimumWidth(combo_width)
+        target_lang = selected_lang if selected_lang in {"zh_CN", "en_US"} else self._lang
+        idx = self.lang_combo.findData(target_lang)
+        self.lang_combo.setCurrentIndex(0 if idx < 0 else idx)
+        self.lang_combo.blockSignals(False)
 
     def _apply_setup_language(self) -> None:
         lang = self._lang
-        self.setWindowTitle(tr(lang, "setup_title"))
-        self.lbl_lang.setText(tr(lang, "lang_label"))
-        self.lbl_blue_fleet.setText(tr(lang, "setup_blue_fleet"))
-        self.lbl_red_fleet.setText(tr(lang, "setup_red_fleet"))
-        self.lbl_blue_preview.setText(tr(lang, "setup_blue_preview"))
-        self.lbl_red_preview.setText(tr(lang, "setup_red_preview"))
-        self.btn_open_fleet_library.setText(tr(lang, "fleet_lib_open"))
-        self.hint.setText(tr(lang, "setup_hint"))
-        self.backend.setText(f"{tr(lang, 'setup_backend')}: {get_fit_backend_status()}")
-        self.btn_add_blue.setText(tr(lang, "setup_add_blue"))
-        self.btn_add_red.setText(tr(lang, "setup_add_red"))
-        self.btn_delete.setText(tr(lang, "setup_delete"))
-        self.btn_validate.setText(tr(lang, "setup_validate"))
-        self.btns.button(QDialogButtonBox.StandardButton.Ok).setText(tr(lang, "setup_start"))
-        self.btns.button(QDialogButtonBox.StandardButton.Cancel).setText(tr(lang, "setup_cancel"))
-        self.fit_editor.setPlaceholderText(tr(lang, "setup_fit_placeholder"))
+        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'Pre-Battle Fleet Setup'))
+        self.lbl_lang.setText(QCoreApplication.translate("eve_sim", 'Language'))
+        self._refresh_language_combo(self.lang_combo.currentData())
+        self.lbl_blue_fleet.setText(QCoreApplication.translate("eve_sim", 'Blue Fleet'))
+        self.lbl_red_fleet.setText(QCoreApplication.translate("eve_sim", 'Red Fleet'))
+        self.lbl_blue_preview.setText(QCoreApplication.translate("eve_sim", 'Blue Preview'))
+        self.lbl_red_preview.setText(QCoreApplication.translate("eve_sim", 'Red Preview'))
+        self.btn_open_fleet_library.setText(QCoreApplication.translate("eve_sim", 'Open Fleet Library'))
+        self.hint.setText(QCoreApplication.translate("eve_sim", 'Each row is one ship. Paste EFT text below ([Ship, Fit]). Duplicate fits are cached.'))
+        self.backend.setText(f"{QCoreApplication.translate("eve_sim", 'Backend')}: {get_fit_backend_status()}")
+        self.btn_add_blue.setText(QCoreApplication.translate("eve_sim", 'Add Blue Ship'))
+        self.btn_add_red.setText(QCoreApplication.translate("eve_sim", 'Add Red Ship'))
+        self.btn_delete.setText(QCoreApplication.translate("eve_sim", 'Delete Selected'))
+        self.btn_validate.setText(QCoreApplication.translate("eve_sim", 'Validate All Fits'))
+        self.btns.button(QDialogButtonBox.StandardButton.Ok).setText(QCoreApplication.translate("eve_sim", 'Start Simulation'))
+        self.btns.button(QDialogButtonBox.StandardButton.Cancel).setText(QCoreApplication.translate("eve_sim", 'Cancel'))
+        self.fit_editor.setPlaceholderText(QCoreApplication.translate("eve_sim", 'Paste EFT fit text for selected ship here'))
         self.model.notify_headers_changed()
         self._refresh_previews()
 
-        self.setup_tabs.setTabText(0, tr(lang, "setup_tab_preview"))
-        self.setup_tabs.setTabText(1, tr(lang, "setup_tab_settings"))
-        self.lbl_cfg_tick_rate.setText(tr(lang, "setup_cfg_tick_rate"))
-        self.lbl_cfg_substeps.setText(tr(lang, "setup_cfg_physics_substeps"))
-        self.lbl_cfg_radius.setText(tr(lang, "setup_cfg_battlefield_radius"))
-        self.lbl_cfg_lockstep.setText(tr(lang, "setup_cfg_lockstep"))
-        self.lbl_cfg_detailed_log.setText(tr(lang, "setup_cfg_detailed_logging"))
-        self.lbl_cfg_hotspot_log.setText(tr(lang, "setup_cfg_hotspot_logging"))
-        self.lbl_cfg_log_file.setText(tr(lang, "setup_cfg_log_file"))
-        self.lbl_cfg_hotspot_log_file.setText(tr(lang, "setup_cfg_hotspot_log_file"))
-        self.lbl_cfg_log_merge_window.setText(tr(lang, "setup_cfg_log_merge_window"))
+        self.setup_tabs.setTabText(0, QCoreApplication.translate("eve_sim", 'Fleet Preview'))
+        self.setup_tabs.setTabText(1, QCoreApplication.translate("eve_sim", 'Simulation Settings'))
+        self.lbl_cfg_tick_rate.setText(QCoreApplication.translate("eve_sim", 'Tick Rate (Hz)'))
+        self.lbl_cfg_substeps.setText(QCoreApplication.translate("eve_sim", 'Physics Substeps'))
+        self.lbl_cfg_radius.setText(QCoreApplication.translate("eve_sim", 'Battlefield Radius (m)'))
+        self.lbl_cfg_lockstep.setText(QCoreApplication.translate("eve_sim", 'Lockstep'))
+        self.lbl_cfg_detailed_log.setText(QCoreApplication.translate("eve_sim", 'Detailed Logging'))
+        self.lbl_cfg_hotspot_log.setText(QCoreApplication.translate("eve_sim", 'Hotspot Timing Logging'))
+        self.lbl_cfg_log_file.setText(QCoreApplication.translate("eve_sim", 'Log File'))
+        self.lbl_cfg_hotspot_log_file.setText(QCoreApplication.translate("eve_sim", 'Hotspot Log File'))
+        self.lbl_cfg_log_merge_window.setText(QCoreApplication.translate("eve_sim", 'Log Merge Window (sec)'))
         if self._network_mode == "client":
-            self.lbl_engine_hint.setText(tr(lang, "setup_cfg_host_authority"))
+            self.lbl_engine_hint.setText(QCoreApplication.translate("eve_sim", 'In LAN client mode, Host settings are authoritative. Values are read-only local preferences.'))
         else:
-            self.lbl_engine_hint.setText(tr(lang, "setup_cfg_local_persist"))
+            self.lbl_engine_hint.setText(QCoreApplication.translate("eve_sim", 'These settings are saved locally and will be restored on next launch.'))
 
     def _set_engine_settings_enabled(self, enabled: bool) -> None:
         self.spin_cfg_tick_rate.setEnabled(enabled)
@@ -634,10 +639,10 @@ class FleetSetupDialog(QDialog):
     def _validate_all(self) -> bool:
         lang = self._lang
         if not self.blue_fleet_combo.currentText().strip() or not self.red_fleet_combo.currentText().strip():
-            QMessageBox.warning(self, tr(lang, "setup_validate_fail_title"), tr(lang, "setup_validate_need_fleets"))
+            QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Validation Failed'), QCoreApplication.translate("eve_sim", 'Please select one fleet for both Blue and Red.'))
             return False
         if self.model.rowCount() == 0:
-            QMessageBox.warning(self, tr(lang, "setup_validate_fail_title"), tr(lang, "setup_validate_need_ship"))
+            QMessageBox.warning(self, QCoreApplication.translate("eve_sim", 'Validation Failed'), QCoreApplication.translate("eve_sim", 'At least one ship is required.'))
             return False
         for idx, row in enumerate(self.model.rows, start=1):
             try:
@@ -647,11 +652,11 @@ class FleetSetupDialog(QDialog):
             except Exception as e:
                 QMessageBox.warning(
                     self,
-                    tr(lang, "setup_validate_fail_title"),
-                    tr(lang, "setup_validate_row_invalid", row=idx, error=_localize_fit_error(lang, e)),
+                    QCoreApplication.translate("eve_sim", 'Validation Failed'),
+                    QCoreApplication.translate("eve_sim", 'Invalid fit on row {row}: {error}').format(row=idx, error=display_user_error(e)),
                 )
                 return False
-        QMessageBox.information(self, tr(lang, "setup_validate_ok_title"), tr(lang, "setup_validate_all_ok"))
+        QMessageBox.information(self, QCoreApplication.translate("eve_sim", 'Validation Passed'), QCoreApplication.translate("eve_sim", 'All fits are valid.'))
         return True
 
     def _on_accept(self) -> None:
@@ -683,6 +688,7 @@ class FleetSetupDialog(QDialog):
             for idx in indices:
                 rows[idx].is_leader = (idx == chosen)
         return rows
+
 
 
 
