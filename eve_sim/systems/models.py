@@ -30,6 +30,9 @@ _PROFILE_PASSTHROUGH_ATTRS = (
     "warp_speed_au_s",
     "warp_capacitor_need",
     "max_warp_distance_au",
+    "disallow_assistance",
+    "warp_bubble_immune",
+    "is_shuttle",
 )
 
 _FORMULA_PROJECTED_KEYS = frozenset(

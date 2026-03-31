@@ -116,6 +116,9 @@ class ShipAgent(BaseAgent):
             ship.nav.warp.warp_duration = 0.0
             ship.nav.warp.warp_elapsed = 0.0
             ship.nav.warp.capacitor_cost = 0.0
+            ship.nav.warp.bubble_immune_snapshot = False
+            ship.nav.warp.interdiction_snapshots_captured = False
+            ship.nav.warp.interdiction_snapshots = tuple()
             ship.nav.command_target = None
             self.current_order = None
 

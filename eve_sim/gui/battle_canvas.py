@@ -435,6 +435,23 @@ class BattleCanvas(QWidget):
                 continue
             yield blast
 
+    def _iter_active_bubble_fields(self):
+        now = float(self.engine.world.now)
+        for field in self.engine.world.bubble_fields.values():
+            if not bool(getattr(field, "alive", True)):
+                continue
+            if float(getattr(field, "expires_at", now + 1.0)) <= now and getattr(field, "anchor_ship_id", None) is None:
+                continue
+            yield field
+
+    @staticmethod
+    def _bubble_field_style(kind: str) -> tuple[QColor, QColor]:
+        if str(kind) == "webification_probe":
+            return QColor(88, 196, 255, 20), QColor(88, 196, 255, 120)
+        if str(kind) == "hic_warp_field":
+            return QColor(255, 118, 86, 18), QColor(255, 118, 86, 110)
+        return QColor(255, 78, 78, 18), QColor(255, 78, 78, 110)
+
     @staticmethod
     def _projectile_colors(kind: str) -> tuple[QColor, QColor]:
         if str(kind) == "bomb":
@@ -478,6 +495,20 @@ class BattleCanvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(border, 1))
             painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+
+        for field in self._iter_active_bubble_fields():
+            x, y = self._to_screen(field.position)
+            radius_px = max(1, int(float(field.radius_m) * self.zoom))
+            fill, border = self._bubble_field_style(str(field.kind))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(border, 1))
+            painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(border)
+            painter.drawEllipse(x - 2, y - 2, 4, 4)
 
         for projectile in self.engine.world.projectiles.values():
             px, py = self._to_screen(projectile.position)

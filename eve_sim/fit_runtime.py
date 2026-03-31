@@ -53,6 +53,9 @@ class HullProfile:
     warp_speed_au_s: float = 0.0
     warp_capacitor_need: float = 0.0
     max_warp_distance_au: float = 0.0
+    disallow_assistance: bool = False
+    warp_bubble_immune: bool = False
+    is_shuttle: bool = False
 
 
 @dataclass(slots=True)
@@ -248,6 +251,9 @@ class RuntimeStatEngine:
             warp_speed_au_s=max(0.0, float(getattr(hull, "warp_speed_au_s", 0.0) or 0.0)),
             warp_capacitor_need=max(0.0, float(getattr(hull, "warp_capacitor_need", 0.0) or 0.0)),
             max_warp_distance_au=max(0.0, float(getattr(hull, "max_warp_distance_au", 0.0) or 0.0)),
+            disallow_assistance=bool(getattr(hull, "disallow_assistance", False)),
+            warp_bubble_immune=bool(getattr(hull, "warp_bubble_immune", False)),
+            is_shuttle=bool(getattr(hull, "is_shuttle", False)),
         )
         self._cache[key] = profile
         return profile
@@ -420,6 +426,9 @@ class RuntimeStatEngine:
             warp_speed_au_s=max(0.0, float(getattr(target, "warp_speed_au_s", 0.0) or 0.0)),
             warp_capacitor_need=max(0.0, float(getattr(target, "warp_capacitor_need", 0.0) or 0.0)),
             max_warp_distance_au=max(0.0, float(getattr(target, "max_warp_distance_au", 0.0) or 0.0)),
+            disallow_assistance=bool(getattr(target, "disallow_assistance", False)),
+            warp_bubble_immune=bool(getattr(target, "warp_bubble_immune", False)),
+            is_shuttle=bool(getattr(target, "is_shuttle", False)),
             sensor_strength_gravimetric=max(
                 0.0,
                 self._apply_penalized_projection(
@@ -531,6 +540,9 @@ class RuntimeStatEngine:
             hull.energy_warfare_resistance,
             hull.mass,
             hull.agility,
+            hull.disallow_assistance,
+            hull.warp_bubble_immune,
+            hull.is_shuttle,
         )
         modules = tuple(
             (

@@ -50,10 +50,11 @@ from ..fleet_setup import (
     EftFitParser,
     RuntimeFromEftFactory,
     recompute_profile_from_pyfa_runtime,
-    get_charge_options_for_module,
+    get_charge_option_values_for_module,
     get_fit_backend_status,
     get_common_chargeable_modules,
     get_module_reload_time_sec,
+    module_supports_unloaded_charge,
     resolve_module_type_name,
     get_type_display_name,
 )
@@ -701,7 +702,12 @@ class ShipStatusDialog(QDialog):
     def _refresh_lock_controls_if_needed(self) -> None:
         lang = self._language_getter()
         fit_text = self._fit_text_getter(self.ship_id) or ""
-        signature = (lang, fit_text)
+        module_specs = self._get_module_specs_cached(fit_text)
+        lock_signature = tuple(
+            (f"mod-{idx}", self._lock_charge_getter(self.ship_id, f"mod-{idx}"))
+            for idx, _spec in enumerate(module_specs, start=1)
+        )
+        signature = (lang, fit_text, lock_signature)
         if signature != self._lock_controls_signature:
             self._lock_controls_signature = signature
             self._refresh_lock_controls()
@@ -714,6 +720,14 @@ class ShipStatusDialog(QDialog):
         idx = int(parts[1])
         return idx if idx > 0 else None
 
+    def _charge_selection_entries(self, module_name: str, lang: str) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        if module_supports_unloaded_charge(module_name):
+            entries.append(("", QCoreApplication.translate("eve_sim", "None")))
+        for charge_name in get_charge_option_values_for_module(module_name):
+            entries.append((charge_name, get_type_display_name(charge_name, language=lang)))
+        return entries
+
     def _refresh_lock_controls(self) -> None:
         lang = self._language_getter()
         self.lbl_lock_module.setText(QCoreApplication.translate("eve_sim", 'Lock Module'))
@@ -724,15 +738,15 @@ class ShipStatusDialog(QDialog):
         fit_text = self._fit_text_getter(self.ship_id) or ""
         module_specs = self._get_module_specs_cached(fit_text)
         previous_module_id = str(self.lock_module_combo.currentData() or "")
-        previous_ammo_text = self.lock_ammo_combo.currentText().strip()
-        if previous_module_id and previous_ammo_text:
-            self._lock_ammo_draft_by_module[previous_module_id] = previous_ammo_text
+        previous_ammo_value = str(self.lock_ammo_combo.currentData() or "")
+        if previous_module_id:
+            self._lock_ammo_draft_by_module[previous_module_id] = previous_ammo_value
 
         self._lock_module_specs = {}
         module_rows: list[tuple[str, str]] = []
         for idx, spec in enumerate(module_specs, start=1):
-            ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
-            if not ammo_options:
+            ammo_entries = self._charge_selection_entries(spec.module_name, lang)
+            if not ammo_entries:
                 continue
             module_id = f"mod-{idx}"
             module_label = get_type_display_name(spec.module_name, language=lang)
@@ -748,7 +762,7 @@ class ShipStatusDialog(QDialog):
         self._lock_ammo_draft_by_module = {
             module_id: ammo_text
             for module_id, ammo_text in self._lock_ammo_draft_by_module.items()
-            if module_id in active_module_ids and ammo_text
+            if module_id in active_module_ids
         }
 
         self.lock_module_combo.blockSignals(True)
@@ -782,48 +796,46 @@ class ShipStatusDialog(QDialog):
             self.btn_lock_clear.setEnabled(False)
             return
 
-        ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
+        ammo_entries = self._charge_selection_entries(spec.module_name, lang)
         self.lock_ammo_combo.blockSignals(True)
-        self.lock_ammo_combo.addItems(ammo_options)
+        for charge_value, charge_label in ammo_entries:
+            self.lock_ammo_combo.addItem(charge_label, charge_value)
 
         locked_ammo = self._lock_charge_getter(self.ship_id, module_id)
         selected_ammo = ""
-        if locked_ammo:
-            selected_ammo = get_type_display_name(locked_ammo, language=lang)
-        elif module_id and self._lock_ammo_draft_by_module.get(module_id):
-            selected_ammo = self._lock_ammo_draft_by_module[module_id]
+        valid_values = {charge_value for charge_value, _charge_label in ammo_entries}
+        if locked_ammo is not None:
+            selected_ammo = resolve_module_type_name(locked_ammo).strip() if locked_ammo else ""
+        elif module_id in self._lock_ammo_draft_by_module:
+            selected_ammo = str(self._lock_ammo_draft_by_module[module_id] or "").strip()
         elif spec.charge_name:
-            selected_ammo = get_type_display_name(spec.charge_name, language=lang)
+            selected_ammo = resolve_module_type_name(spec.charge_name).strip()
+        elif "" in valid_values:
+            selected_ammo = ""
 
-        if selected_ammo:
-            if self.lock_ammo_combo.findText(selected_ammo) < 0:
-                self.lock_ammo_combo.addItem(selected_ammo)
-            self.lock_ammo_combo.setCurrentText(selected_ammo)
-        elif ammo_options:
-            self.lock_ammo_combo.setCurrentIndex(0)
+        if selected_ammo not in valid_values and ammo_entries:
+            selected_ammo = ammo_entries[0][0]
+        select_idx = self.lock_ammo_combo.findData(selected_ammo)
+        self.lock_ammo_combo.setCurrentIndex(0 if select_idx < 0 else select_idx)
 
         self.lock_ammo_combo.blockSignals(False)
         has_ammo = self.lock_ammo_combo.count() > 0
         self.lock_ammo_combo.setEnabled(has_ammo)
         self.btn_lock_apply.setEnabled(has_ammo)
-        self.btn_lock_clear.setEnabled(bool(locked_ammo))
+        self.btn_lock_clear.setEnabled(locked_ammo is not None)
         self._on_lock_ammo_changed(self.lock_ammo_combo.currentText())
 
     def _on_lock_ammo_changed(self, text: str) -> None:
+        del text
         module_id = str(self.lock_module_combo.currentData() or "")
-        ammo_text = str(text or "").strip()
         if not module_id:
             return
-        if ammo_text:
-            self._lock_ammo_draft_by_module[module_id] = ammo_text
-        else:
-            self._lock_ammo_draft_by_module.pop(module_id, None)
+        self._lock_ammo_draft_by_module[module_id] = str(self.lock_ammo_combo.currentData() or "").strip()
 
     def _on_lock_apply_clicked(self) -> None:
-        lang = self._language_getter()
         module_id = str(self.lock_module_combo.currentData() or "")
-        ammo_name = self.lock_ammo_combo.currentText().strip()
-        if not module_id or not ammo_name:
+        ammo_name = str(self.lock_ammo_combo.currentData() or "").strip()
+        if not module_id:
             return
         ok, message = self._lock_charge_setter(self.ship_id, module_id, ammo_name)
         if ok:

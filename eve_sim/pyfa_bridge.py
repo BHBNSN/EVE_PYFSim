@@ -87,6 +87,9 @@ class PyfaBridge:
             warp_speed_au_s=max(0.0, float(getattr(fit, "warp_speed_au_s", 0.0) or 0.0)),
             warp_capacitor_need=max(0.0, float(getattr(fit, "warp_capacitor_need", 0.0) or 0.0)),
             max_warp_distance_au=max(0.0, float(getattr(fit, "max_warp_distance_au", 0.0) or 0.0)),
+            disallow_assistance=bool(getattr(fit, "disallow_assistance", False)),
+            warp_bubble_immune=bool(getattr(fit, "warp_bubble_immune", False)),
+            is_shuttle=bool(getattr(fit, "is_shuttle", False)),
         )
         self._profile_cache[fit.fit_key] = profile
         return profile

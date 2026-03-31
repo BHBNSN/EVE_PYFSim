@@ -65,6 +65,17 @@ class RuntimeFromEftFactory:
             self._fit_cache.clear()
             self._profile_cache.clear()
 
+    def clear_charge_module_ammo_override(self, module_name: str) -> None:
+        module = self._pyfa.resolve_type_name(module_name)
+        if not module:
+            return
+        removed = self._charge_module_ammo_overrides.pop(module.lower(), None)
+        if removed is None:
+            return
+        self._runtime_cache.clear()
+        self._fit_cache.clear()
+        self._profile_cache.clear()
+
     def clear_charge_module_ammo_overrides(self) -> None:
         if self._charge_module_ammo_overrides:
             self._charge_module_ammo_overrides.clear()
@@ -82,9 +93,13 @@ class RuntimeFromEftFactory:
         if override:
             return override
         ammo = self._pyfa.list_charge_options_for_module(module_name)
-        if ammo:
-            return ammo[0]
+        for charge_name in ammo:
+            if not self._is_script_charge_name(charge_name):
+                return charge_name
         return None
+
+    def _is_script_charge_name(self, charge_name: str | None) -> bool:
+        return bool(self._pyfa.is_script_charge_name(charge_name))
 
     @staticmethod
     def _skills_default() -> SkillProfile:
@@ -93,7 +108,7 @@ class RuntimeFromEftFactory:
     @staticmethod
     def _is_weapon_like_group(group_name: str) -> bool:
         g = group_name.lower()
-        if "disruptor" in g:
+        if "disruptor" in g or "interdiction sphere launcher" in g:
             return False
         return ("launcher" in g) or ("turret" in g) or ("weapon" in g)
 
@@ -756,7 +771,12 @@ class RuntimeFromEftFactory:
             cycle_params = None
         if cycle_params is not None:
             try:
-                pyfa_cycle_sec = max(0.0, float(getattr(cycle_params, "averageTime", 0.0) or 0.0) / 1000.0)
+                active_time_sec = max(0.0, float(getattr(cycle_params, "activeTime", 0.0) or 0.0) / 1000.0)
+                average_time_sec = max(0.0, float(getattr(cycle_params, "averageTime", 0.0) or 0.0) / 1000.0)
+                inactive_time_sec = max(0.0, float(getattr(cycle_params, "inactiveTime", 0.0) or 0.0) / 1000.0)
+                pyfa_cycle_sec = active_time_sec if active_time_sec > 0.0 else average_time_sec
+                if inactive_time_sec > 0.0 and not bool(getattr(cycle_params, "isInactivityReload", False)):
+                    reactivation_delay_sec = max(reactivation_delay_sec, inactive_time_sec)
             except Exception:
                 pyfa_cycle_sec = 0.0
 
@@ -768,12 +788,16 @@ class RuntimeFromEftFactory:
         is_command_burst = "command burst" in group_name
         is_burst_jammer = "burst jammer" in group_name
         is_smart_bomb = ("smart bomb" in group_name) or ("structure area denial module" in group_name)
+        is_interdiction_sphere_launcher = group_name == "interdiction sphere launcher"
+        is_warp_disruption_field_generator = group_name == "warp disrupt field generator"
         is_bomb_launcher = ("bomb launcher" in group_name)
         if not is_bomb_launcher and loaded_charge is not None:
             try:
                 is_bomb_launcher = bool(loaded_charge.requiresSkill("Bomb Deployment"))
             except Exception:
                 is_bomb_launcher = False
+        has_script_charge = loaded_charge is not None and self._is_script_charge_name(getattr(loaded_charge, "typeName", None))
+        is_unscripted_hic_bubble = is_warp_disruption_field_generator and (not has_script_charge)
         is_weapon_like = self._is_weapon_like_group(group_name)
 
         speed_factor = attr_opt("speedFactor")
@@ -958,6 +982,8 @@ class RuntimeFromEftFactory:
             and not is_ecm
             and not is_command_burst
             and not is_smart_bomb
+            and not is_interdiction_sphere_launcher
+            and not is_unscripted_hic_bubble
             and not is_weapon_like
             and shield_rep <= 0.0
             and armor_rep <= 0.0
@@ -1032,6 +1058,57 @@ class RuntimeFromEftFactory:
                 "armor resistance shift hardener",
             )
         )
+
+        spawns_static_bubble = False
+        bubble_affects_local_profile = False
+        if is_interdiction_sphere_launcher and loaded_charge is not None:
+            probe_radius = max(0.0, charge_attr("warpScrambleRange", 0.0))
+            probe_duration_sec = max(0.0, charge_attr("explosionDelay", 0.0) / 1000.0)
+            web_radius = max(0.0, charge_attr("doomsdayAOERange", 0.0))
+            web_duration_sec = max(0.0, charge_attr("doomsdayAOEDuration", 0.0) / 1000.0)
+            web_speed_factor = charge_attr_opt("speedFactor")
+            if web_radius > 0.0 and web_duration_sec > 0.0 and web_speed_factor is not None:
+                local_add["bubble_radius_m"] = web_radius
+                local_add["bubble_duration_sec"] = web_duration_sec
+                local_add["bubble_blocks_warp"] = 0.0
+                local_add["bubble_follow_owner"] = 0.0
+                local_add["bubble_probe"] = 1.0
+                local_add["bubble_web"] = 1.0
+                local_add["bubble_speed_factor_mult"] = max(0.01, pct_to_mult(float(web_speed_factor)))
+                spawns_static_bubble = True
+            elif probe_radius > 0.0 and probe_duration_sec > 0.0:
+                local_add["bubble_radius_m"] = probe_radius
+                local_add["bubble_duration_sec"] = probe_duration_sec
+                local_add["bubble_blocks_warp"] = 1.0
+                local_add["bubble_follow_owner"] = 0.0
+                local_add["bubble_probe"] = 1.0
+                spawns_static_bubble = True
+
+            if spawns_static_bubble:
+                local_add["bubble_shield_hp"] = max(0.0, charge_attr("shieldCapacity", 0.0))
+                local_add["bubble_armor_hp"] = max(0.0, charge_attr("armorHP", 0.0))
+                local_add["bubble_structure_hp"] = max(0.0, charge_attr("hp", 0.0))
+                local_add["bubble_shield_resonance_em"] = max(0.0, charge_attr_opt("shieldEmDamageResonance") or 1.0)
+                local_add["bubble_shield_resonance_thermal"] = max(0.0, charge_attr_opt("shieldThermalDamageResonance") or 1.0)
+                local_add["bubble_shield_resonance_kinetic"] = max(0.0, charge_attr_opt("shieldKineticDamageResonance") or 1.0)
+                local_add["bubble_shield_resonance_explosive"] = max(0.0, charge_attr_opt("shieldExplosiveDamageResonance") or 1.0)
+                local_add["bubble_armor_resonance_em"] = max(0.0, charge_attr_opt("armorEmDamageResonance") or 1.0)
+                local_add["bubble_armor_resonance_thermal"] = max(0.0, charge_attr_opt("armorThermalDamageResonance") or 1.0)
+                local_add["bubble_armor_resonance_kinetic"] = max(0.0, charge_attr_opt("armorKineticDamageResonance") or 1.0)
+                local_add["bubble_armor_resonance_explosive"] = max(0.0, charge_attr_opt("armorExplosiveDamageResonance") or 1.0)
+                local_add["bubble_structure_resonance_em"] = max(0.0, charge_attr_opt("emDamageResonance") or 1.0)
+                local_add["bubble_structure_resonance_thermal"] = max(0.0, charge_attr_opt("thermalDamageResonance") or 1.0)
+                local_add["bubble_structure_resonance_kinetic"] = max(0.0, charge_attr_opt("kineticDamageResonance") or 1.0)
+                local_add["bubble_structure_resonance_explosive"] = max(0.0, charge_attr_opt("explosiveDamageResonance") or 1.0)
+
+        if is_unscripted_hic_bubble and range_m > 0.0:
+            local_add["bubble_radius_m"] = max(0.0, range_m)
+            local_add["bubble_duration_sec"] = 0.0
+            local_add["bubble_blocks_warp"] = 1.0
+            local_add["bubble_follow_owner"] = 1.0
+            local_add["bubble_hic"] = 1.0
+            bubble_affects_local_profile = True
+
         has_projected = (
             range_m > 0.0
             and (
@@ -1053,7 +1130,11 @@ class RuntimeFromEftFactory:
         state_required = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
         module_state = ModuleState.ONLINE
         module_id = f"mod{suffix}"
-        affects_local_pyfa_profile = is_command_burst or (not has_projected and state_required == ModuleState.ACTIVE)
+        affects_local_pyfa_profile = (
+            bubble_affects_local_profile
+            or is_command_burst
+            or ((not has_projected) and state_required == ModuleState.ACTIVE and not spawns_static_bubble)
+        )
         module_tags = self._module_tags(
             item=item,
             has_projected=has_projected,
@@ -1377,7 +1458,11 @@ class RuntimeFromEftFactory:
         ship = fit.ship
         weapon_stats = self._collect_pyfa_weapon_stats(cast(list[Any], fit.modules), ship, require_volley=True)
         warp_scramble_status = float(ship.getModifiedItemAttr("warpScrambleStatus") or 0.0)
+        disallow_assistance = bool(ship.getModifiedItemAttr("disallowAssistance") or 0.0)
+        warp_bubble_immune = bool(ship.getModifiedItemAttr("warpBubbleImmune") or 0.0)
         warp_capacitor_need = float(ship.getModifiedItemAttr("warpCapacitorNeed") or 0.0)
+        ship_group_name = str(getattr(getattr(getattr(ship, "item", None), "group", None), "name", "") or "").strip().lower()
+        is_shuttle = ship_group_name == "shuttle"
         try:
             warp_speed_au_s = float(getattr(fit, "warpSpeed", 0.0) or 0.0)
         except Exception:
@@ -1433,6 +1518,9 @@ class RuntimeFromEftFactory:
             "warp_speed_au_s": max(0.0, warp_speed_au_s),
             "warp_capacitor_need": max(0.0, warp_capacitor_need),
             "max_warp_distance_au": max(0.0, max_warp_distance_au),
+            "disallow_assistance": disallow_assistance,
+            "warp_bubble_immune": warp_bubble_immune,
+            "is_shuttle": is_shuttle,
             "energy_warfare_resistance": float(ship.getModifiedItemAttr("energyWarfareResistance") or 1.0),
             "max_cap": float(ship.getModifiedItemAttr("capacitorCapacity") or 0.0),
             "cap_recharge_time": float(ship.getModifiedItemAttr("rechargeRate") or 0.0) / 1000.0,
@@ -1736,6 +1824,9 @@ class RuntimeFromEftFactory:
                 warp_speed_au_s=max(0.0, float(pyfa_final.get("warp_speed_au_s", 0.0) or 0.0)),
                 warp_capacitor_need=max(0.0, float(pyfa_final.get("warp_capacitor_need", 0.0) or 0.0)),
                 max_warp_distance_au=max(0.0, float(pyfa_final.get("max_warp_distance_au", 0.0) or 0.0)),
+                disallow_assistance=bool(pyfa_final.get("disallow_assistance", False)),
+                warp_bubble_immune=bool(pyfa_final.get("warp_bubble_immune", False)),
+                is_shuttle=bool(pyfa_final.get("is_shuttle", False)),
                 energy_warfare_resistance=max(0.0, float(pyfa_final.get("energy_warfare_resistance", 1.0) or 1.0)),
                 max_speed=max(1.0, float(pyfa_final.get("max_speed", 0.0) or 0.0)),
                 max_cap=max(1.0, float(pyfa_final.get("max_cap", 0.0) or 0.0)),
@@ -1811,6 +1902,9 @@ class RuntimeFromEftFactory:
                 warp_speed_au_s=profile.warp_speed_au_s,
                 warp_capacitor_need=profile.warp_capacitor_need,
                 max_warp_distance_au=profile.max_warp_distance_au,
+                disallow_assistance=profile.disallow_assistance,
+                warp_bubble_immune=profile.warp_bubble_immune,
+                is_shuttle=profile.is_shuttle,
             )
 
             runtime = FitRuntime(
@@ -1872,6 +1966,9 @@ class RuntimeFromEftFactory:
                 warp_speed_au_s=profile.warp_speed_au_s,
                 warp_capacitor_need=profile.warp_capacitor_need,
                 max_warp_distance_au=profile.max_warp_distance_au,
+                disallow_assistance=profile.disallow_assistance,
+                warp_bubble_immune=profile.warp_bubble_immune,
+                is_shuttle=profile.is_shuttle,
             )
             return runtime, fit, profile
         finally:
@@ -2111,6 +2208,25 @@ class _PyfaStaticBackend:
             except Exception:
                 continue
         return sorted(set(ammo_names))
+
+    def is_script_charge_name(self, charge_name: str | None) -> bool:
+        canonical = self.resolve_type_name(charge_name or "")
+        if not canonical:
+            return False
+        charge_item = self.get_item(canonical)
+        if charge_item is None:
+            return False
+        group_name = str(getattr(getattr(charge_item, "group", None), "name", "") or "").strip().lower()
+        return "script" in group_name
+
+    def supports_unloaded_charge_state(self, module_name: str) -> bool:
+        canonical_module = self.resolve_type_name(module_name)
+        if not canonical_module:
+            return False
+        charge_names = self.list_charge_options_for_module(canonical_module)
+        if not charge_names:
+            return False
+        return all(self.is_script_charge_name(charge_name) for charge_name in charge_names)
 
     def module_reload_time_sec(self, module_name: str) -> float:
         module = self.get_item(module_name)
@@ -2660,6 +2776,9 @@ def _clamp_runtime_state_to_pyfa_max(
 
 
 def _module_affects_local_pyfa_profile(module: ModuleRuntime) -> bool:
+    tags = tuple(str(value) for value in getattr(module, "tags", ()) or ())
+    if tags:
+        return "affects_local_pyfa_profile" in tags
     if _module_has_tag(module, "affects_local_pyfa_profile"):
         return True
     return any(
@@ -3069,6 +3188,17 @@ def get_charge_options_for_module(module_name: str, language: str = "en") -> lis
     canonical_module = backend.resolve_type_name(module_name)
     ammo = backend.list_charge_options_for_module(canonical_module)
     return [backend.localize_type_name(name, language) for name in ammo]
+
+
+def get_charge_option_values_for_module(module_name: str) -> list[str]:
+    backend = _get_static_backend()
+    canonical_module = backend.resolve_type_name(module_name)
+    return list(backend.list_charge_options_for_module(canonical_module))
+
+
+def module_supports_unloaded_charge(module_name: str) -> bool:
+    backend = _get_static_backend()
+    return bool(backend.supports_unloaded_charge_state(module_name))
 
 
 def get_type_display_name(type_name: str, language: str = "en") -> str:

@@ -47,10 +47,11 @@ from ..fleet_setup import (
     EftFitParser,
     RuntimeFromEftFactory,
     recompute_profile_from_pyfa_runtime,
-    get_charge_options_for_module,
+    get_charge_option_values_for_module,
     get_fit_backend_status,
     get_common_chargeable_modules,
     get_module_reload_time_sec,
+    module_supports_unloaded_charge,
     resolve_module_type_name,
     get_type_display_name,
 )
@@ -60,6 +61,9 @@ from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
     CMD_INDUCE_SQUAD_AT,
+    CMD_APPLY_FLEET_CHARGE,
+    CMD_CLEAR_MODULE_CHARGE_LOCK,
+    CMD_SET_MODULE_CHARGE_LOCK,
     CMD_SQUAD_APPROACH,
     CMD_SQUAD_ATTACK,
     CMD_SQUAD_CANCEL_PREFOCUS,
@@ -367,6 +371,22 @@ class MainWindow(QMainWindow):
             return initial_fit_key
         return str(getattr(ship.fit, "fit_key", "") or "")
 
+    @staticmethod
+    def _format_fit_module_line(module_name: str, charge_name: str, offline_suffix: str) -> str:
+        module_label = str(module_name or "").strip()
+        charge_label = str(charge_name or "").strip()
+        if charge_label:
+            return f"{module_label}, {charge_label}{offline_suffix}"
+        return f"{module_label}{offline_suffix}"
+
+    def _charge_selection_entries(self, module_name: str, *, language: str) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        if module_supports_unloaded_charge(module_name):
+            entries.append(("", QCoreApplication.translate("eve_sim", "None")))
+        for charge_name in get_charge_option_values_for_module(module_name):
+            entries.append((charge_name, get_type_display_name(charge_name, language=language)))
+        return entries
+
     def _apply_ship_module_manual_mode(self, ship, module_id: str, normalized_mode: str) -> None:
         if normalized_mode == "auto":
             ship.combat.module_manual_modes.pop(module_id, None)
@@ -556,6 +576,8 @@ class MainWindow(QMainWindow):
         target_ammo_name: str = "",
         force_module_id: str = "",
         force_ammo_name: str = "",
+        target_override: bool = False,
+        force_override: bool = False,
     ) -> str:
         locked_map = self._ship_locked_module_charges.get(ship_id, {})
         canonical_target_module = resolve_module_type_name(target_module_name).strip().lower() if target_module_name else ""
@@ -593,17 +615,17 @@ class MainWindow(QMainWindow):
             module_name = base.split(",", 1)[0].strip()
             canonical_module_name = resolve_module_type_name(module_name).strip().lower()
 
-            if force_module_id and module_id == force_module_id and canonical_force_ammo:
-                out.append(f"{module_name}, {canonical_force_ammo}{offline_suffix}")
+            if force_override and force_module_id and module_id == force_module_id:
+                out.append(self._format_fit_module_line(module_name, canonical_force_ammo, offline_suffix))
                 continue
 
-            locked_ammo = str(locked_map.get(module_id) or "").strip()
-            if locked_ammo:
-                out.append(f"{module_name}, {locked_ammo}{offline_suffix}")
+            if module_id in locked_map:
+                locked_ammo = str(locked_map.get(module_id) or "").strip()
+                out.append(self._format_fit_module_line(module_name, locked_ammo, offline_suffix))
                 continue
 
-            if canonical_target_module and canonical_target_ammo and canonical_module_name == canonical_target_module:
-                out.append(f"{module_name}, {canonical_target_ammo}{offline_suffix}")
+            if target_override and canonical_target_module and canonical_module_name == canonical_target_module:
+                out.append(self._format_fit_module_line(module_name, canonical_target_ammo, offline_suffix))
             else:
                 out.append(line)
 
@@ -684,16 +706,28 @@ class MainWindow(QMainWindow):
             return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
 
         spec = parsed_old.module_specs[module_idx - 1]
-        ammo_options = get_charge_options_for_module(spec.module_name, language=lang)
-        if not ammo_options:
+        ammo_entries = self._charge_selection_entries(spec.module_name, language=lang)
+        if not ammo_entries:
             return False, QCoreApplication.translate("eve_sim", 'Module is not charge-loadable')
 
-        canonical_ammo = resolve_module_type_name(ammo_name).strip()
-        if not canonical_ammo:
+        raw_ammo_name = str(ammo_name or "").strip()
+        canonical_ammo = resolve_module_type_name(raw_ammo_name).strip() if raw_ammo_name else ""
+        valid_values = {str(value or "").strip().lower() for value, _label in ammo_entries}
+        if canonical_ammo.strip().lower() not in valid_values:
             return False, QCoreApplication.translate("eve_sim", 'Charge does not match this module')
-        option_keys = {resolve_module_type_name(opt).strip().lower() for opt in ammo_options}
-        if canonical_ammo.strip().lower() not in option_keys:
-            return False, QCoreApplication.translate("eve_sim", 'Charge does not match this module')
+
+        if self.network_mode == "client" and self.lan_client is not None:
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SET_MODULE_CHARGE_LOCK,
+                    "ship_id": ship_id,
+                    "module_id": module_id,
+                    "charge_name": canonical_ammo,
+                }
+            )
+            module_name = get_type_display_name(spec.module_name, language=lang)
+            ammo_display = get_type_display_name(canonical_ammo, language=lang) if canonical_ammo else QCoreApplication.translate("eve_sim", "None")
+            return True, QCoreApplication.translate("eve_sim", 'Locked {module} charge to {ammo}').format(module=module_name, ammo=ammo_display)
 
         locked_map = self._ship_locked_module_charges.setdefault(ship_id, {})
         locked_map[module_id] = canonical_ammo
@@ -702,6 +736,7 @@ class MainWindow(QMainWindow):
             old_text,
             force_module_id=module_id,
             force_ammo_name=canonical_ammo,
+            force_override=True,
         )
 
         ok, message, parsed_new = self._rebuild_ship_from_fit_text(ship_id, new_text, lang)
@@ -722,7 +757,7 @@ class MainWindow(QMainWindow):
             )
 
         module_name = get_type_display_name(spec.module_name, language=lang)
-        ammo_display = get_type_display_name(canonical_ammo, language=lang)
+        ammo_display = get_type_display_name(canonical_ammo, language=lang) if canonical_ammo else QCoreApplication.translate("eve_sim", "None")
         return True, QCoreApplication.translate("eve_sim", 'Locked {module} charge to {ammo}').format(module=module_name, ammo=ammo_display)
 
     def _clear_ship_module_charge_lock(self, ship_id: str, module_id: str) -> tuple[bool, str]:
@@ -739,6 +774,16 @@ class MainWindow(QMainWindow):
 
         locked_map = self._ship_locked_module_charges.get(ship_id)
         if not locked_map or module_id not in locked_map:
+            return True, QCoreApplication.translate("eve_sim", 'Unlocked charge lock for {module}').format(module=module_label)
+
+        if self.network_mode == "client" and self.lan_client is not None:
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_CLEAR_MODULE_CHARGE_LOCK,
+                    "ship_id": ship_id,
+                    "module_id": module_id,
+                }
+            )
             return True, QCoreApplication.translate("eve_sim", 'Unlocked charge lock for {module}').format(module=module_label)
 
         locked_map.pop(module_id, None)
@@ -1028,7 +1073,14 @@ class MainWindow(QMainWindow):
         self._refresh_propulsion_button_text()
 
     def _refresh_common_charge_modules(self) -> None:
-        fit_texts = [r.fit_text for r in self.manual_setup if self._is_ammo_configurable_team(r.team)]
+        fit_texts = [
+            str(self._ship_fit_texts.get(ship.ship_id, "") or "").strip()
+            for ship in self.engine.world.ships.values()
+            if self._is_ammo_configurable_team(ship.team)
+        ]
+        fit_texts = [text for text in fit_texts if text]
+        if not fit_texts:
+            fit_texts = [r.fit_text for r in self.manual_setup if self._is_ammo_configurable_team(r.team)]
         current = self.charge_module_combo.currentText()
         charge_modules = get_common_chargeable_modules(fit_texts, usage_threshold=0.0, language=self.current_language())
         self.charge_module_combo.blockSignals(True)
@@ -1039,49 +1091,75 @@ class MainWindow(QMainWindow):
         self.charge_module_combo.blockSignals(False)
 
         for module_name in charge_modules:
-            ammo_list = get_charge_options_for_module(module_name, language=self.current_language())
-            if not ammo_list:
+            ammo_entries = self._charge_selection_entries(module_name, language=self.current_language())
+            if not ammo_entries:
                 continue
             selected = self._charge_module_ammo_selection.get(module_name)
-            if not selected or selected not in ammo_list:
-                self._charge_module_ammo_selection[module_name] = ammo_list[0]
+            valid_values = {value for value, _label in ammo_entries}
+            if selected is None or selected not in valid_values:
+                default_entry = ammo_entries[0]
+                self._charge_module_ammo_selection[module_name] = default_entry[0]
             try:
-                self._factory.set_charge_module_ammo_override(
-                    module_name,
-                    self._charge_module_ammo_selection[module_name],
-                )
+                selected_value = self._charge_module_ammo_selection[module_name]
+                if selected_value:
+                    self._factory.set_charge_module_ammo_override(module_name, selected_value)
+                else:
+                    self._factory.clear_charge_module_ammo_override(module_name)
             except Exception:
                 continue
 
         self._on_charge_module_changed(self.charge_module_combo.currentText())
 
     def _on_charge_module_changed(self, module_name: str) -> None:
+        self.ammo_combo.blockSignals(True)
         self.ammo_combo.clear()
         if not module_name:
+            self.ammo_combo.blockSignals(False)
             return
-        ammo = get_charge_options_for_module(module_name, language=self.current_language())
-        self.ammo_combo.addItems(ammo)
-        if not ammo:
+        ammo_entries = self._charge_selection_entries(module_name, language=self.current_language())
+        for value, label in ammo_entries:
+            self.ammo_combo.addItem(label, value)
+        if not ammo_entries:
+            self.ammo_combo.blockSignals(False)
             return
         selected = self._charge_module_ammo_selection.get(module_name)
-        if not selected or selected not in ammo:
-            selected = ammo[0]
+        valid_values = {value for value, _label in ammo_entries}
+        if selected is None or selected not in valid_values:
+            selected = ammo_entries[0][0]
             self._charge_module_ammo_selection[module_name] = selected
             try:
-                self._factory.set_charge_module_ammo_override(module_name, selected)
+                if selected:
+                    self._factory.set_charge_module_ammo_override(module_name, selected)
+                else:
+                    self._factory.clear_charge_module_ammo_override(module_name)
             except Exception:
                 pass
-        self.ammo_combo.setCurrentText(selected)
+        idx = self.ammo_combo.findData(selected)
+        self.ammo_combo.setCurrentIndex(0 if idx < 0 else idx)
+        self.ammo_combo.blockSignals(False)
 
     def _apply_selected_ammo(self) -> None:
         lang = self.current_language()
         module_name = self.charge_module_combo.currentText().strip()
-        ammo_name = self.ammo_combo.currentText().strip()
-        if not module_name or not ammo_name:
+        ammo_name = str(self.ammo_combo.currentData() or "").strip()
+        if not module_name:
             return
 
         self._charge_module_ammo_selection[module_name] = ammo_name
-        self._factory.set_charge_module_ammo_override(module_name, ammo_name)
+        if self.network_mode == "client" and self.lan_client is not None:
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_APPLY_FLEET_CHARGE,
+                    "module_name": resolve_module_type_name(module_name).strip(),
+                    "charge_name": ammo_name,
+                }
+            )
+            return
+
+        if ammo_name:
+            self._factory.set_charge_module_ammo_override(module_name, ammo_name)
+        else:
+            self._factory.clear_charge_module_ammo_override(module_name)
 
         reload_sec = max(0.0, get_module_reload_time_sec(module_name))
         updated_ships = 0
@@ -1110,6 +1188,7 @@ class MainWindow(QMainWindow):
                 old_text,
                 target_module_name=module_name,
                 target_ammo_name=ammo_name,
+                target_override=True,
             )
             if new_text == old_text:
                 continue
@@ -1145,7 +1224,12 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             QCoreApplication.translate("eve_sim", 'Ammo Configuration'),
-            QCoreApplication.translate("eve_sim", 'Switched {module} to {ammo} (updated {count} ships). Battle state is preserved; effect resumes after reload {reload:.1f}s.').format(module=module_name, ammo=ammo_name, count=updated_ships, reload=reload_sec),
+            QCoreApplication.translate("eve_sim", 'Switched {module} to {ammo} (updated {count} ships). Battle state is preserved; effect resumes after reload {reload:.1f}s.').format(
+                module=module_name,
+                ammo=(get_type_display_name(ammo_name, language=lang) if ammo_name else QCoreApplication.translate("eve_sim", "None")),
+                count=updated_ships,
+                reload=reload_sec,
+            ),
         )
         self._log_user_action(
             "apply_ammo",
@@ -1972,6 +2056,70 @@ class MainWindow(QMainWindow):
                     self._undeployed_ship_ids.add(ship.ship_id)
                     ship.vital.alive = False
             return
+        if kind == CMD_SET_MODULE_CHARGE_LOCK:
+            ship_id = str(cmd.get("ship_id", "") or "").strip()
+            module_id = str(cmd.get("module_id", "") or "").strip()
+            if not ship_id or not module_id:
+                return
+            charge_name = str(cmd.get("charge_name", "") or "")
+            self._set_ship_module_charge_lock(ship_id, module_id, charge_name)
+            return
+        if kind == CMD_CLEAR_MODULE_CHARGE_LOCK:
+            ship_id = str(cmd.get("ship_id", "") or "").strip()
+            module_id = str(cmd.get("module_id", "") or "").strip()
+            if not ship_id or not module_id:
+                return
+            self._clear_ship_module_charge_lock(ship_id, module_id)
+            return
+        if kind == CMD_APPLY_FLEET_CHARGE:
+            module_name = str(cmd.get("module_name", "") or "").strip()
+            charge_name = str(cmd.get("charge_name", "") or "").strip()
+            if not module_name:
+                return
+            if charge_name:
+                self._factory.set_charge_module_ammo_override(module_name, charge_name)
+            else:
+                self._factory.clear_charge_module_ammo_override(module_name)
+
+            reload_sec = max(0.0, get_module_reload_time_sec(module_name))
+            for ship_id, ship in list(self.engine.world.ships.items()):
+                if ship.team != team:
+                    continue
+                old_text = str(self._ship_fit_texts.get(ship_id, "") or "")
+                if not old_text:
+                    continue
+                try:
+                    parsed_old = self._parser.parse(old_text)
+                except Exception:
+                    parsed_old = None
+
+                new_text = self._rewrite_fit_text_with_lock_rules(
+                    ship_id,
+                    old_text,
+                    target_module_name=module_name,
+                    target_ammo_name=charge_name,
+                    target_override=True,
+                )
+                if new_text == old_text:
+                    continue
+
+                ok, _message, parsed_new = self._rebuild_ship_from_fit_text(ship_id, new_text, self.current_language())
+                if not ok:
+                    continue
+
+                if reload_sec <= 0.0:
+                    continue
+                changed_module_ids: list[str] = []
+                if parsed_old is not None and parsed_new is not None:
+                    changed_module_ids = self._changed_module_ids_between_parsed(parsed_old, parsed_new)
+                for module_id in changed_module_ids:
+                    self.engine.combat.request_module_reload(
+                        ship,
+                        module_id,
+                        reload_sec,
+                        now=float(self.engine.world.now),
+                    )
+            return
 
         squad = str(cmd.get("squad_id", "")).strip()
         if kind == CMD_INDUCE_FLEET_AT:
@@ -2350,6 +2498,7 @@ class MainWindow(QMainWindow):
                     self.engine.world.ships.pop(sid, None)
                     self.engine.ship_agents.pop(sid, None)
                     self._ship_fit_texts.pop(sid, None)
+                    self._ship_locked_module_charges.pop(sid, None)
                     self._undeployed_ship_ids.discard(sid)
                     dialog = self._status_dialogs.pop(sid, None)
                     if dialog is not None:
@@ -2484,6 +2633,20 @@ class MainWindow(QMainWindow):
             else:
                 ship.combat.ecm_last_attempt_at_by_module.clear()
 
+            locked_module_charges = raw.get("locked_module_charges")
+            if isinstance(locked_module_charges, dict):
+                normalized_locked = {
+                    str(module_id): str(charge_name or "")
+                    for module_id, charge_name in locked_module_charges.items()
+                    if str(module_id)
+                }
+                if normalized_locked:
+                    self._ship_locked_module_charges[ship_id] = normalized_locked
+                else:
+                    self._ship_locked_module_charges.pop(ship_id, None)
+            elif "locked_module_charges" in raw:
+                self._ship_locked_module_charges.pop(ship_id, None)
+
             module_states = raw.get("module_states")
             if isinstance(module_states, dict) and ship.runtime is not None:
                 state_map = {str(mid): str(state) for mid, state in module_states.items()}
@@ -2505,6 +2668,7 @@ class MainWindow(QMainWindow):
         raw_ecm_success_by_module = raw.get("ecm_last_attempt_success_by_module")
         raw_ecm_at_by_module = raw.get("ecm_last_attempt_at_by_module")
         raw_module_states = raw.get("module_states")
+        raw_locked_module_charges = raw.get("locked_module_charges")
         pos: dict = raw_pos if isinstance(raw_pos, dict) else {}
         vel: dict = raw_vel if isinstance(raw_vel, dict) else {}
         projected: dict = raw_projected if isinstance(raw_projected, dict) else {}
@@ -2514,6 +2678,7 @@ class MainWindow(QMainWindow):
         ecm_success_by_module: dict = raw_ecm_success_by_module if isinstance(raw_ecm_success_by_module, dict) else {}
         ecm_at_by_module: dict = raw_ecm_at_by_module if isinstance(raw_ecm_at_by_module, dict) else {}
         module_states: dict = raw_module_states if isinstance(raw_module_states, dict) else {}
+        locked_module_charges: dict = raw_locked_module_charges if isinstance(raw_locked_module_charges, dict) else {}
         cycle_timers_sig: list[tuple[str, float]] = []
         for module_id, timer_left in cycle_timers.items():
             mid = str(module_id)
@@ -2579,6 +2744,7 @@ class MainWindow(QMainWindow):
             tuple(sorted((str(k), bool(v)) for k, v in ecm_success_by_module.items() if isinstance(v, bool))),
             tuple(sorted(ecm_at_by_module_sig)),
             tuple(sorted((str(k), str(v)) for k, v in module_states.items())),
+            tuple(sorted((str(k), str(v)) for k, v in locked_module_charges.items())),
         )
 
     def _engine_config_payload(self) -> dict[str, object]:
@@ -2674,6 +2840,7 @@ class MainWindow(QMainWindow):
             sid = str(ship_id)
             row = dict(raw)
             row["deployed"] = sid not in self._undeployed_ship_ids
+            row["locked_module_charges"] = dict(self._ship_locked_module_charges.get(sid, {}))
             signature = self._ship_signature(row)
             next_signatures[sid] = signature
             fit_text = self._ship_fit_texts.get(sid, "")

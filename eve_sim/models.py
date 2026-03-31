@@ -54,6 +54,9 @@ class FitDescriptor:
     warp_speed_au_s: float = 0.0
     warp_capacitor_need: float = 0.0
     max_warp_distance_au: float = 0.0
+    disallow_assistance: bool = False
+    warp_bubble_immune: bool = False
+    is_shuttle: bool = False
 
 
 @dataclass(slots=True)
@@ -123,6 +126,19 @@ class ShipProfile:
     warp_speed_au_s: float = 0.0
     warp_capacitor_need: float = 0.0
     max_warp_distance_au: float = 0.0
+    disallow_assistance: bool = False
+    warp_bubble_immune: bool = False
+    is_shuttle: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WarpInterdictionSnapshot:
+    field_id: str
+    kind: str
+    interdiction_kind: str
+    position: Vector2
+    radius_m: float
+    blocks_warp: bool
 
 
 @dataclass(slots=True)
@@ -139,6 +155,9 @@ class WarpState:
     warp_duration: float = 0.0
     warp_elapsed: float = 0.0
     capacitor_cost: float = 0.0
+    bubble_immune_snapshot: bool = False
+    interdiction_snapshots_captured: bool = False
+    interdiction_snapshots: tuple[WarpInterdictionSnapshot, ...] = field(default_factory=tuple)
 
 
 @dataclass(slots=True)
@@ -242,6 +261,42 @@ class ProjectileBlast:
     position: Vector2
     radius_m: float
     expires_at: float
+
+
+@dataclass(slots=True)
+class BubbleField:
+    field_id: str
+    kind: str
+    interdiction_kind: str
+    source_ship_id: str
+    source_module_id: str
+    team: Team
+    position: Vector2
+    radius_m: float
+    expires_at: float
+    blocks_warp: bool = False
+    speed_factor_mult: float = 1.0
+    anchor_ship_id: str | None = None
+    destructible: bool = False
+    shield: float = 0.0
+    armor: float = 0.0
+    structure: float = 0.0
+    shield_max: float = 0.0
+    armor_max: float = 0.0
+    structure_max: float = 0.0
+    shield_resonance_em: float = 1.0
+    shield_resonance_thermal: float = 1.0
+    shield_resonance_kinetic: float = 1.0
+    shield_resonance_explosive: float = 1.0
+    armor_resonance_em: float = 1.0
+    armor_resonance_thermal: float = 1.0
+    armor_resonance_kinetic: float = 1.0
+    armor_resonance_explosive: float = 1.0
+    structure_resonance_em: float = 1.0
+    structure_resonance_thermal: float = 1.0
+    structure_resonance_kinetic: float = 1.0
+    structure_resonance_explosive: float = 1.0
+    alive: bool = True
 
 
 @dataclass(slots=True)

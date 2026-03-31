@@ -177,6 +177,24 @@ class SimulationEngine:
                 }
                 for blast_id, blast in self.world.projectile_blasts.items()
             },
+            "bubble_fields": {
+                field_id: {
+                    "field_id": field.field_id,
+                    "kind": field.kind,
+                    "interdiction_kind": field.interdiction_kind,
+                    "source_ship_id": field.source_ship_id,
+                    "source_module_id": field.source_module_id,
+                    "team": field.team.value,
+                    "position": {"x": field.position.x, "y": field.position.y},
+                    "radius_m": float(field.radius_m),
+                    "expires_at": float(field.expires_at),
+                    "blocks_warp": bool(field.blocks_warp),
+                    "speed_factor_mult": float(field.speed_factor_mult),
+                    "anchor_ship_id": field.anchor_ship_id,
+                    "alive": bool(field.alive),
+                }
+                for field_id, field in self.world.bubble_fields.items()
+            },
             "intents": {k: asdict(v) for k, v in self.world.intents.items()},
             "squad_focus_queues": {k: list(v) for k, v in self.world.squad_focus_queues.items()},
         }

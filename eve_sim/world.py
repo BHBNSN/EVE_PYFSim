@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .models import Beacon, FleetIntent, ProjectileBlast, ProjectileEntity, ShipEntity, Team
+from .models import Beacon, BubbleField, FleetIntent, ProjectileBlast, ProjectileEntity, ShipEntity, Team
 
 
 @dataclass(slots=True)
@@ -20,6 +20,7 @@ class WorldState:
     squad_prelock_timers: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     projectiles: dict[str, ProjectileEntity] = field(default_factory=dict)
     projectile_blasts: dict[str, ProjectileBlast] = field(default_factory=dict)
+    bubble_fields: dict[str, BubbleField] = field(default_factory=dict)
 
     def by_team(self, team: Team) -> list[ShipEntity]:
         return [s for s in self.ships.values() if s.team == team and s.vital.alive]
