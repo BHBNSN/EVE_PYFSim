@@ -361,6 +361,12 @@ class MainWindow(QMainWindow):
             return None
         return next((candidate for candidate in runtime.modules if str(candidate.module_id) == str(module_id)), None)
 
+    @staticmethod
+    def _preserve_runtime_dynamic_state(source_runtime, target_runtime) -> None:
+        if source_runtime is None or target_runtime is None:
+            return
+        CombatSystem._copy_runtime_dynamic_state(source_runtime, target_runtime)
+
     def _ship_initial_fit_key(self, ship) -> str:
         runtime = getattr(ship, "runtime", None)
         if runtime is not None and isinstance(getattr(runtime, "diagnostics", None), dict):
@@ -636,6 +642,7 @@ class MainWindow(QMainWindow):
         if ship is None:
             return False, QCoreApplication.translate("eve_sim", 'Ship not found'), None
         initial_fit_key = self._ship_initial_fit_key(ship)
+        source_runtime = ship.runtime
         try:
             parsed = self._parser.parse(fit_text)
             runtime_template, fit = self._factory.build(parsed)
@@ -643,6 +650,8 @@ class MainWindow(QMainWindow):
             profile = self._factory.build_profile(parsed)
         except Exception as exc:
             return False, display_user_error(exc), None
+
+        self._preserve_runtime_dynamic_state(source_runtime, runtime)
 
         ship.runtime = runtime
         ship.fit = fit
