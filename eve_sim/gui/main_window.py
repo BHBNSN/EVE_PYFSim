@@ -1476,6 +1476,7 @@ class MainWindow(QMainWindow):
             ship.combat.current_target = None
             ship.combat.last_attack_target = None
             ship.combat.lock_targets.clear()
+            ship.combat.lock_started_at.clear()
             ship.combat.lock_timers.clear()
             ship.combat.lock_deadlines.clear()
             ship.combat.fire_delay_timers.clear()
@@ -1847,6 +1848,7 @@ class MainWindow(QMainWindow):
                 if ship.team != self.controlled_team or ship.squad_id != squad:
                     continue
                 ship.combat.lock_targets.discard(target_id)
+                ship.combat.lock_started_at.pop(target_id, None)
                 ship.combat.lock_timers.pop(target_id, None)
                 ship.combat.lock_deadlines.pop(target_id, None)
                 ship.combat.fire_delay_timers.pop(target_id, None)
@@ -1886,6 +1888,7 @@ class MainWindow(QMainWindow):
                 ship.combat.current_target = None
                 ship.combat.last_attack_target = None
                 ship.combat.lock_targets.clear()
+                ship.combat.lock_started_at.clear()
                 ship.combat.lock_timers.clear()
                 ship.combat.lock_deadlines.clear()
                 ship.combat.fire_delay_timers.clear()
@@ -2244,6 +2247,7 @@ class MainWindow(QMainWindow):
                     if ship.team != team or ship.squad_id != squad:
                         continue
                     ship.combat.lock_targets.discard(target_id)
+                    ship.combat.lock_started_at.pop(target_id, None)
                     ship.combat.lock_timers.pop(target_id, None)
                     ship.combat.lock_deadlines.pop(target_id, None)
                     ship.combat.fire_delay_timers.pop(target_id, None)
@@ -2266,6 +2270,7 @@ class MainWindow(QMainWindow):
                     ship.combat.current_target = None
                     ship.combat.last_attack_target = None
                     ship.combat.lock_targets.clear()
+                    ship.combat.lock_started_at.clear()
                     ship.combat.lock_timers.clear()
                     ship.combat.lock_deadlines.clear()
                     ship.combat.fire_delay_timers.clear()

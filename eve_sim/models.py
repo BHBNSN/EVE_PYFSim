@@ -177,6 +177,7 @@ class CombatState:
     lock_targets: set[str] = field(default_factory=set)
     current_target: str | None = None
     last_attack_target: str | None = None
+    lock_started_at: dict[str, float] = field(default_factory=dict)
     lock_timers: dict[str, float] = field(default_factory=dict)
     lock_deadlines: dict[str, float] = field(default_factory=dict)
     module_ammo_reload_timers: dict[str, float] = field(default_factory=dict)

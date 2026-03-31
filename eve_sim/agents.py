@@ -341,6 +341,7 @@ class CommanderAgent(BaseAgent):
                 ship_prelock_timers = prelock_timers_by_ship.get(ship.ship_id, {})
                 if assigned in ship_prelocked:
                     ship.combat.lock_targets.add(assigned)
+                    ship.combat.lock_started_at.setdefault(assigned, float(world.now))
                     ship.combat.lock_timers.pop(assigned, None)
                     ship.combat.lock_deadlines.pop(assigned, None)
                 else:
@@ -348,6 +349,7 @@ class CommanderAgent(BaseAgent):
                     if remaining is not None and remaining > 0:
                         remaining_float = float(remaining)
                         ship.combat.lock_targets.discard(assigned)
+                        ship.combat.lock_started_at.setdefault(assigned, float(world.now))
                         ship.combat.lock_timers[assigned] = remaining_float
                         ship.combat.lock_deadlines[assigned] = float(world.now) + remaining_float
 

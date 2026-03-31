@@ -1295,6 +1295,82 @@ class CombatSystem:
         return float(world.now)
 
     @staticmethod
+    def _lock_slot_targets(ship) -> set[str]:
+        targets = {str(target_id) for target_id in ship.combat.lock_targets if str(target_id)}
+        targets.update(str(target_id) for target_id in ship.combat.lock_timers.keys() if str(target_id))
+        targets.update(str(target_id) for target_id in ship.combat.lock_deadlines.keys() if str(target_id))
+        return targets
+
+    @staticmethod
+    def _lock_started_at(ship, target_id: str) -> float:
+        try:
+            return float(ship.combat.lock_started_at.get(str(target_id), float("-inf")))
+        except Exception:
+            return float("-inf")
+
+    @staticmethod
+    def _remember_lock_started(ship, target_id: str, now: float) -> None:
+        normalized_target_id = str(target_id or "")
+        if not normalized_target_id:
+            return
+        ship.combat.lock_started_at.setdefault(normalized_target_id, float(now))
+
+    @staticmethod
+    def _locked_target_is_in_use(ship, target_id: str) -> bool:
+        normalized_target_id = str(target_id or "")
+        if not normalized_target_id:
+            return False
+        if ship.combat.current_target == normalized_target_id:
+            return True
+        if normalized_target_id in ship.combat.fire_delay_timers:
+            return True
+        return normalized_target_id in ship.combat.projected_targets.values()
+
+    def _drop_lock_target(self, ship, target_id: str | None) -> None:
+        normalized_target_id = str(target_id or "")
+        if not normalized_target_id:
+            return
+        ship.combat.lock_targets.discard(normalized_target_id)
+        self._clear_lock_timer(ship, normalized_target_id)
+        ship.combat.lock_started_at.pop(normalized_target_id, None)
+        ship.combat.fire_delay_timers.pop(normalized_target_id, None)
+        if ship.combat.current_target == normalized_target_id:
+            ship.combat.current_target = None
+        if ship.combat.last_attack_target == normalized_target_id:
+            ship.combat.last_attack_target = None
+        for module_id, projected_target_id in list(ship.combat.projected_targets.items()):
+            if projected_target_id == normalized_target_id:
+                ship.combat.projected_targets.pop(module_id, None)
+
+    def _select_lock_eviction_target(self, ship, preserve_target_id: str | None) -> str | None:
+        normalized_preserve_target_id = str(preserve_target_id or "")
+        occupied = [
+            target_id
+            for target_id in self._lock_slot_targets(ship)
+            if target_id and target_id != normalized_preserve_target_id
+        ]
+        if not occupied:
+            return None
+        idle_targets = [target_id for target_id in occupied if not self._locked_target_is_in_use(ship, target_id)]
+        candidate_pool = idle_targets or occupied
+        return min(candidate_pool, key=lambda target_id: (self._lock_started_at(ship, target_id), target_id))
+
+    def _ensure_lock_slot_capacity(self, ship, preserve_target_id: str | None) -> bool:
+        max_locked_targets = max(0, int(getattr(ship.profile, "max_locked_targets", 0) or 0))
+        normalized_preserve_target_id = str(preserve_target_id or "")
+        if max_locked_targets <= 0:
+            return True
+        while True:
+            occupied = self._lock_slot_targets(ship)
+            others = [target_id for target_id in occupied if target_id != normalized_preserve_target_id]
+            if len(others) < max_locked_targets:
+                return True
+            eviction_target_id = self._select_lock_eviction_target(ship, normalized_preserve_target_id)
+            if not eviction_target_id:
+                return False
+            self._drop_lock_target(ship, eviction_target_id)
+
+    @staticmethod
     def _clear_lock_timer(ship, target_id: str) -> None:
         ship.combat.lock_timers.pop(target_id, None)
         ship.combat.lock_deadlines.pop(target_id, None)
@@ -1337,6 +1413,7 @@ class CombatSystem:
 
     def _schedule_lock_deadline(self, ship, target_id: str, *, duration: float | None = None, deadline: float | None = None, now: float) -> None:
         due_at = float(deadline) if deadline is not None else float(now) + max(0.0, float(duration or 0.0))
+        self._remember_lock_started(ship, target_id, now)
         self._schedule_timer_deadline(
             ship,
             target_id,
@@ -1997,17 +2074,17 @@ class CombatSystem:
     ) -> bool:
         if not target_id or target is None or not target.vital.alive:
             if target_id:
-                ship.combat.lock_targets.discard(target_id)
-                self._clear_lock_timer(ship, target_id)
+                self._drop_lock_target(ship, target_id)
             return False
         now_value = self._decision_now(world, now)
         if not self._can_target_under_ecm(ship, target_id, now_value):
-            ship.combat.lock_targets.discard(target_id)
-            self._clear_lock_timer(ship, target_id)
+            self._drop_lock_target(ship, target_id)
             return False
         if target_id in ship.combat.lock_targets:
             return True
         if target_id not in ship.combat.lock_deadlines and target_id not in ship.combat.lock_timers:
+            if not self._ensure_lock_slot_capacity(ship, target_id):
+                return False
             profile_for_lock = target_profile if target_profile is not None else target.profile
             self._schedule_lock_deadline(
                 ship,
@@ -2031,9 +2108,7 @@ class CombatSystem:
             if not ship.vital.alive:
                 continue
             if self._ship_in_warp(ship):
-                ship.combat.lock_targets.clear()
-                ship.combat.lock_timers.clear()
-                ship.combat.lock_deadlines.clear()
+                self._break_all_locks(ship)
                 continue
             if not ship.combat.lock_timers and not ship.combat.lock_deadlines:
                 continue
@@ -2046,8 +2121,7 @@ class CombatSystem:
                     or self._ship_in_warp(target)
                     or not self._can_target_under_ecm(ship, target_id, now_value)
                 ):
-                    self._clear_lock_timer(ship, target_id)
-                    ship.combat.lock_targets.discard(target_id)
+                    self._drop_lock_target(ship, target_id)
                     continue
                 if target_id in ship.combat.lock_deadlines:
                     if float(left) > 0.0:
@@ -2066,7 +2140,11 @@ class CombatSystem:
                             )
                         continue
                 if float(ship.combat.lock_timers.get(target_id, 0.0) or 0.0) <= 0.0:
+                    if not self._ensure_lock_slot_capacity(ship, target_id):
+                        self._drop_lock_target(ship, target_id)
+                        continue
                     ship.combat.lock_targets.add(target_id)
+                    self._remember_lock_started(ship, target_id, now_value)
                     self._clear_lock_timer(ship, target_id)
                     if self.detailed_logging and self.logger is not None:
                         self.logger.debug(f"lock_complete attacker={ship.ship_id} target={target_id}")
@@ -3798,18 +3876,18 @@ class CombatSystem:
         active_sources = self._prune_ecm_sources(ship, now)
         if not active_sources:
             return
-        ship.combat.lock_targets.intersection_update(active_sources)
-        for target_id in list(ship.combat.lock_timers.keys()):
+        engaged_target_ids = set(self._lock_slot_targets(ship))
+        engaged_target_ids.update(str(target_id) for target_id in ship.combat.fire_delay_timers.keys() if str(target_id))
+        engaged_target_ids.update(
+            str(target_id)
+            for target_id in ship.combat.projected_targets.values()
+            if str(target_id)
+        )
+        if ship.combat.current_target:
+            engaged_target_ids.add(str(ship.combat.current_target))
+        for target_id in engaged_target_ids:
             if target_id not in active_sources:
-                self._clear_lock_timer(ship, target_id)
-        for target_id in list(ship.combat.fire_delay_timers.keys()):
-            if target_id not in active_sources:
-                ship.combat.fire_delay_timers.pop(target_id, None)
-        for module_id, target_id in list(ship.combat.projected_targets.items()):
-            if target_id not in active_sources:
-                ship.combat.projected_targets.pop(module_id, None)
-        if ship.combat.current_target and ship.combat.current_target not in active_sources:
-            ship.combat.current_target = None
+                self._drop_lock_target(ship, target_id)
 
     def _update_ecm_restrictions(self, world: WorldState, now: float | None = None) -> None:
         now_value = self._decision_now(world, now)
@@ -3824,9 +3902,11 @@ class CombatSystem:
         ship.combat.lock_targets.clear()
         ship.combat.lock_timers.clear()
         ship.combat.lock_deadlines.clear()
+        ship.combat.lock_started_at.clear()
         ship.combat.fire_delay_timers.clear()
         ship.combat.projected_targets.clear()
         ship.combat.current_target = None
+        ship.combat.last_attack_target = None
 
     def _resolve_ecm_cycle(self, world: WorldState, source, module, target_id: str) -> None:
         target = world.ships.get(target_id)
