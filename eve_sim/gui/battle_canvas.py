@@ -104,6 +104,7 @@ class BattleCanvas(QWidget):
         on_issue_focus: Callable[[str], None],
         on_issue_prefocus: Callable[[str], None],
         on_cancel_prefocus: Callable[[str], None],
+        on_show_ship_context_menu: Callable[[str, QPoint], None],
         on_induce_squad_spawn: Callable[[str, Vector2], None],
         on_induce_fleet_spawn: Callable[[Vector2], None],
         controlled_squads_getter: Callable[[], list[str]],
@@ -126,6 +127,7 @@ class BattleCanvas(QWidget):
         self.on_issue_focus = on_issue_focus
         self.on_issue_prefocus = on_issue_prefocus
         self.on_cancel_prefocus = on_cancel_prefocus
+        self.on_show_ship_context_menu = on_show_ship_context_menu
         self.on_induce_squad_spawn = on_induce_squad_spawn
         self.on_induce_fleet_spawn = on_induce_fleet_spawn
         self.controlled_squads_getter = controlled_squads_getter
@@ -142,6 +144,8 @@ class BattleCanvas(QWidget):
         self.pan_world = Vector2(0.0, 0.0)
         self.selected_squad = "BLUE-ALPHA"
         self.selected_enemy_target: str | None = None
+        self.selected_ship_id: str | None = None
+        self.highlighted_roster_ship_ids: set[str] = set()
 
         self.pan_active = False
         self.pan_start: QPoint | None = None
@@ -239,6 +243,7 @@ class BattleCanvas(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             clicked = self._pick_ship_at(event.position().toPoint())
             if clicked is not None:
+                self.selected_ship_id = clicked.ship_id
                 controlled_team = self.controlled_team_getter()
                 if clicked.team == controlled_team:
                     self.selected_squad = clicked.squad_id
@@ -271,36 +276,10 @@ class BattleCanvas(QWidget):
             lang = self.language_getter()
             menu = QMenu(self)
             if clicked is not None and clicked.vital.alive:
-                action_status = QAction(QCoreApplication.translate("eve_sim", 'View {ship} Status').format(ship=clicked.ship_id), self)
-                action_status.triggered.connect(lambda: self.on_show_status(clicked.ship_id))
-                menu.addAction(action_status)
-                action_warp = QAction(QCoreApplication.translate("eve_sim", '{squad} Warp To {ship}').format(squad=self.selected_squad, ship=clicked.ship_id), self)
-                action_warp.triggered.connect(lambda: self.on_issue_warp_ship(self.selected_squad, clicked.ship_id))
-                menu.addAction(action_warp)
-                controlled_team = self.controlled_team_getter()
-                if clicked.team != controlled_team:
-                    self.selected_enemy_target = clicked.ship_id
-                    self.on_select_enemy(clicked.ship_id)
-                    action_focus = QAction(QCoreApplication.translate("eve_sim", '{squad} Focus {ship}').format(squad=self.selected_squad, ship=clicked.ship_id), self)
-                    action_focus.triggered.connect(lambda: self.on_issue_focus(clicked.ship_id))
-                    menu.addAction(action_focus)
-                    action_prefocus = QAction(QCoreApplication.translate("eve_sim", '{squad} Pre-focus {ship}').format(squad=self.selected_squad, ship=clicked.ship_id), self)
-                    action_prefocus.triggered.connect(lambda: self.on_issue_prefocus(clicked.ship_id))
-                    menu.addAction(action_prefocus)
-                    focus_key = self._focus_key(controlled_team, self.selected_squad)
-                    queue = self.engine.world.squad_focus_queues.get(focus_key, [])
-                    in_prequeue = clicked.ship_id in queue
-                    prelocked_by_ship = self.engine.world.squad_prelocked_targets.get(focus_key, {})
-                    prelock_timers_by_ship = self.engine.world.squad_prelock_timers.get(focus_key, {})
-                    prelocked = any(clicked.ship_id in targets for targets in prelocked_by_ship.values())
-                    prelocking = any(clicked.ship_id in timers for timers in prelock_timers_by_ship.values())
-                    if in_prequeue or prelocked or prelocking:
-                        action_cancel_prefocus = QAction(
-                            QCoreApplication.translate("eve_sim", '{squad} Cancel Pre-lock {ship}').format(squad=self.selected_squad, ship=clicked.ship_id),
-                            self,
-                        )
-                        action_cancel_prefocus.triggered.connect(lambda: self.on_cancel_prefocus(clicked.ship_id))
-                        menu.addAction(action_cancel_prefocus)
+                self.selected_ship_id = clicked.ship_id
+                self.on_show_ship_context_menu(clicked.ship_id, event.globalPosition().toPoint())
+                self.update()
+                return
             elif clicked_beacon is not None:
                 action_warp_beacon = QAction(
                     QCoreApplication.translate("eve_sim", '{squad} Warp To {beacon}').format(squad=self.selected_squad, beacon=clicked_beacon.beacon_id),
@@ -591,6 +570,18 @@ class BattleCanvas(QWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(QPen(QColor(255, 230, 90), 2))
                 painter.drawEllipse(x - 10, y - 10, 20, 20)
+                painter.setPen(Qt.PenStyle.NoPen)
+
+            if self.selected_ship_id and ship.ship_id == self.selected_ship_id and ship.vital.alive:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
+                painter.drawEllipse(x - 13, y - 13, 26, 26)
+                painter.setPen(Qt.PenStyle.NoPen)
+
+            if ship.ship_id in self.highlighted_roster_ship_ids and ship.vital.alive:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(120, 255, 210, 220), 2))
+                painter.drawEllipse(x - 16, y - 16, 32, 32)
                 painter.setPen(Qt.PenStyle.NoPen)
 
             hp_ratio = (ship.vital.shield + ship.vital.armor + ship.vital.structure) / (

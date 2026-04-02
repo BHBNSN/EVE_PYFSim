@@ -273,7 +273,7 @@ class SetupRowDelegate(QStyledItemDelegate):
 
 
 class OverviewTableModel(QAbstractTableModel):
-    HEADERS = ["Name", "Ship Type", "Distance (km)", "Team"]
+    HEADERS = ["Ship ID", "Ship Name", "Distance (km)", "Team"]
 
     def __init__(
         self,
@@ -324,7 +324,7 @@ class OverviewTableModel(QAbstractTableModel):
             if col == 0:
                 return row["id"]
             if col == 1:
-                return row.get("ship_type_display", row["ship_type"])
+                return row.get("ship_name_display", row.get("ship_type_display", row["ship_type"]))
             if col == 2:
                 return f"{row['dist']:.1f}"
             if col == 3:
@@ -362,7 +362,7 @@ class OverviewTableModel(QAbstractTableModel):
 
 
 class BlueRosterTableModel(QAbstractTableModel):
-    HEADERS = ["Ship ID", "Squad", "Role", "Alive", "HP%"]
+    HEADERS = ["Ship ID", "Ship Name", "Squad", "Role", "Alive", "HP%"]
 
     def __init__(self, language_getter: Callable[[], str]) -> None:
         super().__init__()
@@ -403,12 +403,14 @@ class BlueRosterTableModel(QAbstractTableModel):
             if col == 0:
                 return row["ship_id"]
             if col == 1:
-                return row["squad"]
+                return row.get("ship_name_display", row.get("ship_name", ""))
             if col == 2:
-                return row["role"]
+                return row["squad"]
             if col == 3:
-                return QCoreApplication.translate("eve_sim", 'Y') if row["alive"] else QCoreApplication.translate("eve_sim", 'N')
+                return row["role"]
             if col == 4:
+                return QCoreApplication.translate("eve_sim", 'Y') if row["alive"] else QCoreApplication.translate("eve_sim", 'N')
+            if col == 5:
                 return f"{row['hp']:.1f}"
         return None
 
@@ -490,7 +492,7 @@ class OverviewFilterProxyModel(QSortFilterProxyModel):
 
         field_by_col = {
             0: "id",
-            1: "ship_type",
+            1: "ship_name",
             2: "dist",
             3: "team",
         }

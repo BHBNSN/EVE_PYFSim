@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication, QItemSelectionModel
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -63,7 +63,10 @@ from ..lan_commands import (
     CMD_INDUCE_SQUAD_AT,
     CMD_APPLY_FLEET_CHARGE,
     CMD_CLEAR_MODULE_CHARGE_LOCK,
+    CMD_SET_MODULE_MANUAL_MODE,
+    CMD_SET_MODULE_TARGET_MODE,
     CMD_SET_MODULE_CHARGE_LOCK,
+    CMD_SYNC_MODULE_CONTROLS,
     CMD_SQUAD_APPROACH,
     CMD_SQUAD_ATTACK,
     CMD_SQUAD_CANCEL_PREFOCUS,
@@ -98,7 +101,7 @@ from ..timer_views import deadline_map_from_remaining_view
 from ..systems import CombatSystem
 from ..user_errors import display_user_error
 from .battle_canvas import BattleCanvas
-from .dialogs import ShipStatusDialog
+from .dialogs import OverviewOptionsDialog, ShipStatusDialog
 from .fleet_setup_dialog import FleetSetupDialog
 from .models import PreferencesStore, UiPreferences, UiState
 from .table_models import BlueRosterTableModel, OverviewFilterProxyModel, OverviewTableModel
@@ -203,6 +206,7 @@ class MainWindow(QMainWindow):
             self.issue_focus_target,
             self.issue_prefocus_target,
             self.cancel_prefocus_target,
+            self.show_ship_context_menu,
             self.induce_spawn_squad_at,
             self.induce_spawn_fleet_at,
             self._inducible_controlled_squad_ids,
@@ -419,12 +423,19 @@ class MainWindow(QMainWindow):
             return "auto"
         return normalize_module_target_mode(ship.combat.module_target_modes.get(module_id))
 
-    def _set_ship_module_manual_mode(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+    def _set_ship_module_manual_mode(
+        self,
+        ship_id: str,
+        module_id: str,
+        mode: str,
+        *,
+        ignore_team_permission: bool = False,
+    ) -> tuple[bool, str]:
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return False, QCoreApplication.translate("eve_sim", 'Ship not found')
-        if not self._is_ammo_configurable_team(ship.team):
+        if not ignore_team_permission and not self._is_ammo_configurable_team(ship.team):
             return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's module mode in current mode")
         if ship.runtime is None:
             return False, QCoreApplication.translate("eve_sim", '<no runtime>')
@@ -436,6 +447,21 @@ class MainWindow(QMainWindow):
             return False, QCoreApplication.translate("eve_sim", 'This module does not currently support manual mode overrides')
 
         normalized_mode = normalize_module_manual_mode(mode)
+        if (
+            not ignore_team_permission
+            and self.network_mode == "client"
+            and self.lan_client is not None
+        ):
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SET_MODULE_MANUAL_MODE,
+                    "ship_id": ship_id,
+                    "module_id": module_id,
+                    "mode": normalized_mode,
+                }
+            )
+            return True, normalized_mode
+
         self._apply_ship_module_manual_mode(ship, module_id, normalized_mode)
         self.request_overview_refresh(force=True)
         self.canvas.update()
@@ -447,12 +473,19 @@ class MainWindow(QMainWindow):
         )
         return True, normalized_mode
 
-    def _set_ship_module_target_mode(self, ship_id: str, module_id: str, mode: str) -> tuple[bool, str]:
+    def _set_ship_module_target_mode(
+        self,
+        ship_id: str,
+        module_id: str,
+        mode: str,
+        *,
+        ignore_team_permission: bool = False,
+    ) -> tuple[bool, str]:
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return False, QCoreApplication.translate("eve_sim", 'Ship not found')
-        if not self._is_ammo_configurable_team(ship.team):
+        if not ignore_team_permission and not self._is_ammo_configurable_team(ship.team):
             return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's module mode in current mode")
         if ship.runtime is None:
             return False, QCoreApplication.translate("eve_sim", '<no runtime>')
@@ -472,6 +505,21 @@ class MainWindow(QMainWindow):
         default_mode = normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
         applied_mode = stored_module_target_mode(normalized_mode, default_mode)
 
+        if (
+            not ignore_team_permission
+            and self.network_mode == "client"
+            and self.lan_client is not None
+        ):
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SET_MODULE_TARGET_MODE,
+                    "ship_id": ship_id,
+                    "module_id": module_id,
+                    "mode": applied_mode,
+                }
+            )
+            return True, normalized_mode
+
         self._apply_ship_module_target_mode(ship, module_id, applied_mode)
         self.request_overview_refresh(force=True)
         self.canvas.update()
@@ -489,12 +537,14 @@ class MainWindow(QMainWindow):
         module_id: str,
         mode: str,
         target_mode: str,
+        *,
+        ignore_team_permission: bool = False,
     ) -> tuple[bool, str]:
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return False, QCoreApplication.translate("eve_sim", 'Ship not found')
-        if not self._is_ammo_configurable_team(ship.team):
+        if not ignore_team_permission and not self._is_ammo_configurable_team(ship.team):
             return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's module mode in current mode")
         if ship.runtime is None:
             return False, QCoreApplication.translate("eve_sim", '<no runtime>')
@@ -516,6 +566,22 @@ class MainWindow(QMainWindow):
             normalized_target_mode = "auto"
         source_default_target_mode = normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
         requested_target_mode = stored_module_target_mode(normalized_target_mode, source_default_target_mode)
+
+        if (
+            not ignore_team_permission
+            and self.network_mode == "client"
+            and self.lan_client is not None
+        ):
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SYNC_MODULE_CONTROLS,
+                    "ship_id": ship_id,
+                    "module_id": module_id,
+                    "mode": normalized_mode,
+                    "target_mode": normalized_target_mode,
+                }
+            )
+            return True, QCoreApplication.translate("eve_sim", 'Sync requested')
 
         initial_fit_key = self._ship_initial_fit_key(ship)
         updated_ship_ids: list[str] = []
@@ -693,12 +759,19 @@ class MainWindow(QMainWindow):
                 changed.append(f"mod-{idx + 1}")
         return changed
 
-    def _set_ship_module_charge_lock(self, ship_id: str, module_id: str, ammo_name: str) -> tuple[bool, str]:
+    def _set_ship_module_charge_lock(
+        self,
+        ship_id: str,
+        module_id: str,
+        ammo_name: str,
+        *,
+        ignore_team_permission: bool = False,
+    ) -> tuple[bool, str]:
         lang = self.current_language()
         ship = self.engine.world.ships.get(ship_id)
         if ship is None:
             return False, QCoreApplication.translate("eve_sim", 'Ship not found')
-        if not self._is_ammo_configurable_team(ship.team):
+        if not ignore_team_permission and not self._is_ammo_configurable_team(ship.team):
             return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's charge in current mode")
 
         old_text = self.get_ship_fit_text(ship_id) or ""
@@ -769,7 +842,13 @@ class MainWindow(QMainWindow):
         ammo_display = get_type_display_name(canonical_ammo, language=lang) if canonical_ammo else QCoreApplication.translate("eve_sim", "None")
         return True, QCoreApplication.translate("eve_sim", 'Locked {module} charge to {ammo}').format(module=module_name, ammo=ammo_display)
 
-    def _clear_ship_module_charge_lock(self, ship_id: str, module_id: str) -> tuple[bool, str]:
+    def _clear_ship_module_charge_lock(
+        self,
+        ship_id: str,
+        module_id: str,
+        *,
+        ignore_team_permission: bool = False,
+    ) -> tuple[bool, str]:
         lang = self.current_language()
         module_label = module_id
         fit_text = self.get_ship_fit_text(ship_id) or ""
@@ -780,6 +859,12 @@ class MainWindow(QMainWindow):
                 module_label = get_type_display_name(parsed.module_specs[module_idx - 1].module_name, language=lang)
         except Exception:
             pass
+
+        ship = self.engine.world.ships.get(ship_id)
+        if ship is None:
+            return False, QCoreApplication.translate("eve_sim", 'Ship not found')
+        if not ignore_team_permission and not self._is_ammo_configurable_team(ship.team):
+            return False, QCoreApplication.translate("eve_sim", "Cannot modify this ship's charge in current mode")
 
         locked_map = self._ship_locked_module_charges.get(ship_id)
         if not locked_map or module_id not in locked_map:
@@ -1049,9 +1134,7 @@ class MainWindow(QMainWindow):
         self.btn_propulsion_toggle.setText(QCoreApplication.translate("eve_sim", 'Click to Disable Prop') if active else QCoreApplication.translate("eve_sim", 'Click to Enable Prop'))
 
     def _is_ammo_configurable_team(self, team: Team) -> bool:
-        if self.network_mode == "local":
-            return team == self.controlled_team
-        return True
+        return team == self.controlled_team
 
     def toggle_selected_squad_propulsion(self) -> None:
         squad = self.ui_state.selected_squad
@@ -1269,12 +1352,14 @@ class MainWindow(QMainWindow):
         self.overview.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.overview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.overview.customContextMenuRequested.connect(self.show_overview_menu)
+        self.overview.selectionModel().selectionChanged.connect(self._on_overview_selection_changed)
         self.overview.setAlternatingRowColors(True)
         self.overview.setWordWrap(False)
         self.overview.setSortingEnabled(True)
         self.overview.verticalHeader().setVisible(False)
-        self.overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, 4):
+        self.overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.overview.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in range(2, 4):
             self.overview.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.overview, 1)
         return page
@@ -1291,10 +1376,14 @@ class MainWindow(QMainWindow):
         self.blue_roster.setModel(self.blue_roster_model)
         self.blue_roster.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.blue_roster.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
+        self.blue_roster.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.blue_roster.customContextMenuRequested.connect(self.show_blue_roster_menu)
+        self.blue_roster.selectionModel().selectionChanged.connect(self._on_blue_roster_selection_changed)
         self.blue_roster.setWordWrap(False)
         self.blue_roster.verticalHeader().setVisible(False)
-        self.blue_roster.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in (1, 2, 3, 4):
+        self.blue_roster.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.blue_roster.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in (2, 3, 4, 5):
             self.blue_roster.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.blue_roster, 1)
 
@@ -1426,6 +1515,7 @@ class MainWindow(QMainWindow):
         self.squad_combo.setCurrentText(squad_id)
 
     def on_canvas_select_enemy(self, ship_id: str) -> None:
+        self._set_highlighted_ship(ship_id)
         self.ui_state.selected_enemy_target = ship_id
         self.canvas.selected_enemy_target = ship_id
         self.overview_model.notify_visual_state_changed()
@@ -1913,6 +2003,8 @@ class MainWindow(QMainWindow):
             rows.append(
                 {
                     "id": ship.ship_id,
+                    "ship_name": ship.fit.ship_name,
+                    "ship_name_display": self._display_ship_type(ship.fit.ship_name, language=lang),
                     "ship_type": ship.fit.ship_name,
                     "ship_type_display": self._display_ship_type(ship.fit.ship_name, language=lang),
                     "team": ship.team.value,
@@ -1936,6 +2028,153 @@ class MainWindow(QMainWindow):
     def refresh_overview(self, rows: list[dict]) -> None:
         self.overview_model.set_rows(rows)
         self.overview_proxy.apply_preferences()
+        self._restore_overview_selection()
+
+    def _set_highlighted_ship(self, ship_id: str | None) -> None:
+        normalized_ship_id = str(ship_id or "").strip() or None
+        self.canvas.selected_ship_id = normalized_ship_id
+        self.canvas.update()
+
+    def _set_blue_roster_highlighted_ships(self, ship_ids: set[str]) -> None:
+        self.canvas.highlighted_roster_ship_ids = {str(ship_id).strip() for ship_id in ship_ids if str(ship_id).strip()}
+        self.canvas.update()
+
+    def _selected_blue_roster_ship_ids(self) -> set[str]:
+        selection_model = self.blue_roster.selectionModel()
+        if selection_model is None:
+            return set()
+        ship_ids: set[str] = set()
+        for index in selection_model.selectedRows():
+            row_data = self.blue_roster_model.get_row(index.row())
+            if row_data:
+                ship_ids.add(str(row_data.get("ship_id", "")).strip())
+        return {ship_id for ship_id in ship_ids if ship_id}
+
+    def _restore_blue_roster_selection(self, selected_ship_ids: set[str]) -> None:
+        selection_model = self.blue_roster.selectionModel()
+        if selection_model is None:
+            self._set_blue_roster_highlighted_ships(set())
+            return
+        valid_ids = {ship_id for ship_id in selected_ship_ids if ship_id}
+        selection_model.clearSelection()
+        if not valid_ids:
+            self._set_blue_roster_highlighted_ships(set())
+            return
+        restored_ids: set[str] = set()
+        for row in range(self.blue_roster_model.rowCount()):
+            row_data = self.blue_roster_model.get_row(row)
+            ship_id = str(row_data.get("ship_id", "")).strip() if row_data else ""
+            if ship_id and ship_id in valid_ids:
+                model_index = self.blue_roster_model.index(row, 0)
+                selection_model.select(
+                    model_index,
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                )
+                restored_ids.add(ship_id)
+        self._set_blue_roster_highlighted_ships(restored_ids)
+
+    def _restore_overview_selection(self) -> None:
+        selected_ship_id = str(self.canvas.selected_ship_id or "").strip()
+        if not selected_ship_id:
+            return
+        current_index = self.overview.currentIndex()
+        if current_index.isValid():
+            row_data = self.overview_proxy.get_row(current_index.row())
+            if row_data and str(row_data.get("id", "")) == selected_ship_id:
+                return
+        for row in range(self.overview_proxy.rowCount()):
+            row_data = self.overview_proxy.get_row(row)
+            if row_data and str(row_data.get("id", "")) == selected_ship_id:
+                self.overview.selectRow(row)
+                return
+
+    def _on_overview_selection_changed(self, *_args) -> None:
+        indexes = self.overview.selectionModel().selectedRows() if self.overview.selectionModel() is not None else []
+        if not indexes:
+            self._set_highlighted_ship(None)
+            return
+        row_data = self.overview_proxy.get_row(indexes[0].row())
+        self._set_highlighted_ship(str(row_data.get("id", "")) if row_data else None)
+
+    def _on_blue_roster_selection_changed(self, *_args) -> None:
+        self._set_blue_roster_highlighted_ships(self._selected_blue_roster_ship_ids())
+
+    def _build_ship_context_menu(self, ship_id: str) -> QMenu | None:
+        ship = self.engine.world.ships.get(str(ship_id))
+        if ship is None or not ship.vital.alive:
+            return None
+        target_id = str(ship.ship_id)
+        controlled_team = self.controlled_team
+        enemy_team = Team.RED.value if controlled_team == Team.BLUE else Team.BLUE.value
+
+        self._set_highlighted_ship(target_id)
+        if ship.team != controlled_team:
+            self.ui_state.selected_enemy_target = target_id
+            self.canvas.selected_enemy_target = target_id
+            self.overview_model.notify_visual_state_changed()
+            self.request_overview_refresh(force=True)
+
+        menu = QMenu(self)
+        action_status = QAction(QCoreApplication.translate("eve_sim", 'View {ship} Status').format(ship=target_id), self)
+        action_status.triggered.connect(lambda: self.show_ship_status(target_id))
+        menu.addAction(action_status)
+
+        action_warp = QAction(
+            QCoreApplication.translate("eve_sim", '{squad} Warp To {ship}').format(
+                squad=self.ui_state.selected_squad,
+                ship=target_id,
+            ),
+            self,
+        )
+        action_warp.triggered.connect(lambda: self.issue_warp_to_ship(self.ui_state.selected_squad, target_id))
+        menu.addAction(action_warp)
+
+        if ship.team.value == enemy_team:
+            action_focus = QAction(
+                QCoreApplication.translate("eve_sim", '{squad} Focus {ship}').format(
+                    squad=self.ui_state.selected_squad,
+                    ship=target_id,
+                ),
+                self,
+            )
+            action_focus.triggered.connect(lambda: self.issue_focus_target(target_id))
+            menu.addAction(action_focus)
+
+            action_prefocus = QAction(
+                QCoreApplication.translate("eve_sim", '{squad} Pre-focus {ship}').format(
+                    squad=self.ui_state.selected_squad,
+                    ship=target_id,
+                ),
+                self,
+            )
+            action_prefocus.triggered.connect(lambda: self.issue_prefocus_target(target_id))
+            menu.addAction(action_prefocus)
+
+            focus_key = self._focus_key(controlled_team, self.ui_state.selected_squad)
+            queue = self.engine.world.squad_focus_queues.get(focus_key, [])
+            in_prequeue = target_id in queue
+            prelocked_by_ship = self.engine.world.squad_prelocked_targets.get(focus_key, {})
+            prelock_timers_by_ship = self.engine.world.squad_prelock_timers.get(focus_key, {})
+            prelocked = any(target_id in targets for targets in prelocked_by_ship.values())
+            prelocking = any(target_id in timers for timers in prelock_timers_by_ship.values())
+            if in_prequeue or prelocked or prelocking:
+                action_cancel_prefocus = QAction(
+                    QCoreApplication.translate("eve_sim", '{squad} Cancel Pre-lock {ship}').format(
+                        squad=self.ui_state.selected_squad,
+                        ship=target_id,
+                    ),
+                    self,
+                )
+                action_cancel_prefocus.triggered.connect(lambda: self.cancel_prefocus_target(target_id))
+                menu.addAction(action_cancel_prefocus)
+
+        return menu
+
+    def show_ship_context_menu(self, ship_id: str, global_pos: QPoint) -> None:
+        menu = self._build_ship_context_menu(ship_id)
+        if menu is None:
+            return
+        menu.exec(global_pos)
 
     def show_overview_menu(self, pos: QPoint) -> None:
         index = self.overview.indexAt(pos)
@@ -1944,32 +2183,24 @@ class MainWindow(QMainWindow):
         row_data = self.overview_proxy.get_row(index.row())
         if not row_data:
             return
-        target_id = row_data["id"]
-        target_team = row_data["team"]
-        is_alive = bool(row_data["alive"])
-        if not is_alive:
-            return
+        self.show_ship_context_menu(str(row_data["id"]), self.overview.mapToGlobal(pos))
 
-        lang = self.current_language()
-        menu = QMenu(self)
-        action_status = QAction(QCoreApplication.translate("eve_sim", 'View {ship} Status').format(ship=target_id), self)
-        action_status.triggered.connect(lambda: self.show_ship_status(target_id))
-        menu.addAction(action_status)
-        action_warp = QAction(QCoreApplication.translate("eve_sim", '{squad} Warp To {ship}').format(squad=self.ui_state.selected_squad, ship=target_id), self)
-        action_warp.triggered.connect(lambda: self.issue_warp_to_ship(self.ui_state.selected_squad, target_id))
-        menu.addAction(action_warp)
-        enemy_team = Team.RED.value if self.controlled_team == Team.BLUE else Team.BLUE.value
-        if target_team == enemy_team:
-            action_focus = QAction(QCoreApplication.translate("eve_sim", '{squad} Focus {ship}').format(squad=self.ui_state.selected_squad, ship=target_id), self)
-            action_focus.triggered.connect(lambda: self.issue_focus_target(target_id))
-            menu.addAction(action_focus)
-        menu.exec(self.overview.mapToGlobal(pos))
+    def show_blue_roster_menu(self, pos: QPoint) -> None:
+        index = self.blue_roster.indexAt(pos)
+        if not index.isValid():
+            return
+        row_data = self.blue_roster_model.get_row(index.row())
+        if not row_data:
+            return
+        self.show_ship_context_menu(str(row_data["ship_id"]), self.blue_roster.mapToGlobal(pos))
 
     def refresh_blue_roster(self) -> None:
+        selected_ship_ids = self._selected_blue_roster_ship_ids()
         ships = sorted(
             [s for s in self.engine.world.ships.values() if s.team == self.controlled_team and s.ship_id not in self._undeployed_ship_ids],
             key=lambda s: s.ship_id,
         )
+        lang = self.current_language()
         rows: list[dict] = []
         for ship in ships:
             hp_cur = ship.vital.shield + ship.vital.armor + ship.vital.structure
@@ -1978,6 +2209,8 @@ class MainWindow(QMainWindow):
             rows.append(
                 {
                     "ship_id": ship.ship_id,
+                    "ship_name": ship.fit.ship_name,
+                    "ship_name_display": self._display_ship_type(ship.fit.ship_name, language=lang),
                     "squad": ship.squad_id,
                     "role": ship.fit.role,
                     "alive": ship.vital.alive,
@@ -1985,6 +2218,7 @@ class MainWindow(QMainWindow):
                 }
             )
         self.blue_roster_model.set_rows(rows)
+        self._restore_blue_roster_selection(selected_ship_ids)
 
     def assign_blue_ships(self) -> None:
         target_squad = self.assign_squad_edit.text().strip()
@@ -2068,20 +2302,72 @@ class MainWindow(QMainWindow):
                     self._undeployed_ship_ids.add(ship.ship_id)
                     ship.vital.alive = False
             return
+        if kind == CMD_SET_MODULE_MANUAL_MODE:
+            ship_id = str(cmd.get("ship_id", "") or "").strip()
+            module_id = str(cmd.get("module_id", "") or "").strip()
+            if not ship_id or not module_id:
+                return
+            ship = self.engine.world.ships.get(ship_id)
+            if ship is None or ship.team != team:
+                return
+            self._set_ship_module_manual_mode(
+                ship_id,
+                module_id,
+                str(cmd.get("mode", "") or "auto"),
+                ignore_team_permission=True,
+            )
+            return
+        if kind == CMD_SET_MODULE_TARGET_MODE:
+            ship_id = str(cmd.get("ship_id", "") or "").strip()
+            module_id = str(cmd.get("module_id", "") or "").strip()
+            if not ship_id or not module_id:
+                return
+            ship = self.engine.world.ships.get(ship_id)
+            if ship is None or ship.team != team:
+                return
+            self._set_ship_module_target_mode(
+                ship_id,
+                module_id,
+                str(cmd.get("mode", "") or "auto"),
+                ignore_team_permission=True,
+            )
+            return
+        if kind == CMD_SYNC_MODULE_CONTROLS:
+            ship_id = str(cmd.get("ship_id", "") or "").strip()
+            module_id = str(cmd.get("module_id", "") or "").strip()
+            if not ship_id or not module_id:
+                return
+            ship = self.engine.world.ships.get(ship_id)
+            if ship is None or ship.team != team:
+                return
+            self._sync_ship_module_controls_to_matching_squad_fit(
+                ship_id,
+                module_id,
+                str(cmd.get("mode", "") or "auto"),
+                str(cmd.get("target_mode", "") or "auto"),
+                ignore_team_permission=True,
+            )
+            return
         if kind == CMD_SET_MODULE_CHARGE_LOCK:
             ship_id = str(cmd.get("ship_id", "") or "").strip()
             module_id = str(cmd.get("module_id", "") or "").strip()
             if not ship_id or not module_id:
                 return
+            ship = self.engine.world.ships.get(ship_id)
+            if ship is None or ship.team != team:
+                return
             charge_name = str(cmd.get("charge_name", "") or "")
-            self._set_ship_module_charge_lock(ship_id, module_id, charge_name)
+            self._set_ship_module_charge_lock(ship_id, module_id, charge_name, ignore_team_permission=True)
             return
         if kind == CMD_CLEAR_MODULE_CHARGE_LOCK:
             ship_id = str(cmd.get("ship_id", "") or "").strip()
             module_id = str(cmd.get("module_id", "") or "").strip()
             if not ship_id or not module_id:
                 return
-            self._clear_ship_module_charge_lock(ship_id, module_id)
+            ship = self.engine.world.ships.get(ship_id)
+            if ship is None or ship.team != team:
+                return
+            self._clear_ship_module_charge_lock(ship_id, module_id, ignore_team_permission=True)
             return
         if kind == CMD_APPLY_FLEET_CHARGE:
             module_name = str(cmd.get("module_name", "") or "").strip()
@@ -2661,6 +2947,26 @@ class MainWindow(QMainWindow):
             elif "locked_module_charges" in raw:
                 self._ship_locked_module_charges.pop(ship_id, None)
 
+            module_manual_modes = raw.get("module_manual_modes")
+            if isinstance(module_manual_modes, dict):
+                ship.combat.module_manual_modes = {
+                    str(module_id): normalize_module_manual_mode(mode)
+                    for module_id, mode in module_manual_modes.items()
+                    if str(module_id)
+                }
+            else:
+                ship.combat.module_manual_modes.clear()
+
+            module_target_modes = raw.get("module_target_modes")
+            if isinstance(module_target_modes, dict):
+                ship.combat.module_target_modes = {
+                    str(module_id): normalize_module_target_mode(mode)
+                    for module_id, mode in module_target_modes.items()
+                    if str(module_id)
+                }
+            else:
+                ship.combat.module_target_modes.clear()
+
             module_states = raw.get("module_states")
             if isinstance(module_states, dict) and ship.runtime is not None:
                 state_map = {str(mid): str(state) for mid, state in module_states.items()}
@@ -2683,6 +2989,8 @@ class MainWindow(QMainWindow):
         raw_ecm_at_by_module = raw.get("ecm_last_attempt_at_by_module")
         raw_module_states = raw.get("module_states")
         raw_locked_module_charges = raw.get("locked_module_charges")
+        raw_module_manual_modes = raw.get("module_manual_modes")
+        raw_module_target_modes = raw.get("module_target_modes")
         pos: dict = raw_pos if isinstance(raw_pos, dict) else {}
         vel: dict = raw_vel if isinstance(raw_vel, dict) else {}
         projected: dict = raw_projected if isinstance(raw_projected, dict) else {}
@@ -2693,6 +3001,8 @@ class MainWindow(QMainWindow):
         ecm_at_by_module: dict = raw_ecm_at_by_module if isinstance(raw_ecm_at_by_module, dict) else {}
         module_states: dict = raw_module_states if isinstance(raw_module_states, dict) else {}
         locked_module_charges: dict = raw_locked_module_charges if isinstance(raw_locked_module_charges, dict) else {}
+        module_manual_modes: dict = raw_module_manual_modes if isinstance(raw_module_manual_modes, dict) else {}
+        module_target_modes: dict = raw_module_target_modes if isinstance(raw_module_target_modes, dict) else {}
         cycle_timers_sig: list[tuple[str, float]] = []
         for module_id, timer_left in cycle_timers.items():
             mid = str(module_id)
@@ -2759,6 +3069,8 @@ class MainWindow(QMainWindow):
             tuple(sorted(ecm_at_by_module_sig)),
             tuple(sorted((str(k), str(v)) for k, v in module_states.items())),
             tuple(sorted((str(k), str(v)) for k, v in locked_module_charges.items())),
+            tuple(sorted((str(k), str(v)) for k, v in module_manual_modes.items())),
+            tuple(sorted((str(k), str(v)) for k, v in module_target_modes.items())),
         )
 
     def _engine_config_payload(self) -> dict[str, object]:
@@ -2855,6 +3167,10 @@ class MainWindow(QMainWindow):
             row = dict(raw)
             row["deployed"] = sid not in self._undeployed_ship_ids
             row["locked_module_charges"] = dict(self._ship_locked_module_charges.get(sid, {}))
+            ship = self.engine.world.ships.get(sid)
+            if ship is not None:
+                row["module_manual_modes"] = dict(ship.combat.module_manual_modes)
+                row["module_target_modes"] = dict(ship.combat.module_target_modes)
             signature = self._ship_signature(row)
             next_signatures[sid] = signature
             fit_text = self._ship_fit_texts.get(sid, "")
@@ -2992,6 +3308,18 @@ class MainWindow(QMainWindow):
                 self.canvas.selected_enemy_target = None
                 self.overview_model.notify_visual_state_changed()
                 self.request_overview_refresh(force=True)
+        if self.canvas.selected_ship_id:
+            selected_ship = self.engine.world.ships.get(self.canvas.selected_ship_id)
+            if selected_ship is None or selected_ship.ship_id in self._undeployed_ship_ids:
+                self._set_highlighted_ship(None)
+        if self.canvas.highlighted_roster_ship_ids:
+            valid_highlighted_ids = {
+                ship_id
+                for ship_id in self.canvas.highlighted_roster_ship_ids
+                if ship_id in self.engine.world.ships and ship_id not in self._undeployed_ship_ids
+            }
+            if valid_highlighted_ids != self.canvas.highlighted_roster_ship_ids:
+                self._set_blue_roster_highlighted_ships(valid_highlighted_ids)
 
     def closeEvent(self, event) -> None:
         self.prefs.selected_squad = self.ui_state.selected_squad
