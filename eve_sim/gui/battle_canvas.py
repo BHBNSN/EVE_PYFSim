@@ -10,7 +10,7 @@ import time
 from typing import Any, Callable, Literal, cast
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,6 +50,7 @@ from ..fleet_setup import (
     get_charge_options_for_module,
     get_fit_backend_status,
     get_common_chargeable_modules,
+    get_ship_icon_key,
     get_module_reload_time_sec,
     resolve_module_type_name,
     get_type_display_name,
@@ -93,6 +94,17 @@ from ..systems import CombatSystem
 
 from .models import AreaCycleOverlay
 class BattleCanvas(QWidget):
+    _SHIP_ICON_SIZE_PX = 25
+    _SHIP_ICON_SOURCE_CACHE: dict[str, QImage] | None = None
+    _SHIP_ICON_PIXMAP_CACHE: dict[tuple[str, int, int, int, int, int], QPixmap] = {}
+    _MIN_ZOOM = 0.00005
+    _MAX_ZOOM = 0.1
+    _TEAM_BLUE_COLOR = QColor(80, 180, 255)
+    _TEAM_RED_COLOR = QColor(255, 92, 92)
+    _SELECTED_SQUAD_COLOR = QColor(186, 102, 255)
+    _DESTROYED_SHIP_COLOR = QColor(130, 130, 130)
+    _SELECTION_HIGHLIGHT_COLOR = QColor(255, 230, 90)
+
     def __init__(
         self,
         engine: SimulationEngine,
@@ -158,6 +170,101 @@ class BattleCanvas(QWidget):
     @staticmethod
     def _focus_key(team: Team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
+
+    @classmethod
+    def _ship_icon_dir(cls) -> Path:
+        return Path(__file__).resolve().parents[1] / "res" / "icon"
+
+    @classmethod
+    def _ensure_ship_icon_sources(cls) -> None:
+        if cls._SHIP_ICON_SOURCE_CACHE is not None:
+            return
+        sources: dict[str, QImage] = {}
+        icon_dir = cls._ship_icon_dir()
+        if icon_dir.exists():
+            for path in sorted(icon_dir.glob("*_64.png")):
+                image = QImage(str(path))
+                if image.isNull():
+                    continue
+                stem = path.stem
+                icon_key = stem[:-3] if stem.endswith("_64") else stem
+                sources[str(icon_key)] = image
+        cls._SHIP_ICON_SOURCE_CACHE = sources
+
+    @classmethod
+    def _ship_icon_pixmap(cls, icon_key: str, color: QColor, size_px: int) -> QPixmap | None:
+        cls._ensure_ship_icon_sources()
+        source_cache = cls._SHIP_ICON_SOURCE_CACHE or {}
+        source = source_cache.get(str(icon_key))
+        if source is None:
+            return None
+        cache_key = (
+            str(icon_key),
+            int(size_px),
+            int(color.red()),
+            int(color.green()),
+            int(color.blue()),
+            int(color.alpha()),
+        )
+        cached = cls._SHIP_ICON_PIXMAP_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        scaled = source.scaled(
+            int(size_px),
+            int(size_px),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        tinted = QImage(scaled.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        painter.drawImage(0, 0, scaled)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), color)
+        painter.end()
+
+        pixmap = QPixmap.fromImage(tinted)
+        cls._SHIP_ICON_PIXMAP_CACHE[cache_key] = pixmap
+        return pixmap
+
+    @classmethod
+    def _ship_icon_for_name(cls, ship_name: str, color: QColor, *, size_px: int | None = None) -> QPixmap | None:
+        icon_key = get_ship_icon_key(ship_name)
+        if not icon_key:
+            return None
+        return cls._ship_icon_pixmap(icon_key, color, size_px or cls._SHIP_ICON_SIZE_PX)
+
+    @classmethod
+    def _ship_draw_color(cls, ship: ShipEntity, controlled_team: Team, selected_squad: str) -> QColor:
+        if not ship.vital.alive:
+            return QColor(cls._DESTROYED_SHIP_COLOR)
+        if ship.team == controlled_team and ship.squad_id == selected_squad:
+            return QColor(cls._SELECTED_SQUAD_COLOR)
+        if ship.team == Team.BLUE:
+            return QColor(cls._TEAM_BLUE_COLOR)
+        return QColor(cls._TEAM_RED_COLOR)
+
+    def _ship_selection_highlight_level(self, ship: ShipEntity) -> int:
+        if not ship.vital.alive:
+            return 0
+        layers = 0
+        if ship.ship_id in self.highlighted_roster_ship_ids:
+            layers += 1
+        if self.selected_ship_id and ship.ship_id == self.selected_ship_id:
+            layers += 1
+        if self.selected_enemy_target and ship.ship_id == self.selected_enemy_target:
+            layers += 2
+        return layers
+
+    def _ship_selection_highlight_size_px(self, ship: ShipEntity, base_size_px: int) -> int | None:
+        level = self._ship_selection_highlight_level(ship)
+        if level <= 0:
+            return None
+        return int(base_size_px + 2 + (level * 2))
+
+    def _ship_draw_priority(self, ship: ShipEntity) -> int:
+        return self._ship_selection_highlight_level(ship)
 
     def _ensure_bg_cache(self) -> None:
         width = self.width()
@@ -231,12 +338,31 @@ class BattleCanvas(QWidget):
         wy = (p.y() - cy) / self.zoom + self.pan_world.y
         return Vector2(wx, wy)
 
+    @classmethod
+    def _clamp_zoom(cls, zoom: float) -> float:
+        return max(cls._MIN_ZOOM, min(cls._MAX_ZOOM, float(zoom)))
+
+    def _set_zoom_anchored(self, target_zoom: float, anchor: QPoint | None = None) -> None:
+        next_zoom = self._clamp_zoom(target_zoom)
+        if math.isclose(next_zoom, self.zoom, rel_tol=0.0, abs_tol=1e-12):
+            return
+        if anchor is None:
+            anchor = QPoint(self.width() // 2, self.height() // 2)
+        focus_world = self._to_world(anchor)
+        self.zoom = next_zoom
+        cx = self.width() // 2
+        cy = self.height() // 2
+        self.pan_world = Vector2(
+            focus_world.x - (anchor.x() - cx) / self.zoom,
+            focus_world.y - (anchor.y() - cy) / self.zoom,
+        )
+
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
         if delta > 0:
-            self.zoom = min(0.02, self.zoom * 1.15)
+            self._set_zoom_anchored(self.zoom * 1.15, event.position().toPoint())
         elif delta < 0:
-            self.zoom = max(0.0001, self.zoom / 1.15)
+            self._set_zoom_anchored(self.zoom / 1.15, event.position().toPoint())
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -564,41 +690,50 @@ class BattleCanvas(QWidget):
                 )
                 painter.setPen(ring_pen)
 
-        for ship in self.engine.world.ships.values():
-            if not self.ship_visible_getter(ship.ship_id):
-                continue
-            color = QColor(80, 180, 255) if ship.team == Team.BLUE else QColor(255, 92, 92)
-            if not ship.vital.alive:
-                color = QColor(130, 130, 130)
+        controlled_team = self.controlled_team_getter()
+        visible_ships = [
+            ship
+            for ship in self.engine.world.ships.values()
+            if self.ship_visible_getter(ship.ship_id)
+        ]
+        visible_ships.sort(key=self._ship_draw_priority)
+        for ship in visible_ships:
+            color = self._ship_draw_color(ship, controlled_team, self.selected_squad)
             x, y = self._to_screen(ship.nav.position)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            painter.drawEllipse(x - 4, y - 4, 8, 8)
-
-            controlled_team = self.controlled_team_getter()
-            if ship.team == controlled_team and ship.squad_id == self.selected_squad and ship.vital.alive:
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(188, 238, 255), 2))
-                painter.drawEllipse(x - 8, y - 8, 16, 16)
+            ship_icon = self._ship_icon_for_name(ship.fit.ship_name, color)
+            highlight_size_px = self._ship_selection_highlight_size_px(ship, self._SHIP_ICON_SIZE_PX)
+            if ship_icon is not None:
+                if highlight_size_px is not None:
+                    highlight_icon = self._ship_icon_for_name(
+                        ship.fit.ship_name,
+                        self._SELECTION_HIGHLIGHT_COLOR,
+                        size_px=highlight_size_px,
+                    )
+                    if highlight_icon is not None:
+                        painter.drawPixmap(
+                            x - (highlight_icon.width() // 2),
+                            y - (highlight_icon.height() // 2),
+                            highlight_icon,
+                        )
+                icon_w = ship_icon.width()
+                icon_h = ship_icon.height()
+                painter.drawPixmap(x - (icon_w // 2), y - (icon_h // 2), ship_icon)
+            else:
+                highlight_radius = 0
+                if highlight_size_px is not None:
+                    highlight_radius = max(1, int(round(highlight_size_px / 2.0)))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(self._SELECTION_HIGHLIGHT_COLOR)
+                    painter.drawEllipse(
+                        x - highlight_radius,
+                        y - highlight_radius,
+                        highlight_radius * 2,
+                        highlight_radius * 2,
+                    )
+                base_radius = 5
                 painter.setPen(Qt.PenStyle.NoPen)
-
-            if self.selected_enemy_target and ship.ship_id == self.selected_enemy_target and ship.vital.alive:
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(255, 230, 90), 2))
-                painter.drawEllipse(x - 10, y - 10, 20, 20)
-                painter.setPen(Qt.PenStyle.NoPen)
-
-            if self.selected_ship_id and ship.ship_id == self.selected_ship_id and ship.vital.alive:
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
-                painter.drawEllipse(x - 13, y - 13, 26, 26)
-                painter.setPen(Qt.PenStyle.NoPen)
-
-            if ship.ship_id in self.highlighted_roster_ship_ids and ship.vital.alive:
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(120, 255, 210, 220), 2))
-                painter.drawEllipse(x - 16, y - 16, 32, 32)
-                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                painter.drawEllipse(x - base_radius, y - base_radius, base_radius * 2, base_radius * 2)
 
             hp_ratio = (ship.vital.shield + ship.vital.armor + ship.vital.structure) / (
                 ship.vital.shield_max + ship.vital.armor_max + ship.vital.structure_max
@@ -610,7 +745,6 @@ class BattleCanvas(QWidget):
             painter.setBrush(QColor(64, 220, 120))
             painter.drawRect(x - w // 2, y - 12, max(1, int(w * hp_ratio)), h)
 
-        controlled_team = self.controlled_team_getter()
         guidance_target = self.squad_guidance_target_getter(self.selected_squad)
         if leader_ship is not None and guidance_target is not None:
             start_x, start_y = self._to_screen(leader_ship.nav.position)

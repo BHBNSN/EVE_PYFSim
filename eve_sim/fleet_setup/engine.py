@@ -2343,6 +2343,7 @@ class _PyfaStaticBackend:
 _STATIC_BACKEND: _PyfaStaticBackend | None = None
 _PYFA_RUNTIME_RESOLVED_CACHE: dict[tuple[Any, ...], tuple[FitRuntime, ShipProfile]] = {}
 _PYFA_PRECALCULATED_LOCAL_BASE_FIT_CACHE: dict[tuple[Any, ...], tuple[Any, tuple[str | None, ...]]] = {}
+_SHIP_ICON_KEY_CACHE: dict[str, str | None] = {}
 _PYFA_PROJECTION_RANGE_BUCKET_M = 100.0
 _PYFA_PROJECTION_SIGNATURE_ROUND_DIGITS = 6
 
@@ -3204,6 +3205,102 @@ def module_supports_unloaded_charge(module_name: str) -> bool:
 def get_type_display_name(type_name: str, language: str = "en") -> str:
     backend = _get_static_backend()
     return backend.localize_type_name(type_name, language)
+
+
+def _ship_group_to_icon_key(group_name: str) -> str | None:
+    group = str(group_name or "").strip().lower()
+    if not group:
+        return None
+
+    exact_map = {
+        "capsule": "capsule",
+        "shuttle": "shuttle",
+        "rookie ship": "rookie",
+        "mining frigate": "miningFrigate",
+        "mining barge": "miningBarge",
+        "exhumer": "miningBarge",
+        "industrial": "industrial",
+        "transport ship": "industrial",
+        "deep space transport": "industrial",
+        "blockade runner": "industrial",
+        "freighter": "freighter",
+        "jump freighter": "freighter",
+        "industrial command ship": "industrialCommand",
+        "capital industrial ship": "industrialCommand",
+        "supercarrier": "superCarrier",
+        "titan": "titan",
+    }
+    exact = exact_map.get(group)
+    if exact is not None:
+        return exact
+
+    if "supercarrier" in group:
+        return "superCarrier"
+    if "titan" in group:
+        return "titan"
+    if "industrial command" in group or "capital industrial" in group:
+        return "industrialCommand"
+    if "freighter" in group:
+        return "freighter"
+    if "mining frigate" in group:
+        return "miningFrigate"
+    if "mining barge" in group or "exhumer" in group:
+        return "miningBarge"
+    if "rookie" in group:
+        return "rookie"
+    if "shuttle" in group:
+        return "shuttle"
+    if "capsule" in group:
+        return "capsule"
+    if "super capital" in group or group == "supercapital":
+        return "superCapital"
+    if "carrier" in group or "dreadnought" in group or "force auxiliary" in group or group == "capital":
+        return "capital"
+    if "battlecruiser" in group or "command ship" in group:
+        return "battlecruiser"
+    if "battleship" in group or "marauder" in group or "black ops" in group:
+        return "battleship"
+    if (
+        "cruiser" in group
+        or "recon ship" in group
+        or "logistics" in group
+        or "heavy interdictor" in group
+        or "strategic cruiser" in group
+    ):
+        return "cruiser"
+    if "destroyer" in group or "interdictor" in group:
+        return "destroyer"
+    if (
+        "frigate" in group
+        or "interceptor" in group
+        or "covert ops" in group
+        or "electronic attack ship" in group
+        or "assault frigate" in group
+        or "expedition frigate" in group
+        or "logistics frigate" in group
+    ):
+        return "frigate"
+    if "industrial" in group or "hauler" in group:
+        return "industrial"
+    return None
+
+
+def get_ship_icon_key(type_name: str) -> str | None:
+    backend = _get_static_backend()
+    canonical = backend.resolve_type_name(type_name or "")
+    if not canonical:
+        return None
+    if canonical in _SHIP_ICON_KEY_CACHE:
+        return _SHIP_ICON_KEY_CACHE[canonical]
+
+    icon_key: str | None = None
+    item = backend.get_item(canonical)
+    if item is not None:
+        group_name = str(getattr(getattr(item, "group", None), "name", "") or "")
+        icon_key = _ship_group_to_icon_key(group_name)
+
+    _SHIP_ICON_KEY_CACHE[canonical] = icon_key
+    return icon_key
 
 
 def resolve_module_type_name(type_name: str) -> str:
