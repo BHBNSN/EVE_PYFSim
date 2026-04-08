@@ -59,7 +59,9 @@ class AreaCycleOverlay:
     radius_m: float
     fill_color: QColor
     border_color: QColor
+    started_at: float
     expires_at: float
+    expand_duration_sec: float = 0.0
 
 
 class PreferencesStore:

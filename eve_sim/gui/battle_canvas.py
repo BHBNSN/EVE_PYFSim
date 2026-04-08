@@ -357,6 +357,13 @@ class BattleCanvas(QWidget):
             radius_m = max(radius_m, max(0.0, float(effect.range_m or 0.0)))
         return radius_m
 
+    @staticmethod
+    def _module_area_expand_duration(module: ModuleRuntime) -> float:
+        group = str(getattr(module, "group", "") or "").strip().lower()
+        if group == "command burst":
+            return 0.35
+        return 0.0
+
     def _sync_area_cycle_overlays(self) -> None:
         now = float(self.engine.world.now)
         cycle_restart_margin = 0.2
@@ -369,6 +376,8 @@ class BattleCanvas(QWidget):
             if module is None or self._module_area_style(module) is None or module.state != ModuleState.ACTIVE:
                 self._area_cycle_overlays.pop(key, None)
                 continue
+            overlay.center = Vector2(ship.nav.position.x, ship.nav.position.y)
+            overlay.radius_m = self._module_area_radius(module)
             cycle_left = max(0.0, float(ship.combat.module_cycle_timers.get(overlay.module_id, 0.0) or 0.0))
             if cycle_left <= 0.0 or now >= overlay.expires_at:
                 self._area_cycle_overlays.pop(key, None)
@@ -398,7 +407,9 @@ class BattleCanvas(QWidget):
                     radius_m=radius_m,
                     fill_color=style[0],
                     border_color=style[1],
+                    started_at=now,
                     expires_at=now + cycle_left,
+                    expand_duration_sec=self._module_area_expand_duration(module),
                 )
 
     def _iter_active_area_overlays(self) -> list[AreaCycleOverlay]:
@@ -455,7 +466,12 @@ class BattleCanvas(QWidget):
 
         for overlay in self._iter_active_area_overlays():
             x, y = self._to_screen(overlay.center)
-            radius_px = max(1, int(overlay.radius_m * self.zoom))
+            expand_duration = max(0.0, float(getattr(overlay, "expand_duration_sec", 0.0) or 0.0))
+            if expand_duration > 0.0:
+                progress = max(0.0, min(1.0, (float(self.engine.world.now) - float(overlay.started_at)) / expand_duration))
+            else:
+                progress = 1.0
+            radius_px = max(1, int(overlay.radius_m * self.zoom * progress))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(overlay.fill_color)
             painter.drawEllipse(x - radius_px, y - radius_px, radius_px * 2, radius_px * 2)

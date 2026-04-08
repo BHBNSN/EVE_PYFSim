@@ -1813,6 +1813,28 @@ class CombatSystem:
     ) -> CycleTargetSnapshot | None:
         return self._module_cycle_snapshots_for(source_ship_id, module_id).get(target_ship_id)
 
+    def _live_cycle_snapshot_target_ids(
+        self,
+        world: WorldState,
+        source_ship_id: str,
+        module_id: str,
+        *,
+        team: Team | None = None,
+        require_runtime: bool = False,
+    ) -> tuple[str, ...]:
+        retained_ids: list[str] = []
+        for target_id in self._module_cycle_snapshots_for(source_ship_id, module_id):
+            target = world.ships.get(target_id)
+            if target is None or not target.vital.alive or self._ship_in_warp(target):
+                continue
+            if team is not None and target.team != team:
+                continue
+            if require_runtime and target.runtime is None:
+                continue
+            retained_ids.append(str(target_id))
+        retained_ids.sort()
+        return tuple(retained_ids)
+
     def _clear_module_cycle_snapshots(self, source_ship_id: str, module_id: str) -> None:
         self._module_cycle_target_snapshots.pop(self._module_cycle_snapshot_key(source_ship_id, module_id), None)
 
@@ -3217,15 +3239,18 @@ class CombatSystem:
                 if state_value not in {"ACTIVE", "OVERHEATED"}:
                     continue
 
-                target_ids = {
-                    target_id
-                    for target_id in self._module_cycle_snapshots_for(source.ship_id, module.module_id)
-                    if (target := world.ships.get(target_id)) is not None
-                    and target.vital.alive
-                    and not self._ship_in_warp(target)
-                    and target.team == source.team
-                    and target.runtime is not None
-                }
+                # Command burst recipients are frozen at cycle start. Once the cycle begins,
+                # leaving the burst radius does not remove a target and newly-entering ships
+                # do not gain the burst until the next cycle starts.
+                target_ids = set(
+                    self._live_cycle_snapshot_target_ids(
+                        world,
+                        source.ship_id,
+                        module.module_id,
+                        team=source.team,
+                        require_runtime=True,
+                    )
+                )
                 if not target_ids:
                     continue
 
