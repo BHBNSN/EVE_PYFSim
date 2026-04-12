@@ -912,6 +912,8 @@ class CombatSystem:
             target = world.ships.get(str(candidate_id))
             if target is None or not target.vital.alive or target.team == source.team:
                 continue
+            if not self._target_within_lock_range(source, target):
+                continue
             if not self._module_in_projected_range(source, target, module):
                 continue
             if not self._can_target_under_ecm(source, str(candidate_id), self._decision_now(world)):
@@ -2098,6 +2100,9 @@ class CombatSystem:
             if target_id:
                 self._drop_lock_target(ship, target_id)
             return False
+        if not self._target_within_lock_range(ship, target):
+            self._drop_lock_target(ship, target_id)
+            return False
         now_value = self._decision_now(world, now)
         if not self._can_target_under_ecm(ship, target_id, now_value):
             self._drop_lock_target(ship, target_id)
@@ -2132,9 +2137,19 @@ class CombatSystem:
             if self._ship_in_warp(ship):
                 self._break_all_locks(ship)
                 continue
-            if not ship.combat.lock_timers and not ship.combat.lock_deadlines:
+            if not ship.combat.lock_timers and not ship.combat.lock_deadlines and not ship.combat.lock_targets:
                 continue
             self._prepare_ship_timer_views(ship, now_value)
+            for target_id in list(ship.combat.lock_targets):
+                target = world.ships.get(target_id)
+                if (
+                    target is None
+                    or not target.vital.alive
+                    or self._ship_in_warp(target)
+                    or not self._can_target_under_ecm(ship, target_id, now_value)
+                    or not self._target_within_lock_range(ship, target)
+                ):
+                    self._drop_lock_target(ship, target_id)
             for target_id, left in list(ship.combat.lock_timers.items()):
                 target = world.ships.get(target_id)
                 if (
@@ -2142,6 +2157,7 @@ class CombatSystem:
                     or not target.vital.alive
                     or self._ship_in_warp(target)
                     or not self._can_target_under_ecm(ship, target_id, now_value)
+                    or not self._target_within_lock_range(ship, target)
                 ):
                     self._drop_lock_target(ship, target_id)
                     continue
@@ -2186,6 +2202,61 @@ class CombatSystem:
     def _vector_from_facing_deg(facing_deg: float) -> Vector2:
         radians = math.radians(float(facing_deg or 0.0))
         return Vector2(math.cos(radians), math.sin(radians))
+
+    @staticmethod
+    def _lock_range_m(profile: ShipProfile | None) -> float:
+        if profile is None:
+            return 0.0
+        return max(0.0, float(getattr(profile, "max_target_range", 0.0) or 0.0))
+
+    @classmethod
+    def _target_within_lock_range(
+        cls,
+        source,
+        target,
+        *,
+        source_profile: ShipProfile | None = None,
+    ) -> bool:
+        if source is None or target is None:
+            return False
+        max_target_range = cls._lock_range_m(source_profile if source_profile is not None else getattr(source, "profile", None))
+        if max_target_range <= 0.0:
+            return False
+        return source.nav.position.distance_to(target.nav.position) <= max_target_range
+
+    def _ship_target_candidate_pools(
+        self,
+        world: WorldState,
+        ship,
+        *,
+        focus_queue: tuple[str, ...],
+    ) -> tuple[list, list, set[str], set[str]]:
+        visible_ids: set[str] = {str(target_id) for target_id in getattr(ship, "perception", ()) if str(target_id)}
+        visible_ids.update(str(target_id) for target_id in focus_queue[:2] if str(target_id))
+        visible_ids.update(str(target_id) for target_id in ship.combat.lock_targets if str(target_id))
+        visible_ids.update(str(target_id) for target_id in ship.combat.lock_timers.keys() if str(target_id))
+        visible_ids.update(str(target_id) for target_id in ship.combat.projected_targets.values() if str(target_id))
+        current_target_id = str(getattr(ship.combat, "current_target", "") or "")
+        if current_target_id:
+            visible_ids.add(current_target_id)
+
+        allies_pool: list[Any] = []
+        enemies_pool: list[Any] = []
+        ally_ids: set[str] = set()
+        enemy_ids: set[str] = set()
+        for candidate_id in sorted(visible_ids):
+            candidate = world.ships.get(candidate_id)
+            if candidate is None or not candidate.vital.alive or self._ship_in_warp(candidate):
+                continue
+            if not self._target_within_lock_range(ship, candidate):
+                continue
+            if candidate.team == ship.team:
+                allies_pool.append(candidate)
+                ally_ids.add(candidate_id)
+            else:
+                enemies_pool.append(candidate)
+                enemy_ids.add(candidate_id)
+        return allies_pool, enemies_pool, ally_ids, enemy_ids
 
     @staticmethod
     def _projectile_damage_tuple(projectile: ProjectileEntity) -> DamageTuple:
@@ -3109,6 +3180,8 @@ class CombatSystem:
                     continue
                 if not self._ship_needs_layer_repair(target, layer):
                     continue
+                if not self._target_within_lock_range(source, target):
+                    continue
                 if not self._module_in_projected_range(source, target, module):
                     continue
                 return target_id
@@ -3538,6 +3611,8 @@ class CombatSystem:
         target = world.ships.get(target_id)
         if target is None or not target.vital.alive:
             return False
+        if not self._target_within_lock_range(source, target):
+            return False
         if not self._module_in_projected_range(source, target, module):
             return False
         if not self._can_target_under_ecm(source, target_id, self._decision_now(world)):
@@ -3609,6 +3684,8 @@ class CombatSystem:
             target_id = str(raw_target_id)
             target = world.ships.get(target_id)
             if target is None or not target.vital.alive or target.team == source.team:
+                continue
+            if not self._target_within_lock_range(source, target):
                 continue
             if not self._module_in_projected_range(source, target, module):
                 continue
@@ -4074,11 +4151,9 @@ class CombatSystem:
 
     def _update_module_states(self, world: WorldState, dt: float, now: float | None = None) -> bool:
         alive_by_team: dict[Team, list] = {Team.BLUE: [], Team.RED: []}
-        alive_ids_by_team: dict[Team, set[str]] = {Team.BLUE: set(), Team.RED: set()}
         for candidate in world.ships.values():
             if candidate.vital.alive and not self._ship_in_warp(candidate):
                 alive_by_team[candidate.team].append(candidate)
-                alive_ids_by_team[candidate.team].add(candidate.ship_id)
 
         changed_focus_keys = self._changed_focus_queues(world)
         pyfa_remote_inputs_dirty = False
@@ -4110,10 +4185,11 @@ class CombatSystem:
                 )
                 <= 30.0
             )
-            allies_pool = alive_by_team.get(ship.team, [])
-            enemies_alive = alive_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, [])
-            ally_ids = alive_ids_by_team.get(ship.team, set())
-            enemy_ids = alive_ids_by_team.get(Team.RED if ship.team == Team.BLUE else Team.BLUE, set())
+            allies_pool, enemies_alive, ally_ids, enemy_ids = self._ship_target_candidate_pools(
+                world,
+                ship,
+                focus_queue=focus_queue,
+            )
             force_target_reselect = focus_key in changed_focus_keys
             self._enqueue_ship_control_signal_modules(world, ship, runtime, focus_changed=force_target_reselect, now=now_value)
             local_signature_dirty = False
@@ -4367,7 +4443,7 @@ class CombatSystem:
                             ship,
                             module,
                             projected_target_id,
-                            area_candidates=allies_pool if metadata.is_command_burst else None,
+                            area_candidates=alive_by_team.get(ship.team, []) if metadata.is_command_burst else None,
                         )
 
                 if cycle_started and self._uses_cycle_start_projected_application(metadata):
@@ -4691,6 +4767,9 @@ class CombatSystem:
                     target = world.ships.get(target_id)
                     if target is None or not target.vital.alive:
                         continue
+                    if not self._target_within_lock_range(ship, target, source_profile=attacker_profile):
+                        ship_timers.pop(target_id, None)
+                        continue
                     target_profile = effective_profiles.get(target_id) or target.profile
                     left = ship_timers.get(target_id)
                     if left is None:
@@ -4985,6 +5064,7 @@ class CombatSystem:
                     or not current_target.vital.alive
                     or self._ship_in_warp(current_target)
                     or current_target.team == ship.team
+                    or not self._target_within_lock_range(ship, current_target, source_profile=ship_profile)
                 ):
                     ship.combat.current_target = None
 
@@ -4992,7 +5072,13 @@ class CombatSystem:
                 queue = list(world.squad_focus_queues.get(self._focus_key(ship.team, ship.squad_id), []))
                 for candidate_id in queue:
                     candidate = world.ships.get(candidate_id)
-                    if candidate is None or not candidate.vital.alive or self._ship_in_warp(candidate) or candidate.team == ship.team:
+                    if (
+                        candidate is None
+                        or not candidate.vital.alive
+                        or self._ship_in_warp(candidate)
+                        or candidate.team == ship.team
+                        or not self._target_within_lock_range(ship, candidate, source_profile=ship_profile)
+                    ):
                         continue
                     ship.combat.current_target = candidate_id
                     break
