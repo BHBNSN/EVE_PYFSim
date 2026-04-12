@@ -49,7 +49,6 @@ from ..fleet_setup import (
     build_world_from_manual_setup,
     EftFitParser,
     RuntimeFromEftFactory,
-    recompute_profile_from_pyfa_runtime,
     get_charge_option_values_for_module,
     get_fit_backend_status,
     get_common_chargeable_modules,
@@ -496,8 +495,6 @@ class ShipStatusDialog(QDialog):
         self._lock_module_specs: dict[str, ParsedModuleSpec] = {}
         self._lock_ammo_draft_by_module: dict[str, str] = {}
         self._module_control_row_contexts: list[_ModuleControlRowContext] = []
-        self._stable_profile_cache = None
-        self._stable_profile_cache_key: tuple[Any, ...] | None = None
         self._lock_controls_signature: tuple[Any, ...] | None = None
         self._tab_signatures: dict[str, tuple[Any, ...] | str] = {}
         self._tab_keys = ["overview", "combat", "defense", "cap_target", "modules", "debug"]
@@ -1394,34 +1391,12 @@ class ShipStatusDialog(QDialog):
         return f" | {QCoreApplication.translate("eve_sim", 'ECM This Cycle')}={result_label}"
 
     def _stable_profile(self, ship):
+        current_profile = getattr(ship, "profile", None)
+        if isinstance(current_profile, ShipProfile):
+            return replace(current_profile)
         if ship.runtime is None:
             return ship.profile
-        fit_text = self._fit_text_getter(self.ship_id) or ""
-        runtime_state_key = tuple((module.module_id, module.state.value) for module in ship.runtime.modules)
-        diagnostics = ship.runtime.diagnostics if isinstance(ship.runtime.diagnostics, dict) else {}
-        cache_key = (
-            fit_text,
-            id(ship.runtime),
-            runtime_state_key,
-            diagnostics.get("pyfa_resolve_signature"),
-            diagnostics.get("pyfa_command_booster_signature"),
-            diagnostics.get("pyfa_projected_sources_signature"),
-        )
-        if self._stable_profile_cache is not None and self._stable_profile_cache_key == cache_key:
-            return self._stable_profile_cache
-
-        cached_pyfa_profile = ship.runtime.diagnostics.get("pyfa_base_profile")
-        if isinstance(cached_pyfa_profile, ShipProfile):
-            base = replace(cached_pyfa_profile)
-        else:
-            pyfa_profile = recompute_profile_from_pyfa_runtime(ship.runtime)
-            if pyfa_profile is not None:
-                base = replace(pyfa_profile)
-            else:
-                base = replace(self._runtime_engine.compute_base_profile(ship.runtime))
-        self._stable_profile_cache = base
-        self._stable_profile_cache_key = cache_key
-        return base
+        return replace(self._runtime_engine.compute_base_profile(ship.runtime))
 
     def _get_module_specs_cached(self, fit_text: str):
         if fit_text == self._cached_fit_text:
