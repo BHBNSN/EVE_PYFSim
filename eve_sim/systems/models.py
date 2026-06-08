@@ -110,6 +110,7 @@ class ModuleStaticMetadata:
     cycle_time: float
     reactivation_delay: float
     has_projected: bool
+    projected_max_range: float | None
     target_side: str
     is_command_burst: bool
     is_smart_bomb: bool

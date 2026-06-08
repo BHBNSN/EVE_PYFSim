@@ -21,7 +21,7 @@ class SimulationEngine:
         self.ship_agents: dict[str, ShipAgent] = {}
 
         self.perception = PerceptionSystem()
-        self.movement = MovementSystem(config.battlefield_radius)
+        self.movement = MovementSystem()
         self.combat = combat_system
         self.combat.attach_logger(
             self._logger,
@@ -125,6 +125,13 @@ class SimulationEngine:
                 "position": {"x": ship.nav.position.x, "y": ship.nav.position.y},
                 "velocity": {"x": ship.nav.velocity.x, "y": ship.nav.velocity.y},
                 "facing_deg": ship.nav.facing_deg,
+                "system_id": str(getattr(ship.nav, "system_id", "") or ""),
+                "gate_target_structure_id": str(getattr(getattr(ship.nav, "gate", None), "target_structure_id", "") or ""),
+                "gate_cloak_active": bool(getattr(getattr(ship.nav, "cloak", None), "active", False)),
+                "gate_cloak_expires_at": float(getattr(getattr(ship.nav, "cloak", None), "expires_at", 0.0) or 0.0),
+                "gate_cloak_source": str(getattr(getattr(ship.nav, "cloak", None), "source", "") or ""),
+                "follow_hold_active": bool(getattr(ship.nav, "follow_hold_active", False)),
+                "follow_hold_leader_id": str(getattr(ship.nav, "follow_hold_leader_id", "") or ""),
                 "shield": ship.vital.shield,
                 "armor": ship.vital.armor,
                 "structure": ship.vital.structure,
@@ -159,6 +166,7 @@ class SimulationEngine:
                     "source_module_id": projectile.source_module_id,
                     "team": projectile.team.value,
                     "position": {"x": projectile.position.x, "y": projectile.position.y},
+                    "system_id": str(getattr(projectile, "system_id", "") or ""),
                     "target_ship_id": projectile.target_ship_id,
                     "distance_traveled": float(projectile.distance_traveled),
                     "flight_time": float(projectile.flight_time),
@@ -172,6 +180,7 @@ class SimulationEngine:
                     "blast_id": blast.blast_id,
                     "kind": blast.kind,
                     "position": {"x": blast.position.x, "y": blast.position.y},
+                    "system_id": str(getattr(blast, "system_id", "") or ""),
                     "radius_m": float(blast.radius_m),
                     "expires_at": float(blast.expires_at),
                 }
@@ -186,6 +195,7 @@ class SimulationEngine:
                     "source_module_id": field.source_module_id,
                     "team": field.team.value,
                     "position": {"x": field.position.x, "y": field.position.y},
+                    "system_id": str(getattr(field, "system_id", "") or ""),
                     "radius_m": float(field.radius_m),
                     "expires_at": float(field.expires_at),
                     "blocks_warp": bool(field.blocks_warp),

@@ -25,9 +25,9 @@ from ..fit_runtime import (
     ModuleState,
     SkillProfile,
 )
+from ..maps import DEFAULT_MAP_ID, MapDefinition, instantiate_structures, load_map_definition
 from ..math2d import Vector2
 from ..models import (
-    Beacon,
     CombatState,
     FitDescriptor,
     NavigationState,
@@ -3397,33 +3397,63 @@ def default_manual_setup() -> list[ManualShipSetup]:
     return rows
 
 
-def build_world_from_manual_setup(ship_setups: list[ManualShipSetup]) -> WorldState:
-    def random_point_in_radius(center: Vector2, radius: float) -> Vector2:
-        theta = random.uniform(0.0, 2.0 * 3.141592653589793)
-        distance = radius * (random.random() ** 0.5)
-        return Vector2(center.x + math.cos(theta) * distance, center.y + math.sin(theta) * distance)
+def _random_point_in_radius(center: Vector2, radius: float) -> Vector2:
+    theta = random.uniform(0.0, 2.0 * math.tau)
+    distance = radius * (random.random() ** 0.5)
+    return Vector2(center.x + math.cos(theta) * distance, center.y + math.sin(theta) * distance)
 
-    world = WorldState()
-    world.beacons["gate-1"] = Beacon(
-        beacon_id="gate-1",
-        position=Vector2(-80_000, 0),
-        radius=2000,
-        interaction_range=2500,
-        kind="STARGATE",
+
+def _spawn_anchor_center(
+    map_definition: MapDefinition,
+    team: Team,
+    squad_id: str,
+    *,
+    claimed_anchor_counts: dict[str, int],
+) -> tuple[str, Vector2]:
+    anchor_candidates = []
+    for anchor in map_definition.all_spawn_anchors():
+        anchor_team = str(anchor.team or "ALL").upper()
+        anchor_squad = str(anchor.squad_id or "")
+        if anchor_team not in {"ALL", team.value}:
+            continue
+        match_score = 0
+        if anchor_team == team.value:
+            match_score += 1
+        if anchor_squad and anchor_squad == squad_id:
+            match_score += 2
+        anchor_candidates.append((match_score, anchor))
+    if anchor_candidates:
+        anchor_candidates.sort(key=lambda item: (-item[0], item[1].anchor_id))
+        selected = anchor_candidates[0][1]
+        claimed_anchor_counts[selected.anchor_id] = claimed_anchor_counts.get(selected.anchor_id, 0) + 1
+        system = map_definition.system_by_id(selected.system_id)
+        if system is not None:
+            return system.system_id, Vector2(float(selected.position.x), float(selected.position.y))
+    first_system = map_definition.systems[0] if map_definition.systems else None
+    if first_system is None:
+        return "", Vector2(0.0, 0.0)
+    return first_system.system_id, Vector2(0.0, 0.0)
+
+
+def build_world_from_manual_setup(
+    ship_setups: list[ManualShipSetup],
+    map_definition: MapDefinition | None = None,
+) -> WorldState:
+    selected_map = map_definition or load_map_definition(DEFAULT_MAP_ID)
+    world = WorldState(
+        map_id=selected_map.map_id,
+        map_name=selected_map.name,
+        map_definition=selected_map,
     )
-    world.beacons["gate-2"] = Beacon(
-        beacon_id="gate-2",
-        position=Vector2(80_000, 0),
-        radius=2000,
-        interaction_range=2500,
-        kind="STARGATE",
-    )
+    world.structures = instantiate_structures(selected_map)
 
     parser = EftFitParser()
     factory = RuntimeFromEftFactory()
     counters: dict[tuple[Team, str], int] = {}
     first_ship_per_squad: dict[str, str] = {}
     squad_centers: dict[tuple[Team, str], Vector2] = {}
+    squad_system_ids: dict[tuple[Team, str], str] = {}
+    claimed_anchor_counts: dict[str, int] = {}
 
     for setup in ship_setups:
         quality = QUALITY_PRESETS[setup.quality]
@@ -3434,9 +3464,15 @@ def build_world_from_manual_setup(ship_setups: list[ManualShipSetup]) -> WorldSt
 
         key = (setup.team, setup.squad_id)
         if key not in squad_centers:
-            team_anchor = Vector2(-45_000.0, 0.0) if setup.team == Team.BLUE else Vector2(45_000.0, 0.0)
-            squad_centers[key] = random_point_in_radius(team_anchor, 12_000.0)
-        spawn_position = random_point_in_radius(squad_centers[key], 5_000.0)
+            system_id, anchor_center = _spawn_anchor_center(
+                selected_map,
+                setup.team,
+                setup.squad_id,
+                claimed_anchor_counts=claimed_anchor_counts,
+            )
+            squad_system_ids[key] = system_id
+            squad_centers[key] = _random_point_in_radius(anchor_center, 12_000.0)
+        spawn_position = _random_point_in_radius(squad_centers[key], 5_000.0)
         counters[key] = counters.get(key, 0) + 1
         ship_id = f"{setup.team.value}-{setup.squad_id}-{counters[key]:03d}"
 
@@ -3447,7 +3483,13 @@ def build_world_from_manual_setup(ship_setups: list[ManualShipSetup]) -> WorldSt
             fit=fit,
             profile=profile,
             runtime=runtime,
-            nav=NavigationState(position=spawn_position, velocity=Vector2(0.0, 0.0), facing_deg=0.0, max_speed=profile.max_speed),
+            nav=NavigationState(
+                position=spawn_position,
+                velocity=Vector2(0.0, 0.0),
+                facing_deg=0.0,
+                max_speed=profile.max_speed,
+                system_id=squad_system_ids.get(key, ""),
+            ),
             combat=CombatState(),
             vital=VitalState(
                 shield=max(1.0, profile.shield_hp),

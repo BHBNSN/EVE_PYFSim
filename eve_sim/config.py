@@ -10,7 +10,6 @@ class EngineConfig:
     tick_rate: int = 30
     physics_substeps: int = 1
     lockstep: bool = True
-    battlefield_radius: float = 800_000.0
     detailed_logging: bool = False
     hotspot_logging: bool = False
     detail_log_file: str = "logs/sim_detail.log"
@@ -22,7 +21,7 @@ class EngineConfig:
 class UiConfig:
     width: int = 1400
     height: int = 900
-    world_to_screen_scale: float = 0.0009
+    world_to_screen_scale: float = 0.3
 
 
 def resolve_pyfa_source_dir() -> Path:

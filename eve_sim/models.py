@@ -161,15 +161,33 @@ class WarpState:
 
 
 @dataclass(slots=True)
+class GateTransitState:
+    target_structure_id: str | None = None
+    activation_range_m: float = 2_500.0
+
+
+@dataclass(slots=True)
+class CloakState:
+    active: bool = False
+    expires_at: float = 0.0
+    source: str = ""
+
+
+@dataclass(slots=True)
 class NavigationState:
     position: Vector2
     velocity: Vector2
     facing_deg: float
     max_speed: float
+    system_id: str = ""
     radius: float = 60.0
     command_target: Vector2 | None = None
     propulsion_command_active: bool = False
     warp: WarpState = field(default_factory=WarpState)
+    gate: GateTransitState = field(default_factory=GateTransitState)
+    cloak: CloakState = field(default_factory=CloakState)
+    follow_hold_active: bool = False
+    follow_hold_leader_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -206,6 +224,8 @@ class CombatState:
     module_decision_pending_signature: tuple[str, ...] = field(default_factory=tuple)
     module_decision_propulsion_active: bool | None = None
     module_decision_recent_enemy_damage_active: bool | None = None
+    module_decision_enemy_targets_active: bool | None = None
+    module_decision_ally_targets_active: bool | None = None
 
 
 @dataclass(slots=True)
@@ -253,6 +273,7 @@ class ProjectileEntity:
     structure_resonance_explosive: float = 1.0
     blast_radius: float = 0.0
     alive: bool = True
+    system_id: str = ""
 
 
 @dataclass(slots=True)
@@ -262,6 +283,7 @@ class ProjectileBlast:
     position: Vector2
     radius_m: float
     expires_at: float
+    system_id: str = ""
 
 
 @dataclass(slots=True)
@@ -298,6 +320,7 @@ class BubbleField:
     structure_resonance_kinetic: float = 1.0
     structure_resonance_explosive: float = 1.0
     alive: bool = True
+    system_id: str = ""
 
 
 @dataclass(slots=True)
@@ -342,15 +365,29 @@ class ShipEntity:
     runtime: "FitRuntime | None" = None
     order_queue: list[Order] = field(default_factory=list)
     perception: list[str] = field(default_factory=list)
+    perception_allies: list[str] = field(default_factory=list)
+    perception_enemies: list[str] = field(default_factory=list)
+    perception_split_ready: bool = False
 
 
 @dataclass(slots=True)
-class Beacon:
-    beacon_id: str
+class StructureEntity:
+    structure_id: str
     position: Vector2
     radius: float
     interaction_range: float
     kind: str
+    system_id: str = ""
+    display_name: str = ""
+    icon_key: str = ""
+    linked_structure_id: str | None = None
+
+    @property
+    def beacon_id(self) -> str:
+        return self.structure_id
+
+
+Beacon = StructureEntity
 
 
 @dataclass(slots=True)

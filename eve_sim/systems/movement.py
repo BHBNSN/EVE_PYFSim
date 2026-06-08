@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 
 from ..math2d import Vector2
 from ..models import WarpInterdictionSnapshot
@@ -9,12 +10,16 @@ from ..world import WorldState
 
 class MovementSystem:
     AU_METERS = 149_597_870_700.0
+    DEFAULT_SYSTEM_RADIUS_M = 30.0 * AU_METERS
     MIN_WARP_DISTANCE_M = 150_000.0
     WARP_BUBBLE_CATCH_WINDOW_M = 500_000.0
     WARP_ALIGNMENT_CONE_DEG = 5.0
+    STARGATE_USE_DISTANCE_M = 2_500.0
+    STARGATE_JUMP_OFFSET_MIN_M = 10_000.0
+    STARGATE_JUMP_OFFSET_MAX_M = 15_000.0
+    STARGATE_GATE_CLOAK_SEC = 60.0
 
-    def __init__(self, battlefield_radius: float) -> None:
-        self.battlefield_radius = battlefield_radius
+    def __init__(self) -> None:
         self._large_angle_threshold_deg = 45.0
 
     @staticmethod
@@ -36,8 +41,71 @@ class MovementSystem:
         return Vector2(math.cos(facing_rad), math.sin(facing_rad))
 
     @staticmethod
+    def _random_point_in_radius(center: Vector2, radius: float) -> Vector2:
+        theta = random.uniform(0.0, math.tau)
+        distance = max(0.0, float(radius)) * math.sqrt(random.random())
+        return Vector2(center.x + math.cos(theta) * distance, center.y + math.sin(theta) * distance)
+
+    @staticmethod
+    def _random_point_in_annulus(center: Vector2, min_radius: float, max_radius: float) -> Vector2:
+        minimum = max(0.0, float(min_radius))
+        maximum = max(minimum, float(max_radius))
+        theta = random.uniform(0.0, math.tau)
+        distance = math.sqrt(random.uniform(minimum * minimum, maximum * maximum))
+        return Vector2(center.x + math.cos(theta) * distance, center.y + math.sin(theta) * distance)
+
+    @staticmethod
     def _ship_in_warp(ship) -> bool:
         return str(getattr(getattr(ship.nav, "warp", None), "phase", "idle") or "idle") == "warp"
+
+    @staticmethod
+    def _ship_is_gate_cloaked(ship, now: float | None = None) -> bool:
+        cloak = getattr(ship.nav, "cloak", None)
+        if cloak is None or not bool(getattr(cloak, "active", False)):
+            return False
+        if now is not None and float(getattr(cloak, "expires_at", 0.0) or 0.0) <= float(now):
+            cloak.active = False
+            cloak.expires_at = 0.0
+            cloak.source = ""
+            return False
+        return True
+
+    @staticmethod
+    def _clear_gate_cloak(ship) -> None:
+        cloak = getattr(ship.nav, "cloak", None)
+        if cloak is None:
+            return
+        cloak.active = False
+        cloak.expires_at = 0.0
+        cloak.source = ""
+
+    @staticmethod
+    def _clear_gate_transit(ship) -> None:
+        gate = getattr(ship.nav, "gate", None)
+        if gate is None:
+            return
+        gate.target_structure_id = None
+
+    @staticmethod
+    def _edge_distance_to_structure(position: Vector2, structure) -> float:
+        radius = max(0.0, float(getattr(structure, "radius", 0.0) or 0.0))
+        return max(0.0, position.distance_to(structure.position) - radius)
+
+    @staticmethod
+    def _system_definition(world: WorldState, system_id: str):
+        map_definition = getattr(world, "map_definition", None)
+        if map_definition is None:
+            return None
+        try:
+            return map_definition.system_by_id(system_id)
+        except Exception:
+            return None
+
+    def _system_center_and_radius(self, world: WorldState, ship) -> tuple[Vector2, float]:
+        system = self._system_definition(world, str(getattr(ship.nav, "system_id", "") or ""))
+        if system is None:
+            return Vector2(0.0, 0.0), float(self.DEFAULT_SYSTEM_RADIUS_M)
+        return Vector2(0.0, 0.0), max(1_000.0, float(system.radius_m or 1_000.0))
 
     @staticmethod
     def _ship_has_warp_request(ship) -> bool:
@@ -266,17 +334,22 @@ class MovementSystem:
 
     def _resolve_warp_target(self, world: WorldState, ship) -> tuple[Vector2 | None, float]:
         warp = ship.nav.warp
+        source_system_id = str(getattr(ship.nav, "system_id", "") or "")
         if warp.target_ship_id:
             target_ship = world.ships.get(str(warp.target_ship_id))
             if target_ship is None or not target_ship.vital.alive:
+                return None, 0.0
+            if str(getattr(target_ship.nav, "system_id", "") or "") != source_system_id:
                 return None, 0.0
             landing_offset = max(0.0, float(getattr(target_ship.nav, "radius", 0.0) or 0.0)) + max(
                 0.0, float(getattr(ship.nav, "radius", 0.0) or 0.0)
             )
             return Vector2(target_ship.nav.position.x, target_ship.nav.position.y), landing_offset
         if warp.target_beacon_id:
-            beacon = world.beacons.get(str(warp.target_beacon_id))
+            beacon = world.structures.get(str(warp.target_beacon_id))
             if beacon is None:
+                return None, 0.0
+            if str(getattr(beacon, "system_id", "") or "") != source_system_id:
                 return None, 0.0
             landing_offset = max(0.0, float(getattr(beacon, "radius", 0.0) or 0.0)) + max(
                 0.0, float(getattr(ship.nav, "radius", 0.0) or 0.0)
@@ -299,7 +372,7 @@ class MovementSystem:
         angle_error = abs(self._wrap_angle_deg(target_angle - move_angle))
         return angle_error <= self.WARP_ALIGNMENT_CONE_DEG
 
-    def _start_warp(self, ship, target_position: Vector2, landing_offset: float) -> bool:
+    def _start_warp(self, world: WorldState, ship, target_position: Vector2, landing_offset: float) -> bool:
         to_target = target_position - ship.nav.position
         distance = to_target.length()
         if distance <= 1e-6:
@@ -324,8 +397,10 @@ class MovementSystem:
         if actual_distance > 1e-6 and destination_distance < actual_distance:
             cap_cost *= destination_distance / actual_distance
         destination = ship.nav.position + direction * destination_distance
-        if destination.length() > self.battlefield_radius:
-            destination = destination.normalized() * self.battlefield_radius
+        system_center, system_radius = self._system_center_and_radius(world, ship)
+        relative_destination = destination - system_center
+        if relative_destination.length() > system_radius:
+            destination = system_center + relative_destination.normalized() * system_radius
             destination_distance = ship.nav.position.distance_to(destination)
             cap_cost = min(cap_cost, max(0.0, float(ship.vital.cap or 0.0)))
 
@@ -384,9 +459,9 @@ class MovementSystem:
         if self._ship_inside_current_warp_disruption(world, ship, bool(ship.nav.warp.bubble_immune_snapshot)):
             return
         if self._alignment_ready_for_warp(world, ship, target_position) or ship.nav.warp.align_elapsed >= float(ship.nav.warp.align_timeout):
-            self._start_warp(ship, target_position, landing_offset)
+            self._start_warp(world, ship, target_position, landing_offset)
 
-    def _advance_in_warp(self, ship, dt: float) -> None:
+    def _advance_in_warp(self, world: WorldState, ship, dt: float) -> None:
         if str(ship.nav.warp.phase or "idle") != "warp":
             return
         origin = ship.nav.warp.origin
@@ -414,6 +489,76 @@ class MovementSystem:
         ship.nav.velocity = direction * average_speed
         if direction.length() > 0.0:
             ship.nav.facing_deg = direction.angle_deg()
+
+    def _activate_stargate_jump(self, world: WorldState, ship, source_gate, destination_gate) -> None:
+        del source_gate
+        destination_position = self._random_point_in_annulus(
+            Vector2(destination_gate.position.x, destination_gate.position.y),
+            self.STARGATE_JUMP_OFFSET_MIN_M,
+            self.STARGATE_JUMP_OFFSET_MAX_M,
+        )
+        ship.nav.system_id = str(getattr(destination_gate, "system_id", "") or ship.nav.system_id)
+        ship.nav.position = destination_position
+        ship.nav.velocity = Vector2(0.0, 0.0)
+        ship.nav.command_target = None
+        self._cancel_warp(ship)
+        self._clear_gate_transit(ship)
+        cloak = getattr(ship.nav, "cloak", None)
+        if cloak is not None:
+            cloak.active = True
+            cloak.expires_at = float(world.now) + self.STARGATE_GATE_CLOAK_SEC
+            cloak.source = "stargate"
+
+        leader_key = f"{ship.team.value}:{ship.squad_id}"
+        leader_id = str(world.squad_leaders.get(leader_key, "") or "")
+        if leader_id and leader_id != ship.ship_id:
+            ship.nav.follow_hold_active = True
+            ship.nav.follow_hold_leader_id = leader_id
+        else:
+            ship.nav.follow_hold_active = False
+            ship.nav.follow_hold_leader_id = None
+
+    def _prepare_gate_transit(self, world: WorldState, ship) -> None:
+        target_structure_id = str(getattr(getattr(ship.nav, "gate", None), "target_structure_id", "") or "").strip()
+        if not target_structure_id:
+            return
+        structure = world.structures.get(target_structure_id)
+        if structure is None or str(getattr(structure, "kind", "") or "").upper() != "STARGATE":
+            self._clear_gate_transit(ship)
+            ship.nav.command_target = None
+            return
+        if str(getattr(structure, "system_id", "") or "") != str(getattr(ship.nav, "system_id", "") or ""):
+            self._clear_gate_transit(ship)
+            ship.nav.command_target = None
+            return
+        linked_id = str(getattr(structure, "linked_structure_id", "") or "").strip()
+        if not linked_id or world.structures.get(linked_id) is None:
+            self._clear_gate_transit(ship)
+            ship.nav.command_target = None
+            return
+
+        activation_range = max(
+            float(getattr(structure, "interaction_range", 0.0) or 0.0),
+            float(getattr(getattr(ship.nav, "gate", None), "activation_range_m", self.STARGATE_USE_DISTANCE_M) or self.STARGATE_USE_DISTANCE_M),
+        )
+        ship.nav.gate.activation_range_m = activation_range
+        if self._edge_distance_to_structure(ship.nav.position, structure) <= activation_range:
+            self._activate_stargate_jump(world, ship, structure, world.structures[linked_id])
+            return
+        ship.nav.command_target = Vector2(structure.position.x, structure.position.y)
+
+    def _update_gate_cloak(self, world: WorldState, ship) -> None:
+        if not self._ship_is_gate_cloaked(ship, float(world.now)):
+            return
+        warp_phase = str(getattr(getattr(ship.nav, "warp", None), "phase", "idle") or "idle")
+        gate_target_id = str(getattr(getattr(ship.nav, "gate", None), "target_structure_id", "") or "").strip()
+        if (
+            warp_phase != "idle"
+            or ship.nav.command_target is not None
+            or gate_target_id
+            or ship.nav.velocity.length() > 5.0
+        ):
+            self._clear_gate_cloak(ship)
 
     @staticmethod
     def _motion_params(ship) -> tuple[float, float]:
@@ -544,20 +689,31 @@ class MovementSystem:
             if profile_speed > 0.0:
                 ship.nav.max_speed = profile_speed
 
+            self._update_gate_cloak(world, ship)
+
             if self._ship_in_warp(ship):
-                self._advance_in_warp(ship, dt)
+                self._advance_in_warp(world, ship, dt)
+                continue
+
+            self._prepare_gate_transit(world, ship)
+            if self._ship_in_warp(ship):
+                self._advance_in_warp(world, ship, dt)
                 continue
 
             self._prepare_warp_alignment(world, ship)
 
             displacement = self._update_velocity_with_inertia(world, ship, dt)
             next_pos = ship.nav.position + displacement
-            if next_pos.length() > self.battlefield_radius:
-                n = next_pos.normalized()
-                next_pos = n * self.battlefield_radius
+            system_center, system_radius = self._system_center_and_radius(world, ship)
+            relative_next = next_pos - system_center
+            if relative_next.length() > system_radius:
+                n = relative_next.normalized()
+                next_pos = system_center + n * system_radius
                 ship.nav.velocity = Vector2(0.0, 0.0)
 
-            for beacon in world.beacons.values():
+            for beacon in world.structures.values():
+                if str(getattr(beacon, "system_id", "") or "") != str(getattr(ship.nav, "system_id", "") or ""):
+                    continue
                 dist = next_pos.distance_to(beacon.position)
                 if dist < beacon.radius + ship.nav.radius:
                     push_dir = (next_pos - beacon.position).normalized()
@@ -566,5 +722,9 @@ class MovementSystem:
                     next_pos = beacon.position + push_dir * (beacon.radius + ship.nav.radius)
 
             ship.nav.position = next_pos
+            self._prepare_gate_transit(world, ship)
+            if self._ship_in_warp(ship):
+                self._advance_in_warp(world, ship, 0.0)
+                continue
             self._finalize_warp_alignment(world, ship, dt)
 

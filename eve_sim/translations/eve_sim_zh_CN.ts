@@ -133,11 +133,6 @@
         <translation>计算后端</translation>
     </message>
     <message>
-        <source>Battlefield Radius (m)</source>
-        <comment>setup_cfg_battlefield_radius</comment>
-        <translation type="vanished">战场半径 (m)</translation>
-    </message>
-    <message>
         <source>Blue</source>
         <comment>filter_blue</comment>
         <translation type="vanished">蓝方</translation>
@@ -2189,11 +2184,6 @@
         <translation>物理子步数</translation>
     </message>
     <message>
-        <location filename="../gui/fleet_setup_dialog.py" line="479" />
-        <source>Battlefield Radius (m)</source>
-        <translation>战场半径 (m)</translation>
-    </message>
-    <message>
         <location filename="../gui/fleet_setup_dialog.py" line="480" />
         <source>Lockstep</source>
         <translation>锁步模式</translation>
@@ -2487,6 +2477,198 @@
         <location filename="../../tests/test_localization.py" line="47" />
         <source>EFT header is invalid; expected [Ship, Fit Name].</source>
         <translation>EFT 头格式无效，需要形如 [Ship, Fit Name]。</translation>
+    </message>
+    <message>
+        <source>Battle Mode</source>
+        <translation>战斗模式</translation>
+    </message>
+    <message>
+        <source>Select mode</source>
+        <translation>选择模式</translation>
+    </message>
+    <message>
+        <source>Local</source>
+        <translation>本地</translation>
+    </message>
+    <message>
+        <source>Host LAN</source>
+        <translation>创建局域网主机</translation>
+    </message>
+    <message>
+        <source>Join LAN</source>
+        <translation>加入局域网</translation>
+    </message>
+    <message>
+        <source>Port</source>
+        <translation>端口</translation>
+    </message>
+    <message>
+        <source>Host IP</source>
+        <translation>主机 IP</translation>
+    </message>
+    <message>
+        <source>Failed to open LAN host: {error}</source>
+        <translation>启动局域网主机失败：{error}</translation>
+    </message>
+    <message>
+        <source>Failed to connect to host</source>
+        <translation>连接主机失败</translation>
+    </message>
+    <message>
+        <source>Fleet Setup</source>
+        <translation>舰队配置</translation>
+    </message>
+    <message>
+        <source>No ships found for current side in this mode</source>
+        <translation>当前模式下没有找到当前持方可用的舰船</translation>
+    </message>
+    <message>
+        <source>Map Editor</source>
+        <translation>地图编辑器</translation>
+    </message>
+    <message>
+        <source>No system selected</source>
+        <translation>未选择星系</translation>
+    </message>
+    <message>
+        <source>Map ID</source>
+        <translation>地图 ID</translation>
+    </message>
+    <message>
+        <source>Map Name</source>
+        <translation>地图名称</translation>
+    </message>
+    <message>
+        <source>Description</source>
+        <translation>描述</translation>
+    </message>
+    <message>
+        <source>Add System</source>
+        <translation>添加星系</translation>
+    </message>
+    <message>
+        <source>Remove System</source>
+        <translation>删除星系</translation>
+    </message>
+    <message>
+        <source>System</source>
+        <translation>星系</translation>
+    </message>
+    <message>
+        <source>System Name</source>
+        <translation>星系名称</translation>
+    </message>
+    <message>
+        <source>Origin X</source>
+        <translation>X 原点</translation>
+    </message>
+    <message>
+        <source>Origin Y</source>
+        <translation>Y 原点</translation>
+    </message>
+    <message>
+        <source>System Radius (AU)</source>
+        <translation>星系半径 (AU)</translation>
+    </message>
+    <message>
+        <source>Add Building</source>
+        <translation>添加建筑</translation>
+    </message>
+    <message>
+        <source>Remove Building</source>
+        <translation>删除建筑</translation>
+    </message>
+    <message>
+        <source>Building</source>
+        <translation>建筑</translation>
+    </message>
+    <message>
+        <source>Building Name</source>
+        <translation>建筑名称</translation>
+    </message>
+    <message>
+        <source>Kind</source>
+        <translation>类型</translation>
+    </message>
+    <message>
+        <source>Local X</source>
+        <translation>局部 X</translation>
+    </message>
+    <message>
+        <source>Local Y</source>
+        <translation>局部 Y</translation>
+    </message>
+    <message>
+        <source>Radius (m)</source>
+        <translation>半径 (m)</translation>
+    </message>
+    <message>
+        <source>Interaction Range (m)</source>
+        <translation>交互范围 (m)</translation>
+    </message>
+    <message>
+        <source>Gate Link</source>
+        <translation>星门连接</translation>
+    </message>
+    <message>
+        <source>Click canvas to place selected building</source>
+        <translation>点击画布放置当前选中的建筑</translation>
+    </message>
+    <message>
+        <source>Stargate</source>
+        <translation>星门</translation>
+    </message>
+    <message>
+        <source>Map ID cannot be empty</source>
+        <translation>地图 ID 不能为空</translation>
+    </message>
+    <message>
+        <source>At least one system is required</source>
+        <translation>至少需要一个星系</translation>
+    </message>
+    <message>
+        <source>System {index}</source>
+        <translation>星系 {index}</translation>
+    </message>
+    <message>
+        <source>Blue Spawn</source>
+        <translation>蓝方出生点</translation>
+    </message>
+    <message>
+        <source>Red Spawn</source>
+        <translation>红方出生点</translation>
+    </message>
+    <message>
+        <source>Building {index}</source>
+        <translation>建筑 {index}</translation>
+    </message>
+    <message>
+        <source>Center View on {structure}</source>
+        <translation>将视角居中到 {structure}</translation>
+    </message>
+    <message>
+        <source>{squad} Warp To {structure}</source>
+        <translation>{squad} 跃迁至 {structure}</translation>
+    </message>
+    <message>
+        <source>{squad} Take Gate {structure}</source>
+        <translation>{squad} 使用星门 {structure}</translation>
+    </message>
+    <message>
+        <source>{system} Stargate</source>
+        <translation>{system} 星门</translation>
+    </message>
+    <message>
+        <source>System Map</source>
+        <translation>星系图</translation>
+    </message>
+    <message>
+        <source>No map loaded</source>
+        <translation>未加载地图</translation>
+    </message>
+    <message>
+        <source>No systems</source>
+        <translation>没有星系</translation>
     </message>
 </context>
 </TS>

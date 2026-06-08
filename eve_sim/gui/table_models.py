@@ -273,7 +273,7 @@ class SetupRowDelegate(QStyledItemDelegate):
 
 
 class OverviewTableModel(QAbstractTableModel):
-    HEADERS = ["Ship ID", "Ship Name", "Distance (km)", "Team"]
+    HEADERS = ["ID", "Name", "Distance (km)", "Type"]
 
     def __init__(
         self,
@@ -326,15 +326,15 @@ class OverviewTableModel(QAbstractTableModel):
             if col == 1:
                 return row.get("ship_name_display", row.get("ship_type_display", row["ship_type"]))
             if col == 2:
-                return f"{row['dist']:.1f}"
+                return row.get("dist_display", f"{row['dist']:.1f}")
             if col == 3:
-                return row["team"]
+                return row.get("team_display", row["team"])
 
         if role == Qt.ItemDataRole.BackgroundRole:
             selected_squad = self._selected_squad_getter()
             selected_target = self._selected_target_getter()
             controlled_team = self._controlled_team_getter().value
-            if row["team"] == controlled_team and row["squad"] == selected_squad:
+            if row.get("entity_kind") == "ship" and row["team"] == controlled_team and row["squad"] == selected_squad:
                 return QColor(28, 45, 68)
             if selected_target and row["id"] == selected_target:
                 return QColor(85, 70, 24)
@@ -449,6 +449,10 @@ class OverviewFilterProxyModel(QSortFilterProxyModel):
             return False
 
         prefs = self._prefs_getter()
+        if str(row.get("entity_kind", "ship")) == "structure":
+            if prefs.filter_alive == "DESTROYED":
+                return False
+            return True
         enemy_team = Team.RED if self._controlled_team_getter() == Team.BLUE else Team.BLUE
         controlled_team = self._controlled_team_getter()
         team_filter = str(prefs.filter_team or "ALL").upper()
@@ -494,7 +498,7 @@ class OverviewFilterProxyModel(QSortFilterProxyModel):
             0: "id",
             1: "ship_name",
             2: "dist",
-            3: "team",
+            3: "team_display",
         }
         field = field_by_col.get(left.column(), "id")
         lv = lrow[field]

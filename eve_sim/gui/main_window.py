@@ -75,10 +75,12 @@ from ..lan_commands import (
     CMD_SQUAD_MOVE,
     CMD_SQUAD_PREFOCUS,
     CMD_SQUAD_PROPULSION,
+    CMD_SQUAD_USE_GATE,
     CMD_SQUAD_WARP,
     CMD_SYNC_SETUP,
     SQUAD_FOCUS_COMMANDS,
 )
+from ..maps import deserialize_map_definition, instantiate_structures, serialize_map_definition
 from ..math2d import Vector2
 from ..module_control import normalize_module_manual_mode, normalize_module_target_mode, stored_module_target_mode
 from ..models import (
@@ -103,8 +105,11 @@ from ..user_errors import display_user_error
 from .battle_canvas import BattleCanvas
 from .dialogs import OverviewOptionsDialog, ShipStatusDialog
 from .fleet_setup_dialog import FleetSetupDialog
+from .system_graph_window import SystemGraphWindow
 from .models import PreferencesStore, UiPreferences, UiState
 from .table_models import BlueRosterTableModel, OverviewFilterProxyModel, OverviewTableModel
+
+AU_METERS = 149_597_870_700.0
 
 class MainWindow(QMainWindow):
     """
@@ -183,6 +188,7 @@ class MainWindow(QMainWindow):
         self._last_sent_ship_signatures: dict[str, tuple] = {}
         self._last_sent_fit_texts: dict[str, str] = {}
         self._lan_debug_enabled = False
+        self._view_system_id: str = ""
 
         self._create_menu()
 
@@ -217,11 +223,21 @@ class MainWindow(QMainWindow):
             lambda: self.controlled_team,
             self.on_canvas_select_squad,
             self.on_canvas_select_enemy,
+            on_show_structure_context_menu=self.show_structure_context_menu,
         )
+        self.canvas.current_view_system_id = self._view_system_id
         if self.prefs.zoom is not None:
-            self.canvas.zoom = float(self.prefs.zoom)
+            self.canvas.zoom = self.canvas._clamp_zoom(float(self.prefs.zoom))
         splitter.addWidget(self.canvas)
         splitter.setSizes([560, ui_cfg.width])
+        if self.prefs.zoom is None and self.engine.world.map_definition is not None:
+            QTimer.singleShot(0, self.canvas.fit_to_map)
+        self.system_graph_window = SystemGraphWindow(
+            engine=self.engine,
+            current_system_getter=lambda: str(self.canvas.current_view_system_id or self._current_view_system_id()),
+            jump_to_system=lambda system_id: self._set_view_system(system_id, center=True),
+        )
+        self.system_graph_window.show()
 
         self.tick_timer = QTimer(self)
         self.tick_timer.timeout.connect(self.on_tick)
@@ -258,6 +274,24 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _center_canvas_on_world(self, system_id: str, position: Vector2) -> None:
+        normalized_system_id = str(system_id or "").strip()
+        if normalized_system_id:
+            self._set_view_system(normalized_system_id, center=False)
+        self.canvas.center_on_world(position)
+
+    def _disable_team_propulsion_for_squad(self, team: Team, squad_id: str) -> None:
+        self._set_team_propulsion_state(team, squad_id, False)
+        old = self._get_team_intent(team, squad_id)
+        if old is not None and old.propulsion_active is not False:
+            self._set_team_intent(team, squad_id, replace(old, propulsion_active=False))
+        for ship in self.engine.world.ships.values():
+            if ship.team != team or ship.squad_id != squad_id:
+                continue
+            ship.nav.propulsion_command_active = False
+        if team == self.controlled_team and squad_id == self.ui_state.selected_squad:
+            self._refresh_propulsion_button_text()
 
     def _enqueue_tick_op(self, op: Callable[[], None]) -> None:
         self._pending_tick_ops.append(op)
@@ -300,8 +334,44 @@ class MainWindow(QMainWindow):
             ship.nav.velocity = Vector2(0.0, 0.0)
             ship.order_queue.clear()
 
+    @staticmethod
+    def _ship_is_gate_cloaked(ship, now: float | None = None) -> bool:
+        cloak = getattr(getattr(ship, "nav", None), "cloak", None)
+        if cloak is None or not bool(getattr(cloak, "active", False)):
+            return False
+        if now is not None and float(getattr(cloak, "expires_at", 0.0) or 0.0) <= float(now):
+            cloak.active = False
+            cloak.expires_at = 0.0
+            cloak.source = ""
+            return False
+        return True
+
+    def _ship_is_visible_gate_cloak_leader(self, ship) -> bool:
+        if ship.team != self.controlled_team:
+            return False
+        leader_key = self._focus_key(ship.team, ship.squad_id)
+        leader_id = str(self.engine.world.squad_leaders.get(leader_key, "") or "")
+        if leader_id:
+            return leader_id == ship.ship_id
+        squad_members = [
+            candidate
+            for candidate in self.engine.world.ships.values()
+            if candidate.team == ship.team and candidate.squad_id == ship.squad_id and candidate.vital.alive
+        ]
+        if not squad_members:
+            return False
+        squad_members.sort(key=lambda candidate: candidate.ship_id)
+        return squad_members[0].ship_id == ship.ship_id
+
     def _is_ship_visible(self, ship_id: str) -> bool:
-        return ship_id not in self._undeployed_ship_ids
+        if ship_id in self._undeployed_ship_ids:
+            return False
+        ship = self.engine.world.ships.get(str(ship_id))
+        if ship is None:
+            return False
+        if not self._ship_is_gate_cloaked(ship, float(self.engine.world.now)):
+            return True
+        return self._ship_is_visible_gate_cloak_leader(ship)
 
     @staticmethod
     def _parse_team_squad_key(scoped_key: str, default_team: Team) -> tuple[Team, str]:
@@ -464,14 +534,97 @@ class MainWindow(QMainWindow):
 
         self._apply_ship_module_manual_mode(ship, module_id, normalized_mode)
         self.request_overview_refresh(force=True)
+
+    def _install_map_definition(self, map_definition) -> None:
+        self.engine.world.map_id = str(getattr(map_definition, "map_id", "") or "")
+        self.engine.world.map_name = str(getattr(map_definition, "name", "") or "")
+        self.engine.world.map_definition = map_definition
+        self.engine.world.structures = instantiate_structures(map_definition)
+        self._refresh_system_view_controls()
+        if hasattr(self, "system_graph_window"):
+            self.system_graph_window.sync_from_world()
+        if hasattr(self, "canvas") and self.prefs.zoom is None:
+            QTimer.singleShot(0, self.canvas.fit_to_map)
+
+    def _selected_anchor_system_id(self) -> str:
+        members = [
+            s
+            for s in self.engine.world.ships.values()
+            if s.team == self.controlled_team and s.squad_id == self.ui_state.selected_squad and s.vital.alive
+        ]
+        if not members:
+            return ""
+        return str(getattr(members[0].nav, "system_id", "") or "")
+
+    def _refresh_system_view_controls(self) -> None:
+        if not hasattr(self, "system_view_combo"):
+            return
+        map_definition = getattr(self.engine.world, "map_definition", None)
+        current_system_id = str(self._view_system_id or self.system_view_combo.currentData() or "").strip()
+        self.system_view_combo.blockSignals(True)
+        self.system_view_combo.clear()
+        if map_definition is not None:
+            for system in getattr(map_definition, "systems", []):
+                label = str(getattr(system, "name", "") or getattr(system, "system_id", "") or "")
+                self.system_view_combo.addItem(label, str(system.system_id))
+        if self.system_view_combo.count() > 0:
+            idx = self.system_view_combo.findData(current_system_id)
+            self.system_view_combo.setCurrentIndex(0 if idx < 0 else idx)
+            self._view_system_id = str(self.system_view_combo.currentData() or "").strip()
+            if hasattr(self, "canvas"):
+                self.canvas.current_view_system_id = self._view_system_id
+        self.system_view_combo.setEnabled(self.system_view_combo.count() > 0)
+        self.btn_view_system.setEnabled(self.system_view_combo.count() > 0)
+        self.btn_fit_map.setEnabled(self.engine.world.map_definition is not None)
+        self.system_view_combo.blockSignals(False)
+
+    def _current_view_system_id(self) -> str:
+        if self._view_system_id:
+            return str(self._view_system_id)
+        if hasattr(self, "system_view_combo"):
+            value = str(self.system_view_combo.currentData() or "").strip()
+            if value:
+                return value
+        map_definition = getattr(self.engine.world, "map_definition", None)
+        if map_definition is None or not getattr(map_definition, "systems", None):
+            return ""
+        anchor_system = self._selected_anchor_system_id()
+        if anchor_system:
+            return anchor_system
+        return str(getattr(map_definition.systems[0], "system_id", "") or "")
+
+    def _set_view_system(self, system_id: str, *, center: bool = True) -> None:
+        normalized = str(system_id or "").strip()
+        if not normalized:
+            return
+        self._view_system_id = normalized
+        if hasattr(self, "canvas"):
+            self.canvas.current_view_system_id = normalized
+        if hasattr(self, "system_view_combo"):
+            idx = self.system_view_combo.findData(normalized)
+            if idx >= 0 and self.system_view_combo.currentIndex() != idx:
+                self.system_view_combo.blockSignals(True)
+                self.system_view_combo.setCurrentIndex(idx)
+                self.system_view_combo.blockSignals(False)
+        if center:
+            self.canvas.focus_system(normalized)
+        self.request_overview_refresh(force=True)
         self.canvas.update()
-        self._log_user_action(
-            "module_mode_override",
-            ship=ship_id,
-            module=module_id,
-            mode=normalized_mode,
-        )
-        return True, normalized_mode
+
+    def _on_system_view_changed(self, _index: int) -> None:
+        system_id = str(self.system_view_combo.currentData() or "").strip()
+        if not system_id:
+            return
+        self._set_view_system(system_id, center=True)
+
+    def _focus_selected_system(self) -> None:
+        system_id = str(self.system_view_combo.currentData() or "").strip()
+        if not system_id:
+            return
+        self._set_view_system(system_id, center=True)
+
+    def _fit_view_to_map(self) -> None:
+        self.canvas.fit_to_map()
 
     def _set_ship_module_target_mode(
         self,
@@ -928,6 +1081,28 @@ class MainWindow(QMainWindow):
         self._ship_type_display_cache[cache_key] = resolved
         return resolved
 
+    @staticmethod
+    def _display_structure_type(kind: str) -> str:
+        normalized = str(kind or "").strip().upper()
+        if normalized == "STARGATE":
+            return QCoreApplication.translate("eve_sim", "Stargate")
+        return QCoreApplication.translate("eve_sim", "Structure")
+
+    def _display_structure_name(self, structure) -> str:
+        kind = str(getattr(structure, "kind", "") or "").strip().upper()
+        if kind == "STARGATE":
+            system_id = str(getattr(structure, "system_id", "") or "").strip()
+            map_definition = getattr(self.engine.world, "map_definition", None)
+            if map_definition is not None and system_id:
+                system = map_definition.system_by_id(system_id)
+                if system is not None:
+                    system_name = str(getattr(system, "name", "") or system_id).strip()
+                    if system_name:
+                        return QCoreApplication.translate("eve_sim", "{system} Stargate").format(system=system_name)
+            return QCoreApplication.translate("eve_sim", "Stargate")
+        display_name = str(getattr(structure, "display_name", "") or getattr(structure, "structure_id", "") or "").strip()
+        return display_name or self._display_structure_type(kind)
+
     def _create_menu(self) -> None:
         lang = self.current_language()
         self.menu_overview = self.menuBar().addMenu(QCoreApplication.translate("eve_sim", 'Overview'))
@@ -965,6 +1140,21 @@ class MainWindow(QMainWindow):
         self.lang_combo.currentIndexChanged.connect(self.on_language_changed)
         header.addWidget(self.lang_combo)
         side_layout.addLayout(header)
+
+        system_row = QHBoxLayout()
+        self.lbl_view_system = QLabel(QCoreApplication.translate("eve_sim", "View System"))
+        system_row.addWidget(self.lbl_view_system)
+        self.system_view_combo = QComboBox(self)
+        self.system_view_combo.setMinimumWidth(180)
+        self.system_view_combo.currentIndexChanged.connect(self._on_system_view_changed)
+        system_row.addWidget(self.system_view_combo, 1)
+        self.btn_view_system = QPushButton(QCoreApplication.translate("eve_sim", "Center"))
+        self.btn_view_system.clicked.connect(self._focus_selected_system)
+        system_row.addWidget(self.btn_view_system)
+        self.btn_fit_map = QPushButton(QCoreApplication.translate("eve_sim", "Fit Map"))
+        self.btn_fit_map.clicked.connect(self._fit_view_to_map)
+        system_row.addWidget(self.btn_fit_map)
+        side_layout.addLayout(system_row)
 
         leader_limit_row = QHBoxLayout()
         self.lbl_leader_speed_limit = QLabel(QCoreApplication.translate("eve_sim", 'Leader Max Speed (0=Unlimited):'))
@@ -1021,6 +1211,7 @@ class MainWindow(QMainWindow):
         self._refresh_selected_squad_leader_speed_limit()
         self._refresh_propulsion_button_text()
         self._refresh_controlled_team_widgets()
+        self._refresh_system_view_controls()
         return side
 
     def _get_squad_propulsion_state(self, squad_id: str) -> bool:
@@ -1102,6 +1293,8 @@ class MainWindow(QMainWindow):
         self.retranslate_ui()
         self._refresh_common_charge_modules()
         self.request_overview_refresh(force=True)
+        if hasattr(self, "system_graph_window"):
+            self.system_graph_window.retranslate_ui()
 
     def retranslate_ui(self) -> None:
         lang = self.current_language()
@@ -1112,6 +1305,9 @@ class MainWindow(QMainWindow):
         self.lbl_selected_squad.setText(QCoreApplication.translate("eve_sim", 'Selected Squad'))
         self.lbl_language.setText(QCoreApplication.translate("eve_sim", 'Language'))
         self._refresh_language_combo(self.lang_combo.currentData())
+        self.lbl_view_system.setText(QCoreApplication.translate("eve_sim", "View System"))
+        self.btn_view_system.setText(QCoreApplication.translate("eve_sim", "Center"))
+        self.btn_fit_map.setText(QCoreApplication.translate("eve_sim", "Fit Map"))
         self.lbl_leader_speed_limit.setText(QCoreApplication.translate("eve_sim", 'Leader Max Speed (0=Unlimited):'))
         self.btn_clear_focus.setText(QCoreApplication.translate("eve_sim", 'Clear Focus Targets'))
         self.lbl_freq_charge_module.setText(QCoreApplication.translate("eve_sim", 'Common Charge-Loadable Modules (all, sorted by count):'))
@@ -1119,7 +1315,6 @@ class MainWindow(QMainWindow):
         self.apply_ammo_btn.setText(QCoreApplication.translate("eve_sim", 'Apply to Fleet'))
         self.tabs.setTabText(0, QCoreApplication.translate("eve_sim", 'Overview'))
         self.tabs.setTabText(1, QCoreApplication.translate("eve_sim", 'Fleet'))
-        self.lbl_overview_hint.setText(QCoreApplication.translate("eve_sim", 'Double-click space: move there; double-click ship: continuously approach; right-click opens command menu'))
         self.lbl_fleet_tip.setText(QCoreApplication.translate("eve_sim", 'Multi-select ships to assign squad; edit name to create squad'))
         self.lbl_target_squad.setText(QCoreApplication.translate("eve_sim", 'Target Squad'))
         self.btn_assign.setText(QCoreApplication.translate("eve_sim", 'Assign Selected Ships'))
@@ -1127,6 +1322,8 @@ class MainWindow(QMainWindow):
         self.blue_roster_model.notify_headers_changed()
         self._refresh_propulsion_button_text()
         self._refresh_controlled_team_widgets()
+        if hasattr(self, "system_graph_window"):
+            self.system_graph_window.retranslate_ui()
 
     def _refresh_propulsion_button_text(self) -> None:
         active = self._get_squad_propulsion_state(self.ui_state.selected_squad)
@@ -1335,9 +1532,6 @@ class MainWindow(QMainWindow):
         page = QWidget(self)
         layout = QVBoxLayout(page)
 
-        self.lbl_overview_hint = QLabel(QCoreApplication.translate("eve_sim", 'Double-click space: move there; double-click ship: continuously approach; right-click opens command menu'))
-        layout.addWidget(self.lbl_overview_hint)
-
         self.overview = QTableView(self)
         self.overview_model = OverviewTableModel(
             selected_squad_getter=lambda: self.ui_state.selected_squad,
@@ -1353,6 +1547,7 @@ class MainWindow(QMainWindow):
         self.overview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.overview.customContextMenuRequested.connect(self.show_overview_menu)
         self.overview.selectionModel().selectionChanged.connect(self._on_overview_selection_changed)
+        self.overview.doubleClicked.connect(self._on_overview_double_clicked)
         self.overview.setAlternatingRowColors(True)
         self.overview.setWordWrap(False)
         self.overview.setSortingEnabled(True)
@@ -1415,12 +1610,12 @@ class MainWindow(QMainWindow):
         zoom = self.canvas.zoom
         self.prefs = UiPreferences(
             selected_squad=selected,
+            selected_map_id=self.prefs.selected_map_id,
             zoom=zoom,
             language=self.prefs.language,
             engine_tick_rate=self.prefs.engine_tick_rate,
             engine_physics_substeps=self.prefs.engine_physics_substeps,
             engine_lockstep=self.prefs.engine_lockstep,
-            engine_battlefield_radius=self.prefs.engine_battlefield_radius,
             engine_detailed_logging=self.prefs.engine_detailed_logging,
             engine_hotspot_logging=self.prefs.engine_hotspot_logging,
             engine_detail_log_file=self.prefs.engine_detail_log_file,
@@ -1515,7 +1710,7 @@ class MainWindow(QMainWindow):
         self.squad_combo.setCurrentText(squad_id)
 
     def on_canvas_select_enemy(self, ship_id: str) -> None:
-        self._set_highlighted_ship(ship_id)
+        self._set_highlighted_overview_object({"entity_kind": "ship", "id": ship_id})
         self.ui_state.selected_enemy_target = ship_id
         self.canvas.selected_enemy_target = ship_id
         self.overview_model.notify_visual_state_changed()
@@ -1535,6 +1730,40 @@ class MainWindow(QMainWindow):
             sum(m.nav.position.y for m in members) / len(members),
         )
 
+    def _overview_anchor_for_system(self, system_id: str) -> Vector2:
+        members = [
+            s
+            for s in self.engine.world.ships.values()
+            if (
+                s.team == self.controlled_team
+                and s.squad_id == self.ui_state.selected_squad
+                and s.vital.alive
+                and str(getattr(s.nav, "system_id", "") or "") == str(system_id or "")
+            )
+        ]
+        if not members:
+            return Vector2(0.0, 0.0)
+        return Vector2(
+            sum(m.nav.position.x for m in members) / len(members),
+            sum(m.nav.position.y for m in members) / len(members),
+        )
+
+    def _current_command_squad(self) -> str:
+        squad_id = str(self.ui_state.selected_squad or "").strip()
+        if squad_id:
+            return squad_id
+        if hasattr(self, "squad_combo"):
+            squad_id = str(self.squad_combo.currentText() or "").strip()
+            if squad_id:
+                return squad_id
+        for ship in self.engine.world.ships.values():
+            if ship.team == self.controlled_team and ship.ship_id not in self._undeployed_ship_ids:
+                return str(ship.squad_id or "").strip()
+        for ship in self.engine.world.ships.values():
+            if ship.team == self.controlled_team:
+                return str(ship.squad_id or "").strip()
+        return ""
+
     @staticmethod
     def _focus_key(team: Team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
@@ -1546,6 +1775,7 @@ class MainWindow(QMainWindow):
         return Vector2(center.x + math.cos(angle) * distance, center.y + math.sin(angle) * distance)
 
     def _apply_induce_spawn(self, team: Team, center: Vector2, squad_id: str | None = None) -> None:
+        target_system_id = self._current_view_system_id()
         affected_squads: set[str] = set()
         for ship in self.engine.world.ships.values():
             if ship.team != team:
@@ -1556,6 +1786,7 @@ class MainWindow(QMainWindow):
                 continue
             affected_squads.add(ship.squad_id)
             ship.nav.position = self._random_point_in_radius(center, 5_000.0)
+            ship.nav.system_id = target_system_id
             ship.nav.velocity = Vector2(0.0, 0.0)
             ship.order_queue.clear()
             ship.vital.alive = True
@@ -1669,6 +1900,7 @@ class MainWindow(QMainWindow):
         scoped_key = self._focus_key(team, squad_id)
         self._squad_approach_targets.pop(scoped_key, None)
         self._squad_guidance_targets[scoped_key] = Vector2(target_position.x, target_position.y)
+        self._disable_team_propulsion_for_squad(team, squad_id)
         members = [
             ship
             for ship in self.engine.world.ships.values()
@@ -1693,6 +1925,31 @@ class MainWindow(QMainWindow):
                 )
             )
 
+    def _apply_squad_use_gate(self, team: Team, squad_id: str, structure_id: str) -> None:
+        structure = self.engine.world.structures.get(str(structure_id))
+        if structure is None or str(getattr(structure, "kind", "") or "").upper() != "STARGATE":
+            return
+        linked_id = str(getattr(structure, "linked_structure_id", "") or "").strip()
+        if not linked_id or self.engine.world.structures.get(linked_id) is None:
+            return
+        scoped_key = self._focus_key(team, squad_id)
+        self._squad_approach_targets.pop(scoped_key, None)
+        self._squad_guidance_targets[scoped_key] = Vector2(structure.position.x, structure.position.y)
+        self._disable_team_propulsion_for_squad(team, squad_id)
+        for ship in self.engine.world.ships.values():
+            if ship.team != team or ship.squad_id != squad_id or not ship.vital.alive:
+                continue
+            if str(getattr(ship.nav, "system_id", "") or "") != str(getattr(structure, "system_id", "") or ""):
+                continue
+            ship.order_queue = [order for order in ship.order_queue if order.kind not in {"USE_STARGATE", "MOVE"}]
+            ship.order_queue.append(
+                Order(
+                    kind="USE_STARGATE",
+                    payload={"target_structure_id": str(structure_id), "immediate": True},
+                    issue_time=self.engine.world.now,
+                )
+            )
+
     def issue_warp_to_ship(self, squad_id: str, target_id: str) -> None:
         squad = squad_id.strip()
         target = target_id.strip()
@@ -1703,6 +1960,7 @@ class MainWindow(QMainWindow):
             target_ship = self.engine.world.ships.get(target)
             if target_ship is None or not target_ship.vital.alive:
                 return
+            self._disable_team_propulsion_for_squad(self.controlled_team, squad)
             self.lan_client.send_command(
                 {
                     "kind": CMD_SQUAD_WARP,
@@ -1717,11 +1975,16 @@ class MainWindow(QMainWindow):
                 target_ship.nav.position.y,
             )
             return
+        target_ship = self.engine.world.ships.get(target)
+        if target_ship is None or not target_ship.vital.alive:
+            return
+        self._disable_team_propulsion_for_squad(self.controlled_team, squad)
 
         def apply() -> None:
             target_ship = self.engine.world.ships.get(target)
             if target_ship is None or not target_ship.vital.alive:
                 return
+            self._disable_team_propulsion_for_squad(self.controlled_team, squad)
             self._apply_squad_warp(
                 self.controlled_team,
                 squad,
@@ -1737,9 +2000,10 @@ class MainWindow(QMainWindow):
         if not squad or not beacon_key:
             return
         self._log_user_action("squad_warp_beacon", squad=squad, beacon=beacon_key)
-        beacon = self.engine.world.beacons.get(beacon_key)
+        beacon = self.engine.world.structures.get(beacon_key)
         if beacon is None:
             return
+        self._disable_team_propulsion_for_squad(self.controlled_team, squad)
         if self.network_mode == "client" and self.lan_client is not None:
             self.lan_client.send_command(
                 {
@@ -1757,7 +2021,7 @@ class MainWindow(QMainWindow):
             return
 
         def apply() -> None:
-            current_beacon = self.engine.world.beacons.get(beacon_key)
+            current_beacon = self.engine.world.structures.get(beacon_key)
             if current_beacon is None:
                 return
             self._apply_squad_warp(
@@ -1766,6 +2030,35 @@ class MainWindow(QMainWindow):
                 Vector2(current_beacon.position.x, current_beacon.position.y),
                 target_beacon_id=beacon_key,
             )
+
+        self._enqueue_tick_op(apply)
+
+    def issue_use_gate(self, squad_id: str, structure_id: str) -> None:
+        squad = squad_id.strip()
+        structure_key = structure_id.strip()
+        if not squad or not structure_key:
+            return
+        structure = self.engine.world.structures.get(structure_key)
+        if structure is None or str(getattr(structure, "kind", "") or "").upper() != "STARGATE":
+            return
+        self._log_user_action("squad_use_gate", squad=squad, structure=structure_key)
+        self._disable_team_propulsion_for_squad(self.controlled_team, squad)
+        if self.network_mode == "client" and self.lan_client is not None:
+            self.lan_client.send_command(
+                {
+                    "kind": CMD_SQUAD_USE_GATE,
+                    "squad_id": squad,
+                    "target_structure_id": structure_key,
+                }
+            )
+            self._squad_guidance_targets[self._focus_key(self.controlled_team, squad)] = Vector2(
+                structure.position.x,
+                structure.position.y,
+            )
+            return
+
+        def apply() -> None:
+            self._apply_squad_use_gate(self.controlled_team, squad, structure_key)
 
         self._enqueue_tick_op(apply)
 
@@ -1990,30 +2283,74 @@ class MainWindow(QMainWindow):
         self.request_overview_refresh(force=True)
 
     def _iter_overview_rows(self) -> list[dict]:
-        anchor = self._selected_anchor()
         lang = self.current_language()
+        current_system_id = self._current_view_system_id()
+        anchor = self._overview_anchor_for_system(current_system_id)
         rows: list[dict] = []
         for ship in self.engine.world.ships.values():
-            if ship.ship_id in self._undeployed_ship_ids:
+            if not self._is_ship_visible(ship.ship_id):
+                continue
+            ship_system_id = str(getattr(ship.nav, "system_id", "") or "")
+            if current_system_id and ship_system_id and ship_system_id != current_system_id:
                 continue
             hp_cur = ship.vital.shield + ship.vital.armor + ship.vital.structure
             hp_max = ship.vital.shield_max + ship.vital.armor_max + ship.vital.structure_max
             hp_pct = round(100.0 * hp_cur / hp_max, 1) if hp_max > 0 else 0.0
-            dist_km = round(ship.nav.position.distance_to(anchor) / 1000.0, 1)
+            dist_m = ship.nav.position.distance_to(anchor)
+            if dist_m >= (0.1 * AU_METERS):
+                dist_display = f"{dist_m / AU_METERS:.2f} AU"
+            else:
+                dist_display = f"{dist_m / 1000.0:.1f} km"
             rows.append(
                 {
+                    "entity_kind": "ship",
                     "id": ship.ship_id,
+                    "display_name": ship.ship_id,
                     "ship_name": ship.fit.ship_name,
                     "ship_name_display": self._display_ship_type(ship.fit.ship_name, language=lang),
                     "ship_type": ship.fit.ship_name,
                     "ship_type_display": self._display_ship_type(ship.fit.ship_name, language=lang),
                     "team": ship.team.value,
+                    "team_display": ship.team.value,
                     "squad": ship.squad_id,
                     "role": ship.fit.role,
                     "alive": ship.vital.alive,
-                    "dist": dist_km,
+                    "system_id": ship_system_id,
+                    "dist": dist_m,
+                    "dist_display": dist_display,
                     "hp": hp_pct,
                     "dps": round(ship.profile.dps, 1),
+                }
+            )
+        for structure in self.engine.world.structures.values():
+            structure_system_id = str(getattr(structure, "system_id", "") or "")
+            if current_system_id and structure_system_id and structure_system_id != current_system_id:
+                continue
+            display_name = str(getattr(structure, "display_name", "") or getattr(structure, "structure_id", "") or "")
+            dist_m = structure.position.distance_to(anchor)
+            if dist_m >= (0.1 * AU_METERS):
+                dist_display = f"{dist_m / AU_METERS:.2f} AU"
+            else:
+                dist_display = f"{dist_m / 1000.0:.1f} km"
+            rows.append(
+                {
+                    "entity_kind": "structure",
+                    "id": str(structure.structure_id),
+                    "display_name": display_name,
+                    "ship_name": display_name,
+                    "ship_name_display": display_name,
+                    "ship_type": str(getattr(structure, "kind", "") or "STRUCTURE"),
+                    "ship_type_display": self._display_structure_type(str(getattr(structure, "kind", "") or "STRUCTURE")),
+                    "team": "STRUCTURE",
+                    "team_display": QCoreApplication.translate("eve_sim", "Structure"),
+                    "squad": "",
+                    "role": "STRUCTURE",
+                    "alive": True,
+                    "system_id": structure_system_id,
+                    "dist": dist_m,
+                    "dist_display": dist_display,
+                    "hp": 100.0,
+                    "dps": 0.0,
                 }
             )
         return rows
@@ -2030,10 +2367,19 @@ class MainWindow(QMainWindow):
         self.overview_proxy.apply_preferences()
         self._restore_overview_selection()
 
-    def _set_highlighted_ship(self, ship_id: str | None) -> None:
-        normalized_ship_id = str(ship_id or "").strip() or None
-        self.canvas.selected_ship_id = normalized_ship_id
+    def _set_highlighted_overview_object(self, row_data: dict | None) -> None:
+        entity_kind = str((row_data or {}).get("entity_kind", "ship") or "ship")
+        entity_id = str((row_data or {}).get("id", "") or "").strip() or None
+        self.canvas.selected_ship_id = entity_id if entity_kind == "ship" else None
+        self.canvas.selected_structure_id = entity_id if entity_kind == "structure" else None
         self.canvas.update()
+
+    def _selected_overview_key(self) -> tuple[str, str] | None:
+        if self.canvas.selected_ship_id:
+            return ("ship", str(self.canvas.selected_ship_id))
+        if self.canvas.selected_structure_id:
+            return ("structure", str(self.canvas.selected_structure_id))
+        return None
 
     def _set_blue_roster_highlighted_ships(self, ship_ids: set[str]) -> None:
         self.canvas.highlighted_roster_ship_ids = {str(ship_id).strip() for ship_id in ship_ids if str(ship_id).strip()}
@@ -2074,27 +2420,51 @@ class MainWindow(QMainWindow):
         self._set_blue_roster_highlighted_ships(restored_ids)
 
     def _restore_overview_selection(self) -> None:
-        selected_ship_id = str(self.canvas.selected_ship_id or "").strip()
-        if not selected_ship_id:
+        selected_key = self._selected_overview_key()
+        if selected_key is None:
             return
         current_index = self.overview.currentIndex()
         if current_index.isValid():
             row_data = self.overview_proxy.get_row(current_index.row())
-            if row_data and str(row_data.get("id", "")) == selected_ship_id:
+            if row_data and (
+                str(row_data.get("entity_kind", "ship")),
+                str(row_data.get("id", "")),
+            ) == selected_key:
                 return
         for row in range(self.overview_proxy.rowCount()):
             row_data = self.overview_proxy.get_row(row)
-            if row_data and str(row_data.get("id", "")) == selected_ship_id:
+            if row_data and (
+                str(row_data.get("entity_kind", "ship")),
+                str(row_data.get("id", "")),
+            ) == selected_key:
                 self.overview.selectRow(row)
                 return
 
     def _on_overview_selection_changed(self, *_args) -> None:
         indexes = self.overview.selectionModel().selectedRows() if self.overview.selectionModel() is not None else []
         if not indexes:
-            self._set_highlighted_ship(None)
+            self._set_highlighted_overview_object(None)
             return
         row_data = self.overview_proxy.get_row(indexes[0].row())
-        self._set_highlighted_ship(str(row_data.get("id", "")) if row_data else None)
+        self._set_highlighted_overview_object(row_data)
+
+    def _on_overview_double_clicked(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        row_data = self.overview_proxy.get_row(index.row())
+        if not row_data:
+            return
+        system_id = str(row_data.get("system_id", "") or "").strip()
+        if system_id:
+            self._set_view_system(system_id, center=False)
+        entity_kind = str(row_data.get("entity_kind", "ship") or "ship")
+        entity_id = str(row_data.get("id", "") or "").strip()
+        if not entity_id:
+            return
+        if entity_kind == "structure":
+            self.canvas.focus_structure(entity_id)
+        else:
+            self.canvas.focus_ship(entity_id)
 
     def _on_blue_roster_selection_changed(self, *_args) -> None:
         self._set_blue_roster_highlighted_ships(self._selected_blue_roster_ship_ids())
@@ -2107,7 +2477,7 @@ class MainWindow(QMainWindow):
         controlled_team = self.controlled_team
         enemy_team = Team.RED.value if controlled_team == Team.BLUE else Team.BLUE.value
 
-        self._set_highlighted_ship(target_id)
+        self._set_highlighted_overview_object({"entity_kind": "ship", "id": target_id})
         if ship.team != controlled_team:
             self.ui_state.selected_enemy_target = target_id
             self.canvas.selected_enemy_target = target_id
@@ -2121,12 +2491,12 @@ class MainWindow(QMainWindow):
 
         action_warp = QAction(
             QCoreApplication.translate("eve_sim", '{squad} Warp To {ship}').format(
-                squad=self.ui_state.selected_squad,
+                squad=self._current_command_squad(),
                 ship=target_id,
             ),
             self,
         )
-        action_warp.triggered.connect(lambda: self.issue_warp_to_ship(self.ui_state.selected_squad, target_id))
+        action_warp.triggered.connect(lambda: self.issue_warp_to_ship(self._current_command_squad(), target_id))
         menu.addAction(action_warp)
 
         if ship.team.value == enemy_team:
@@ -2176,12 +2546,60 @@ class MainWindow(QMainWindow):
             return
         menu.exec(global_pos)
 
+    def _build_structure_context_menu(self, structure_id: str) -> QMenu | None:
+        structure = self.engine.world.structures.get(str(structure_id))
+        if structure is None:
+            return None
+        structure_key = str(structure.structure_id)
+        structure_name = self._display_structure_name(structure)
+        self._set_highlighted_overview_object({"entity_kind": "structure", "id": structure_key})
+
+        menu = QMenu(self)
+        action_center = QAction(
+            QCoreApplication.translate("eve_sim", "Center View on {structure}").format(structure=structure_name),
+            self,
+        )
+        action_center.triggered.connect(lambda: self.canvas.focus_structure(structure_key))
+        menu.addAction(action_center)
+
+        action_warp = QAction(
+            QCoreApplication.translate("eve_sim", "{squad} Warp To {structure}").format(
+                squad=self._current_command_squad(),
+                structure=structure_name,
+            ),
+            self,
+        )
+        action_warp.triggered.connect(lambda: self.issue_warp_to_beacon(self._current_command_squad(), structure_key))
+        menu.addAction(action_warp)
+        if str(getattr(structure, "kind", "") or "").upper() == "STARGATE":
+            linked_id = str(getattr(structure, "linked_structure_id", "") or "").strip()
+            if linked_id:
+                action_use_gate = QAction(
+                    QCoreApplication.translate("eve_sim", "{squad} Take Gate {structure}").format(
+                        squad=self._current_command_squad(),
+                        structure=structure_name,
+                    ),
+                    self,
+                )
+                action_use_gate.triggered.connect(lambda: self.issue_use_gate(self._current_command_squad(), structure_key))
+                menu.addAction(action_use_gate)
+        return menu
+
+    def show_structure_context_menu(self, structure_id: str, global_pos: QPoint) -> None:
+        menu = self._build_structure_context_menu(structure_id)
+        if menu is None:
+            return
+        menu.exec(global_pos)
+
     def show_overview_menu(self, pos: QPoint) -> None:
         index = self.overview.indexAt(pos)
         if not index.isValid():
             return
         row_data = self.overview_proxy.get_row(index.row())
         if not row_data:
+            return
+        if str(row_data.get("entity_kind", "ship")) == "structure":
+            self.show_structure_context_menu(str(row_data["id"]), self.overview.mapToGlobal(pos))
             return
         self.show_ship_context_menu(str(row_data["id"]), self.overview.mapToGlobal(pos))
 
@@ -2290,6 +2708,7 @@ class MainWindow(QMainWindow):
                 ship.nav.position = Vector2(float(pos.get("x", ship.nav.position.x)), float(pos.get("y", ship.nav.position.y)))
                 ship.nav.velocity = Vector2(float(vel.get("x", ship.nav.velocity.x)), float(vel.get("y", ship.nav.velocity.y)))
                 ship.nav.facing_deg = float(item.get("facing_deg", ship.nav.facing_deg))
+                ship.nav.system_id = str(item.get("system_id", ship.nav.system_id) or ship.nav.system_id)
                 ship.vital.shield = float(item.get("shield", ship.vital.shield))
                 ship.vital.armor = float(item.get("armor", ship.vital.armor))
                 ship.vital.structure = float(item.get("structure", ship.vital.structure))
@@ -2463,7 +2882,7 @@ class MainWindow(QMainWindow):
                     return
                 target = Vector2(target_ship.nav.position.x, target_ship.nav.position.y)
             elif target_beacon_id:
-                beacon = self.engine.world.beacons.get(target_beacon_id)
+                beacon = self.engine.world.structures.get(target_beacon_id)
                 if beacon is None:
                     return
                 target = Vector2(beacon.position.x, beacon.position.y)
@@ -2479,6 +2898,11 @@ class MainWindow(QMainWindow):
                 target_ship_id=target_ship_id,
                 target_beacon_id=target_beacon_id,
             )
+        elif kind == CMD_SQUAD_USE_GATE:
+            target_structure_id = str(cmd.get("target_structure_id", "") or "").strip()
+            if not target_structure_id:
+                return
+            self._apply_squad_use_gate(team, squad, target_structure_id)
         elif kind == CMD_SQUAD_APPROACH:
             target_id = str(cmd.get("target_id", "")).strip()
             target_ship = self.engine.world.ships.get(target_id)
@@ -2757,6 +3181,7 @@ class MainWindow(QMainWindow):
                     "position": {"x": ship.nav.position.x, "y": ship.nav.position.y},
                     "velocity": {"x": ship.nav.velocity.x, "y": ship.nav.velocity.y},
                     "facing_deg": ship.nav.facing_deg,
+                    "system_id": str(getattr(ship.nav, "system_id", "") or ""),
                     "x": ship.nav.position.x,
                     "y": ship.nav.position.y,
                     "shield": ship.vital.shield,
@@ -2784,6 +3209,17 @@ class MainWindow(QMainWindow):
             cfg_payload = lan.get("engine_config")
             if isinstance(cfg_payload, dict):
                 self._apply_host_engine_config(cfg_payload)
+            map_payload = lan.get("map")
+            if isinstance(map_payload, dict):
+                try:
+                    remote_map = deserialize_map_definition(map_payload)
+                except Exception:
+                    remote_map = None
+                if remote_map is not None and (
+                    getattr(self.engine.world, "map_id", "") != str(getattr(remote_map, "map_id", "") or "")
+                    or not self.engine.world.structures
+                ):
+                    self._install_map_definition(remote_map)
         snapshot = packet.get("snapshot") if isinstance(packet.get("snapshot"), dict) else packet
         if isinstance(snapshot, dict):
             try:
@@ -2824,6 +3260,13 @@ class MainWindow(QMainWindow):
             ship.nav.position = Vector2(float(pos.get("x", ship.nav.position.x)), float(pos.get("y", ship.nav.position.y)))
             ship.nav.velocity = Vector2(float(vel.get("x", ship.nav.velocity.x)), float(vel.get("y", ship.nav.velocity.y)))
             ship.nav.facing_deg = float(raw.get("facing_deg", ship.nav.facing_deg))
+            ship.nav.system_id = str(raw.get("system_id", ship.nav.system_id) or ship.nav.system_id)
+            ship.nav.gate.target_structure_id = str(raw.get("gate_target_structure_id", "") or "").strip() or None
+            ship.nav.cloak.active = bool(raw.get("gate_cloak_active", ship.nav.cloak.active))
+            ship.nav.cloak.expires_at = float(raw.get("gate_cloak_expires_at", ship.nav.cloak.expires_at) or 0.0)
+            ship.nav.cloak.source = str(raw.get("gate_cloak_source", ship.nav.cloak.source) or "")
+            ship.nav.follow_hold_active = bool(raw.get("follow_hold_active", ship.nav.follow_hold_active))
+            ship.nav.follow_hold_leader_id = str(raw.get("follow_hold_leader_id", ship.nav.follow_hold_leader_id) or "") or None
             ship.vital.shield = float(raw.get("shield", ship.vital.shield))
             ship.vital.armor = float(raw.get("armor", ship.vital.armor))
             ship.vital.structure = float(raw.get("structure", ship.vital.structure))
@@ -3033,6 +3476,13 @@ class MainWindow(QMainWindow):
         return (
             str(raw.get("team", "")),
             str(raw.get("squad_id", "")),
+            str(raw.get("system_id", "")),
+            str(raw.get("gate_target_structure_id", "")),
+            bool(raw.get("gate_cloak_active", False)),
+            round(float(raw.get("gate_cloak_expires_at", 0.0) or 0.0), 2),
+            str(raw.get("gate_cloak_source", "") or ""),
+            bool(raw.get("follow_hold_active", False)),
+            str(raw.get("follow_hold_leader_id", "") or ""),
             bool(raw.get("deployed", True)),
             bool(raw.get("alive", False)),
             round(float(pos.get("x", 0.0)), 1),
@@ -3079,7 +3529,6 @@ class MainWindow(QMainWindow):
             "tick_rate": int(cfg.tick_rate),
             "physics_substeps": int(cfg.physics_substeps),
             "lockstep": bool(cfg.lockstep),
-            "battlefield_radius": float(cfg.battlefield_radius),
             "detailed_logging": bool(cfg.detailed_logging),
             "hotspot_logging": bool(cfg.hotspot_logging),
             "detail_log_file": str(cfg.detail_log_file),
@@ -3099,10 +3548,6 @@ class MainWindow(QMainWindow):
         except Exception:
             substeps = max(1, int(self.engine.config.physics_substeps))
         try:
-            radius = max(1_000.0, float(payload.get("battlefield_radius", self.engine.config.battlefield_radius)))
-        except Exception:
-            radius = max(1_000.0, float(self.engine.config.battlefield_radius))
-        try:
             merge_window = max(0.1, float(payload.get("log_merge_window_sec", self.engine.config.log_merge_window_sec)))
         except Exception:
             merge_window = max(0.1, float(self.engine.config.log_merge_window_sec))
@@ -3111,7 +3556,6 @@ class MainWindow(QMainWindow):
         self.engine.config.tick_rate = tick_rate
         self.engine.config.physics_substeps = substeps
         self.engine.config.lockstep = bool(payload.get("lockstep", self.engine.config.lockstep))
-        self.engine.config.battlefield_radius = radius
         self.engine.config.detailed_logging = bool(payload.get("detailed_logging", self.engine.config.detailed_logging))
         self.engine.config.hotspot_logging = bool(payload.get("hotspot_logging", self.engine.config.hotspot_logging))
         self.engine.config.detail_log_file = str(payload.get("detail_log_file", self.engine.config.detail_log_file))
@@ -3129,8 +3573,6 @@ class MainWindow(QMainWindow):
 
         if hasattr(self.engine, "_dt"):
             self.engine._dt = 1.0 / float(tick_rate)
-        if hasattr(self.engine, "movement") and hasattr(self.engine.movement, "battlefield_radius"):
-            self.engine.movement.battlefield_radius = radius
 
         if old_tick_rate != tick_rate:
             self.tick_timer.setInterval(max(1, int(1000 / tick_rate)))
@@ -3196,6 +3638,11 @@ class MainWindow(QMainWindow):
                 "started": bool(started),
                 "countdown_left": float(max(0.0, countdown_left or 0.0)),
                 "engine_config": self._engine_config_payload(),
+                "map": (
+                    serialize_map_definition(self.engine.world.map_definition)
+                    if full_sync and self.engine.world.map_definition is not None
+                    else None
+                ),
             },
         }
         self._lan_debug(
@@ -3292,7 +3739,7 @@ class MainWindow(QMainWindow):
             self.status.setText(
                 f"{QCoreApplication.translate("eve_sim", 'Tick')}: {tick} | {QCoreApplication.translate("eve_sim", 'Ships')}: {total_ships} | "
                 f"{QCoreApplication.translate("eve_sim", 'BLUE')}: {alive_blue} | {QCoreApplication.translate("eve_sim", 'RED')}: {alive_red} | "
-                f"{QCoreApplication.translate("eve_sim", 'Zoom')}: {self.canvas.zoom:.5f} | {QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f}"
+                f"{QCoreApplication.translate("eve_sim", 'Zoom')}: {self.canvas.zoom:.2f} | {QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f}"
             )
 
         if refresh_overview:
@@ -3311,7 +3758,11 @@ class MainWindow(QMainWindow):
         if self.canvas.selected_ship_id:
             selected_ship = self.engine.world.ships.get(self.canvas.selected_ship_id)
             if selected_ship is None or selected_ship.ship_id in self._undeployed_ship_ids:
-                self._set_highlighted_ship(None)
+                self._set_highlighted_overview_object(None)
+        if self.canvas.selected_structure_id:
+            selected_structure = self.engine.world.structures.get(self.canvas.selected_structure_id)
+            if selected_structure is None:
+                self._set_highlighted_overview_object(None)
         if self.canvas.highlighted_roster_ship_ids:
             valid_highlighted_ids = {
                 ship_id
@@ -3327,6 +3778,8 @@ class MainWindow(QMainWindow):
         self.store.save(self.prefs)
         if hasattr(self.engine, "combat") and hasattr(self.engine.combat, "flush_pending_events"):
             self.engine.combat.flush_pending_events()
+        if hasattr(self, "system_graph_window"):
+            self.system_graph_window.close()
         if self.lan_server is not None:
             self.lan_server.stop()
         if self.lan_client is not None:

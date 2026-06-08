@@ -75,6 +75,8 @@ def enqueue_control_signal_modules(
     *,
     propulsion_active: bool,
     recent_enemy_weapon_damage_active: bool,
+    enemy_targets_active: bool,
+    ally_targets_active: bool,
     focus_changed: bool,
 ) -> None:
     pending = ship.combat.module_decision_pending
@@ -92,6 +94,16 @@ def enqueue_control_signal_modules(
         pending.update(activation_groups.get("recent_enemy_weapon_damage", ()))
         ship.combat.module_decision_recent_enemy_damage_active = recent_enemy_weapon_damage_active
 
+    if ship.combat.module_decision_enemy_targets_active is None or ship.combat.module_decision_enemy_targets_active != enemy_targets_active:
+        pending.update(target_groups.get("enemy_nearest", ()))
+        pending.update(target_groups.get("enemy_random", ()))
+        ship.combat.module_decision_enemy_targets_active = enemy_targets_active
+
+    if ship.combat.module_decision_ally_targets_active is None or ship.combat.module_decision_ally_targets_active != ally_targets_active:
+        pending.update(target_groups.get("ally_nearest", ()))
+        pending.update(target_groups.get("ally_repair_queue", ()))
+        ship.combat.module_decision_ally_targets_active = ally_targets_active
+
     if focus_changed:
         # Focus-driven weapon modules can stay asleep while the queue is empty, but they must
         # wake immediately when squad focus changes.
@@ -108,6 +120,8 @@ def module_keeps_decision_pending(
     target_mode: str,
     propulsion_active: bool,
     recent_enemy_weapon_damage_active: bool,
+    enemy_targets_active: bool,
+    ally_targets_active: bool,
     has_focus_queue: bool,
 ) -> bool:
     module_id = str(module.module_id)
@@ -130,5 +144,9 @@ def module_keeps_decision_pending(
     if activation_mode == "weapon_focus_only" and not has_focus_queue:
         return False
     if target_mode == "weapon_focus_prefocus" and not has_focus_queue:
+        return False
+    if target_mode in {"enemy_nearest", "enemy_random"} and not enemy_targets_active:
+        return False
+    if target_mode in {"ally_nearest", "ally_repair_queue"} and not ally_targets_active:
         return False
     return True

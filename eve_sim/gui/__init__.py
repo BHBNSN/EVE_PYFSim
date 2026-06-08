@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication, QDialog, QInputDialog, QMessageBox
 
 from .fleet_setup_dialog import FleetSetupDialog
@@ -18,8 +19,14 @@ def run_gui() -> None:
     app = QApplication.instance() or QApplication([])
     install_language("zh_CN")
 
-    mode_options = ["Local", "Host LAN", "Join LAN"]
-    mode, ok = QInputDialog.getItem(None, "Battle Mode", "Select mode", mode_options, 0, False)
+    tr = lambda text: QCoreApplication.translate("eve_sim", text)
+
+    mode_options = [
+        tr("Local"),
+        tr("Host LAN"),
+        tr("Join LAN"),
+    ]
+    mode, ok = QInputDialog.getItem(None, tr("Battle Mode"), tr("Select mode"), mode_options, 0, False)
     if not ok:
         return
 
@@ -28,28 +35,32 @@ def run_gui() -> None:
     lan_server: HostLanSession | None = None
     lan_client: ClientLanSession | None = None
 
-    if mode == "Host LAN":
-        port, ok = QInputDialog.getInt(None, "Host LAN", "Port", 50555, 1024, 65535, 1)
+    if mode == tr("Host LAN"):
+        port, ok = QInputDialog.getInt(None, tr("Host LAN"), tr("Port"), 50555, 1024, 65535, 1)
         if not ok:
             return
         lan_server = HostLanSession(host="0.0.0.0", port=int(port))
         try:
             lan_server.start()
         except OSError as exc:
-            QMessageBox.critical(None, "Host LAN", f"Failed to open LAN host: {exc}")
+            QMessageBox.critical(
+                None,
+                tr("Host LAN"),
+                tr("Failed to open LAN host: {error}").format(error=exc),
+            )
             return
         network_mode = "host"
         controlled_team = Team.BLUE
-    elif mode == "Join LAN":
-        host, ok = QInputDialog.getText(None, "Join LAN", "Host IP", text="127.0.0.1")
+    elif mode == tr("Join LAN"):
+        host, ok = QInputDialog.getText(None, tr("Join LAN"), tr("Host IP"), text="127.0.0.1")
         if not ok or not host.strip():
             return
-        port, ok = QInputDialog.getInt(None, "Join LAN", "Port", 50555, 1024, 65535, 1)
+        port, ok = QInputDialog.getInt(None, tr("Join LAN"), tr("Port"), 50555, 1024, 65535, 1)
         if not ok:
             return
         lan_client = ClientLanSession(host=host.strip(), port=int(port))
         if not lan_client.connect(timeout=5.0):
-            QMessageBox.critical(None, "Join LAN", "Failed to connect to host")
+            QMessageBox.critical(None, tr("Join LAN"), tr("Failed to connect to host"))
             lan_client.close()
             return
         network_mode = "client"
@@ -69,15 +80,20 @@ def run_gui() -> None:
     elif network_mode == "client":
         manual_setup = [row for row in manual_setup if row.team == Team.RED]
     if not manual_setup:
-        QMessageBox.critical(None, "Fleet Setup", "No ships found for current side in this mode")
+        QMessageBox.critical(
+            None,
+            tr("Fleet Setup"),
+            tr("No ships found for current side in this mode"),
+        )
         if lan_server is not None:
             lan_server.stop()
         if lan_client is not None:
             lan_client.close()
         return
     pyfa = PyfaBridge()
-    world = build_world_from_manual_setup(manual_setup)
     cfg = setup_dialog.to_engine_config()
+    selected_map = setup_dialog.selected_map_definition()
+    world = build_world_from_manual_setup(manual_setup, map_definition=selected_map)
     engine = SimulationEngine(world=world, config=cfg, combat_system=CombatSystem(pyfa))
 
     blue_squads = sorted({s.squad_id for s in world.ships.values() if s.team == Team.BLUE})

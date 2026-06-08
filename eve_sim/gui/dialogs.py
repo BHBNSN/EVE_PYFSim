@@ -437,6 +437,7 @@ class OverviewOptionsDialog(QDialog):
         return UiPreferences(
             config_version=prefs.config_version,
             selected_squad=prefs.selected_squad,
+            selected_map_id=prefs.selected_map_id,
             filter_team=self._selected_filter_team(),
             filter_role=str(self.filter_role.currentData() or "ALL"),
             filter_alive=str(self.filter_alive.currentData() or "ALL"),
@@ -448,7 +449,6 @@ class OverviewOptionsDialog(QDialog):
             engine_tick_rate=prefs.engine_tick_rate,
             engine_physics_substeps=prefs.engine_physics_substeps,
             engine_lockstep=prefs.engine_lockstep,
-            engine_battlefield_radius=prefs.engine_battlefield_radius,
             engine_detailed_logging=prefs.engine_detailed_logging,
             engine_hotspot_logging=prefs.engine_hotspot_logging,
             engine_detail_log_file=prefs.engine_detail_log_file,

@@ -38,6 +38,18 @@ class ShipAgent(BaseAgent):
     def _focus_key(team: Team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
 
+    @staticmethod
+    def _leader_motion_active(leader: ShipEntity | None) -> bool:
+        if leader is None or not leader.vital.alive:
+            return False
+        if leader.nav.command_target is not None:
+            return True
+        if str(getattr(getattr(leader.nav, "warp", None), "phase", "idle") or "idle") != "idle":
+            return True
+        if str(getattr(getattr(leader.nav, "gate", None), "target_structure_id", "") or "").strip():
+            return True
+        return leader.nav.velocity.length() > 5.0
+
     def sense(self, world: WorldState) -> None:
         ship = self._ship(world)
         self.perception_buffer = ship.perception.copy()
@@ -102,6 +114,7 @@ class ShipAgent(BaseAgent):
 
         if self.current_order and self.current_order.kind == "WARP":
             payload = self.current_order.payload
+            ship.nav.gate.target_structure_id = None
             ship.nav.warp.phase = "align"
             ship.nav.warp.target_position = Vector2(
                 float(payload.get("x", ship.nav.position.x)),
@@ -122,6 +135,12 @@ class ShipAgent(BaseAgent):
             ship.nav.command_target = None
             self.current_order = None
 
+        if self.current_order and self.current_order.kind == "USE_STARGATE":
+            target_structure_id = str(self.current_order.payload.get("target_structure_id", "") or "").strip()
+            ship.nav.gate.target_structure_id = target_structure_id or None
+            ship.nav.command_target = None
+            self.current_order = None
+
         if str(getattr(ship.nav.warp, "phase", "idle") or "idle") != "idle":
             return
 
@@ -135,12 +154,21 @@ class ShipAgent(BaseAgent):
                 ship.nav.command_target = move_target
 
         if not is_leader and leader is not None:
-            to_leader = leader.nav.position - ship.nav.position
-            dist = to_leader.length()
-            if dist > max(600.0, ship.nav.radius * 6.0):
-                ship.nav.command_target = leader.nav.position
-            else:
-                ship.nav.command_target = None
+            hold_active = bool(getattr(ship.nav, "follow_hold_active", False))
+            hold_leader_id = str(getattr(ship.nav, "follow_hold_leader_id", "") or "")
+            if hold_active and (not hold_leader_id or hold_leader_id == leader.ship_id):
+                if not self._leader_motion_active(leader):
+                    ship.nav.command_target = None
+                else:
+                    ship.nav.follow_hold_active = False
+                    ship.nav.follow_hold_leader_id = None
+            if not bool(getattr(ship.nav, "follow_hold_active", False)):
+                to_leader = leader.nav.position - ship.nav.position
+                dist = to_leader.length()
+                if dist > max(600.0, ship.nav.radius * 6.0):
+                    ship.nav.command_target = leader.nav.position
+                else:
+                    ship.nav.command_target = None
 
         if self.current_order and self.current_order.kind == "ATTACK":
             ship.combat.current_target = self.current_order.payload.get("target_id")

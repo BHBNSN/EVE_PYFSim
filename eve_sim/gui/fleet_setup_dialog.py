@@ -71,6 +71,7 @@ from ..lan_commands import (
     CMD_SYNC_SETUP,
     SQUAD_FOCUS_COMMANDS,
 )
+from ..maps import list_map_catalog, load_map_definition, save_map_definition
 from ..math2d import Vector2
 from ..models import (
     CombatState,
@@ -92,6 +93,7 @@ from ..user_errors import UserFacingError, display_user_error
 from .models import PreferencesStore, SetupRow
 from .table_models import FleetSetupTableModel
 from .dialogs import FleetLibraryDialog
+from .map_editor_dialog import MapEditorDialog
 
 class FleetSetupDialog(QDialog):
     @staticmethod
@@ -115,6 +117,7 @@ class FleetSetupDialog(QDialog):
         self._factory = RuntimeFromEftFactory()
         self._fleet_store_path = Path.home() / ".eve_sim_fleet_configs.json"
         self._fleet_templates = self._load_fleet_templates()
+        self._map_catalog = list_map_catalog()
 
         init_rows: list[SetupRow] = []
         self.model = FleetSetupTableModel(init_rows, lambda: self._lang)
@@ -189,11 +192,10 @@ class FleetSetupDialog(QDialog):
         self.spin_cfg_substeps = QSpinBox(settings_tab)
         self.spin_cfg_substeps.setRange(1, 16)
 
-        self.lbl_cfg_radius = QLabel(settings_tab)
-        self.spin_cfg_radius = QDoubleSpinBox(settings_tab)
-        self.spin_cfg_radius.setRange(1_000.0, 20_000_000.0)
-        self.spin_cfg_radius.setDecimals(0)
-        self.spin_cfg_radius.setSingleStep(10_000.0)
+        self.lbl_cfg_map = QLabel(settings_tab)
+        self.combo_cfg_map = QComboBox(settings_tab)
+        self.btn_cfg_edit_map = QPushButton(settings_tab)
+        self._refresh_map_combo()
 
         self.lbl_cfg_lockstep = QLabel(settings_tab)
         self.chk_cfg_lockstep = QCheckBox(settings_tab)
@@ -216,9 +218,12 @@ class FleetSetupDialog(QDialog):
         self.spin_cfg_log_merge_window.setDecimals(1)
         self.spin_cfg_log_merge_window.setSingleStep(0.1)
 
+        map_row = QHBoxLayout()
+        map_row.addWidget(self.combo_cfg_map, 1)
+        map_row.addWidget(self.btn_cfg_edit_map)
+        settings_form.addRow(self.lbl_cfg_map, map_row)
         settings_form.addRow(self.lbl_cfg_tick_rate, self.spin_cfg_tick_rate)
         settings_form.addRow(self.lbl_cfg_substeps, self.spin_cfg_substeps)
-        settings_form.addRow(self.lbl_cfg_radius, self.spin_cfg_radius)
         settings_form.addRow(self.lbl_cfg_lockstep, self.chk_cfg_lockstep)
         settings_form.addRow(self.lbl_cfg_detailed_log, self.chk_cfg_detailed_log)
         settings_form.addRow(self.lbl_cfg_hotspot_log, self.chk_cfg_hotspot_log)
@@ -280,7 +285,8 @@ class FleetSetupDialog(QDialog):
         self.fit_editor.textChanged.connect(self._on_fit_changed)
         self.spin_cfg_tick_rate.valueChanged.connect(self._on_engine_pref_changed)
         self.spin_cfg_substeps.valueChanged.connect(self._on_engine_pref_changed)
-        self.spin_cfg_radius.valueChanged.connect(self._on_engine_pref_changed)
+        self.combo_cfg_map.currentIndexChanged.connect(self._on_engine_pref_changed)
+        self.btn_cfg_edit_map.clicked.connect(self._open_map_editor)
         self.chk_cfg_lockstep.toggled.connect(self._on_engine_pref_changed)
         self.chk_cfg_detailed_log.toggled.connect(self._on_engine_pref_changed)
         self.chk_cfg_hotspot_log.toggled.connect(self._on_engine_pref_changed)
@@ -493,9 +499,10 @@ class FleetSetupDialog(QDialog):
 
         self.setup_tabs.setTabText(0, QCoreApplication.translate("eve_sim", 'Fleet Preview'))
         self.setup_tabs.setTabText(1, QCoreApplication.translate("eve_sim", 'Simulation Settings'))
+        self.lbl_cfg_map.setText(QCoreApplication.translate("eve_sim", 'Map'))
+        self.btn_cfg_edit_map.setText(QCoreApplication.translate("eve_sim", 'Edit...'))
         self.lbl_cfg_tick_rate.setText(QCoreApplication.translate("eve_sim", 'Tick Rate (Hz)'))
         self.lbl_cfg_substeps.setText(QCoreApplication.translate("eve_sim", 'Physics Substeps'))
-        self.lbl_cfg_radius.setText(QCoreApplication.translate("eve_sim", 'Battlefield Radius (m)'))
         self.lbl_cfg_lockstep.setText(QCoreApplication.translate("eve_sim", 'Lockstep'))
         self.lbl_cfg_detailed_log.setText(QCoreApplication.translate("eve_sim", 'Detailed Logging'))
         self.lbl_cfg_hotspot_log.setText(QCoreApplication.translate("eve_sim", 'Hotspot Timing Logging'))
@@ -508,9 +515,10 @@ class FleetSetupDialog(QDialog):
             self.lbl_engine_hint.setText(QCoreApplication.translate("eve_sim", 'These settings are saved locally and will be restored on next launch.'))
 
     def _set_engine_settings_enabled(self, enabled: bool) -> None:
+        self.combo_cfg_map.setEnabled(enabled)
+        self.btn_cfg_edit_map.setEnabled(enabled)
         self.spin_cfg_tick_rate.setEnabled(enabled)
         self.spin_cfg_substeps.setEnabled(enabled)
-        self.spin_cfg_radius.setEnabled(enabled)
         self.chk_cfg_lockstep.setEnabled(enabled)
         self.chk_cfg_detailed_log.setEnabled(enabled)
         self.chk_cfg_hotspot_log.setEnabled(enabled)
@@ -522,9 +530,11 @@ class FleetSetupDialog(QDialog):
         defaults = EngineConfig()
         self._engine_pref_loading = True
         try:
+            self._refresh_map_combo()
+            map_idx = self.combo_cfg_map.findData(self._pref.selected_map_id)
+            self.combo_cfg_map.setCurrentIndex(0 if map_idx < 0 else map_idx)
             self.spin_cfg_tick_rate.setValue(max(1, int(self._pref.engine_tick_rate)))
             self.spin_cfg_substeps.setValue(max(1, int(self._pref.engine_physics_substeps)))
-            self.spin_cfg_radius.setValue(max(1_000.0, float(self._pref.engine_battlefield_radius)))
             self.chk_cfg_lockstep.setChecked(bool(self._pref.engine_lockstep))
             self.chk_cfg_detailed_log.setChecked(bool(self._pref.engine_detailed_logging))
             self.chk_cfg_hotspot_log.setChecked(bool(self._pref.engine_hotspot_logging))
@@ -540,9 +550,9 @@ class FleetSetupDialog(QDialog):
         if self._engine_pref_loading:
             return
         defaults = EngineConfig()
+        self._pref.selected_map_id = self.selected_map_id()
         self._pref.engine_tick_rate = max(1, int(self.spin_cfg_tick_rate.value()))
         self._pref.engine_physics_substeps = max(1, int(self.spin_cfg_substeps.value()))
-        self._pref.engine_battlefield_radius = max(1_000.0, float(self.spin_cfg_radius.value()))
         self._pref.engine_lockstep = bool(self.chk_cfg_lockstep.isChecked())
         self._pref.engine_detailed_logging = bool(self.chk_cfg_detailed_log.isChecked())
         self._pref.engine_hotspot_logging = bool(self.chk_cfg_hotspot_log.isChecked())
@@ -557,13 +567,50 @@ class FleetSetupDialog(QDialog):
             tick_rate=max(1, int(self.spin_cfg_tick_rate.value())),
             physics_substeps=max(1, int(self.spin_cfg_substeps.value())),
             lockstep=bool(self.chk_cfg_lockstep.isChecked()),
-            battlefield_radius=max(1_000.0, float(self.spin_cfg_radius.value())),
             detailed_logging=bool(self.chk_cfg_detailed_log.isChecked()),
             hotspot_logging=bool(self.chk_cfg_hotspot_log.isChecked()),
             detail_log_file=self.edit_cfg_log_file.text().strip() or defaults.detail_log_file,
             hotspot_log_file=self.edit_cfg_hotspot_log_file.text().strip() or defaults.hotspot_log_file,
             log_merge_window_sec=max(0.1, float(self.spin_cfg_log_merge_window.value())),
         )
+
+    def _refresh_map_combo(self) -> None:
+        current = str(self.combo_cfg_map.currentData() or self._pref.selected_map_id or "")
+        self.combo_cfg_map.blockSignals(True)
+        self.combo_cfg_map.clear()
+        if not self._map_catalog:
+            self._map_catalog = list_map_catalog()
+        for entry in self._map_catalog:
+            self.combo_cfg_map.addItem(entry.name, entry.map_id)
+        idx = self.combo_cfg_map.findData(current)
+        if idx < 0:
+            idx = self.combo_cfg_map.findData(self._pref.selected_map_id)
+        self.combo_cfg_map.setCurrentIndex(0 if idx < 0 else idx)
+        self.combo_cfg_map.blockSignals(False)
+
+    def selected_map_id(self) -> str:
+        selected = str(self.combo_cfg_map.currentData() or self._pref.selected_map_id or "").strip()
+        if selected:
+            return selected
+        if self._map_catalog:
+            return self._map_catalog[0].map_id
+        return "dual_system_crossroads"
+
+    def selected_map_definition(self):
+        return load_map_definition(self.selected_map_id())
+
+    def _open_map_editor(self) -> None:
+        dialog = MapEditorDialog(self.selected_map_definition(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated_map = dialog.map_definition()
+        save_map_definition(updated_map)
+        self._map_catalog = list_map_catalog()
+        self._pref.selected_map_id = updated_map.map_id
+        self._store.save(self._pref)
+        self._refresh_map_combo()
+        idx = self.combo_cfg_map.findData(updated_map.map_id)
+        self.combo_cfg_map.setCurrentIndex(0 if idx < 0 else idx)
 
     def _default_fit_text(self, ship: str = "Ferox", fit_name: str = "Manual") -> str:
         return f"[{ship}, {fit_name}]\nMagnetic Field Stabilizer II\nTracking Enhancer II\n"

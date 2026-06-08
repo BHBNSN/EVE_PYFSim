@@ -19,8 +19,9 @@ class UiState:
 
 @dataclass(slots=True)
 class UiPreferences:
-    config_version: int = 6
+    config_version: int = 7
     selected_squad: str = "BLUE-ALPHA"
+    selected_map_id: str = "dual_system_crossroads"
     filter_team: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"] = "ALL"
     filter_role: str = "ALL"
     filter_alive: str = "ALL"
@@ -32,7 +33,6 @@ class UiPreferences:
     engine_tick_rate: int = 30
     engine_physics_substeps: int = 1
     engine_lockstep: bool = True
-    engine_battlefield_radius: float = 800_000.0
     engine_detailed_logging: bool = True
     engine_hotspot_logging: bool = False
     engine_detail_log_file: str = "logs/sim_detail.log"
@@ -65,7 +65,7 @@ class AreaCycleOverlay:
 
 
 class PreferencesStore:
-    CURRENT_VERSION = 6
+    CURRENT_VERSION = 7
 
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
@@ -158,6 +158,7 @@ class PreferencesStore:
             return UiPreferences(
                 config_version=self.CURRENT_VERSION,
                 selected_squad=self._read_str(migrated, "selected_squad", defaults.selected_squad),
+                selected_map_id=self._read_str(migrated, "selected_map_id", defaults.selected_map_id),
                 filter_team=self._read_filter_team(migrated, defaults.filter_team),
                 filter_role=self._read_str(migrated, "filter_role", defaults.filter_role),
                 filter_alive=self._read_str(migrated, "filter_alive", defaults.filter_alive),
@@ -174,12 +175,6 @@ class PreferencesStore:
                     1,
                 ),
                 engine_lockstep=self._read_bool(migrated, "engine_lockstep", defaults.engine_lockstep),
-                engine_battlefield_radius=self._read_float(
-                    migrated,
-                    "engine_battlefield_radius",
-                    defaults.engine_battlefield_radius,
-                    1_000.0,
-                ),
                 engine_detailed_logging=self._read_bool(
                     migrated,
                     "engine_detailed_logging",
