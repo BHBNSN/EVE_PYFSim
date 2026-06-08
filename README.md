@@ -196,16 +196,17 @@ python main.py
             │                      │                     │
             ▼                      ▼                     ▼
 ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-│  Agents (agents.py) │ │  Systems (systems.py)│ │   World (world.py)  │
-│  - CommanderAgent   │ │  - CombatSystem      │ │  - ShipEntity       │
-│  - ShipAgent        │ │  - MovementSystem    │ │  - WorldState       │
-│                     │ │  - PerceptionSystem  │ │                     │
+│  Agents (agents.py) │ │  Systems (systems/) │ │   World (world.py)  │
+│  - CommanderAgent   │ │  - CombatSystem     │ │  - ShipEntity       │
+│  - ShipAgent        │ │  - MovementSystem   │ │  - WorldState       │
+│                     │ │  - PerceptionSystem │ │                     │
+│                     │ │  - LogisticsSystem  │ │                     │
 └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
                               │
                               ▼
                     ┌─────────────────────┐
                     │  Pyfa Integration   │
-                    │  (fleet_setup.py,   │
+                    │  (fleet_setup/,     │
                     │   fit_runtime.py)   │
                     └─────────────────────┘
 ```
@@ -223,6 +224,10 @@ python main.py
 | Right click 右键 | Open command menu 打开指令菜单 |
 | Middle drag 中键拖拽 | Pan view 平移视图 |
 | Scroll 滚轮 | Zoom in/out 缩放 |
+| Right-click ship 右键点击舰船 | Open context menu with warp option 打开包含跃迁选项的上下文菜单 |
+| Right-click beacon 右键点击信标 | Open context menu with warp option 打开包含跃迁选项的上下文菜单 |
+| Right-click ship 右键点击舰船 | Open context menu with warp option 打开包含跃迁选项的上下文菜单 |
+| Right-click beacon 右键点击信标 | Open context menu with warp option 打开包含跃迁选项的上下文菜单 |
 
 ### Keyboard/UI Commands 键盘/界面命令
 | Command 命令 | Function 功能 |
@@ -233,6 +238,10 @@ python main.py
 | Clear focus 清除集火 | Remove all focus targets 清除所有集火目标 |
 | Weapon/Ammo selection 武器/弹药选择 | Switch ammo across fleet 切换全舰队弹药 |
 | Assign ships 分配舰船 | Move selected ships to squad 将选中舰船分配到小队 |
+| Warp to ship 跃迁到舰船 | Command squad to warp to target ship 命令小队跃迁到目标舰船 |
+| Warp to beacon 跃迁到信标 | Command squad to warp to beacon 命令小队跃迁到信标 |
+| Warp to ship 跃迁到舰船 | Command squad to warp to target ship 命令小队跃迁到目标舰船 |
+| Warp to beacon 跃迁到信标 | Command squad to warp to beacon 命令小队跃迁到信标 |
 
 
 ## Development Status 开发状态
@@ -256,20 +265,22 @@ python main.py
 - ✅ 舰队库与模板管理
 - ✅ Ammo switching with reload timers
 - ✅ 弹药切换与装填时间
+- ✅ Missile system mechanics
+- ✅ 导弹系统适配
+- ✅ Customize the map configuration
+- ✅ 自定义地图配置
+- ✅ Bomb mechanics
+- ✅ 炸弹机制
+- ✅ Warp mechanics
+- ✅ 跃迁机制
 
 ### In Progress 进行中
 - 🔄 More comprehensive and smart EWAR effects
 - 🔄 更全面智能的电子战效果
 
 ### Planned 计划中
-- 📅 Missile system mechanics
-- 📅 导弹系统适配
-- 📅 Customize the map configuration
-- 📅 自定义地图配置
-- 📅 Bomb mechanics
-- 📅 炸弹机制
-- 📅 Warp mechanics
-- 📅 跃迁机制
+- 📅 Adaptation for drones/carriers
+- 📅 无人机/舰载机的适配
 
 ---
 
