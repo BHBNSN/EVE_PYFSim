@@ -1,0 +1,122 @@
+{
+  "map_id": "dual_system_crossroads",
+  "name": "Dual-System Crossroads",
+  "description": "Two large combat systems linked by stargates.",
+  "version": 1,
+  "systems": [
+    {
+      "system_id": "alpha",
+      "name": "Alpha",
+      "radius_m": 2991957414000.0,
+      "buildings": [
+        {
+          "building_id": "alpha_gate_to_beta",
+          "name": "Alpha Stargate",
+          "kind": "STARGATE",
+          "position": {
+            "x": -1179220175579.82,
+            "y": 1141581351311.7
+          },
+          "radius_m": 3500.0,
+          "interaction_range_m": 5000.0,
+          "icon_key": "stargate",
+          "linked_building_id": "beta_gate_to_alpha"
+        },
+        {
+          "building_id": "alpha_structure_1",
+          "name": "Relay",
+          "kind": "STRUCTURE",
+          "position": {
+            "x": 928322216503.1447,
+            "y": -1129040533584.9055
+          },
+          "radius_m": 12000.0,
+          "interaction_range_m": 0.0,
+          "icon_key": "structure",
+          "linked_building_id": null
+        }
+      ],
+      "spawn_anchors": [
+        {
+          "anchor_id": "alpha_blue",
+          "team": "BLUE",
+          "squad_id": "",
+          "label": "Blue Entry",
+          "position": {
+            "x": -480000.0,
+            "y": -50000.0
+          },
+          "radius_m": 18000.0
+        },
+        {
+          "anchor_id": "alpha_red",
+          "team": "RED",
+          "squad_id": "",
+          "label": "Red Entry",
+          "position": {
+            "x": 520000.0,
+            "y": 50000.0
+          },
+          "radius_m": 18000.0
+        }
+      ]
+    },
+    {
+      "system_id": "beta",
+      "name": "Beta",
+      "radius_m": 2991957414000.0,
+      "buildings": [
+        {
+          "building_id": "beta_gate_to_alpha",
+          "name": "Beta Stargate",
+          "kind": "STARGATE",
+          "position": {
+            "x": -25089789635.220123,
+            "y": 1768830169283.0188
+          },
+          "radius_m": 3500.0,
+          "interaction_range_m": 5000.0,
+          "icon_key": "stargate",
+          "linked_building_id": "alpha_gate_to_beta"
+        },
+        {
+          "building_id": "beta_structure_1",
+          "name": "Outpost",
+          "kind": "STRUCTURE",
+          "position": {
+            "x": 602154951245.2831,
+            "y": -2088724987132.0754
+          },
+          "radius_m": 15000.0,
+          "interaction_range_m": 0.0,
+          "icon_key": "structure",
+          "linked_building_id": null
+        }
+      ],
+      "spawn_anchors": [
+        {
+          "anchor_id": "beta_blue",
+          "team": "BLUE",
+          "squad_id": "",
+          "label": "Blue Reserve",
+          "position": {
+            "x": -540000.0,
+            "y": -120000.0
+          },
+          "radius_m": 18000.0
+        },
+        {
+          "anchor_id": "beta_red",
+          "team": "RED",
+          "squad_id": "",
+          "label": "Red Reserve",
+          "position": {
+            "x": 540000.0,
+            "y": 120000.0
+          },
+          "radius_m": 18000.0
+        }
+      ]
+    }
+  ]
+}

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..agents import CommanderAgent
+from ..battle_report import BattleReportService
 from ..config import EngineConfig, UiConfig
 from ..fleet_setup import (
     ManualShipSetup,
@@ -97,6 +99,7 @@ from ..models import (
     VitalState,
 )
 from ..pyfa_bridge import PyfaBridge
+from ..replay import ReplayPlayer, ReplayRecorder
 from ..sim_logging import get_sim_logger, log_sim_event
 from ..simulation_engine import SimulationEngine
 from ..timer_views import deadline_map_from_remaining_view
@@ -105,6 +108,7 @@ from ..user_errors import display_user_error
 from .battle_canvas import BattleCanvas
 from .dialogs import OverviewOptionsDialog, ShipStatusDialog
 from .fleet_setup_dialog import FleetSetupDialog
+from .replay_dialog import ReplayPlaybackDialog
 from .system_graph_window import SystemGraphWindow
 from .models import PreferencesStore, UiPreferences, UiState
 from .table_models import BlueRosterTableModel, OverviewFilterProxyModel, OverviewTableModel
@@ -189,6 +193,12 @@ class MainWindow(QMainWindow):
         self._last_sent_fit_texts: dict[str, str] = {}
         self._lan_debug_enabled = False
         self._view_system_id: str = ""
+        self._battle_recorder = ReplayRecorder(self._new_recording_scenario_id(), keyframe_interval_s=30.0)
+        self._battle_recorder.metadata.update(self._recording_metadata())
+        self._battle_recording_active = True
+        self._battle_finished = False
+        self._last_recorded_snapshot_tick: int | None = None
+        self._attach_battle_recorder()
 
         self._create_menu()
 
@@ -250,6 +260,7 @@ class MainWindow(QMainWindow):
         self._sync_blue_squads()
         self.refresh_blue_roster()
         self.request_overview_refresh(force=True)
+        self._record_battle_snapshot(force=True)
 
     def show_ship_status(self, ship_id: str) -> None:
         dialog = self._status_dialogs.get(ship_id)
@@ -1103,6 +1114,213 @@ class MainWindow(QMainWindow):
         display_name = str(getattr(structure, "display_name", "") or getattr(structure, "structure_id", "") or "").strip()
         return display_name or self._display_structure_type(kind)
 
+    def _new_recording_scenario_id(self) -> str:
+        return f"{self.network_mode}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+    def _recording_metadata(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "network_mode": str(self.network_mode),
+            "controlled_team": str(self.controlled_team.value),
+            "engine_config": self._engine_config_payload(),
+            "replay_schema": 3,
+            "keyframe_interval_s": float(getattr(self._battle_recorder, "keyframe_interval_s", 30.0)),
+            "map_id": str(getattr(self.engine.world, "map_id", "") or ""),
+            "map_name": str(getattr(self.engine.world, "map_name", "") or ""),
+        }
+        if self.engine.world.map_definition is not None:
+            metadata["map"] = serialize_map_definition(self.engine.world.map_definition)
+        return metadata
+
+    def _attach_battle_recorder(self) -> None:
+        combat = getattr(self.engine, "combat", None)
+        if combat is None or not hasattr(combat, "attach_event_sink"):
+            return
+        previous_sink = getattr(combat, "_combat_event_sink", None)
+
+        def sink(event) -> None:
+            if previous_sink is not None:
+                previous_sink(event)
+            self._battle_recorder.record(event)
+
+        self._battle_event_sink = sink
+        combat.attach_event_sink(sink)
+
+    def _record_battle_snapshot(self, *, force: bool = False) -> None:
+        if not getattr(self, "_battle_recording_active", False):
+            return
+        try:
+            snapshot = self.engine.snapshot()
+        except Exception:
+            return
+        tick = int(snapshot.get("tick", self.engine.world.tick))
+        if not force and self._last_recorded_snapshot_tick == tick:
+            return
+        at = float(snapshot.get("now", self.engine.world.now))
+        self._battle_recorder.record_snapshot(snapshot, tick=tick, at=at, force_frame=force)
+        self._last_recorded_snapshot_tick = tick
+
+    def _default_replay_path(self) -> Path:
+        replay_dir = Path("logs") / "replays"
+        name = f"{self._battle_recorder.scenario_id or self._new_recording_scenario_id()}.replay.json"
+        return (replay_dir / name).resolve()
+
+    def _save_battle_recording(self, path: str | Path) -> Path:
+        if hasattr(self.engine, "combat") and hasattr(self.engine.combat, "flush_pending_events"):
+            self.engine.combat.flush_pending_events()
+        self._record_battle_snapshot(force=True)
+        self._battle_recorder.metadata.update(self._recording_metadata())
+        self._battle_recorder.metadata.update(
+            {
+                "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "duration_s": float(self.engine.world.now),
+                "final_tick": int(self.engine.world.tick),
+            }
+        )
+        target = Path(path)
+        self._battle_recorder.save(target)
+        return target
+
+    def end_battle_and_save_recording(self) -> None:
+        default_path = self._default_replay_path()
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            QCoreApplication.translate("eve_sim", "Save Battle Recording"),
+            str(default_path),
+            QCoreApplication.translate("eve_sim", "Replay Files (*.replay.json);;JSON Files (*.json);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            saved_path = self._save_battle_recording(path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                QCoreApplication.translate("eve_sim", "Save Failed"),
+                str(exc),
+            )
+            return
+        self._battle_recording_active = False
+        self._battle_finished = True
+        if hasattr(self, "tick_timer"):
+            self.tick_timer.stop()
+        if hasattr(self, "act_end_battle"):
+            self.act_end_battle.setEnabled(False)
+        self.status.setText(
+            QCoreApplication.translate("eve_sim", "Battle ended. Recording saved: {path}").format(path=str(saved_path))
+        )
+        QMessageBox.information(
+            self,
+            QCoreApplication.translate("eve_sim", "Battle Recording Saved"),
+            QCoreApplication.translate("eve_sim", "Saved recording to:\n{path}").format(path=str(saved_path)),
+        )
+
+    def open_replay_recording(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            QCoreApplication.translate("eve_sim", "Open Battle Recording"),
+            str((Path("logs") / "replays").resolve()),
+            QCoreApplication.translate("eve_sim", "Replay Files (*.replay.json *.json);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            player = ReplayPlayer.from_file(path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                QCoreApplication.translate("eve_sim", "Open Failed"),
+                str(exc),
+            )
+            return
+        if player.snapshot_count <= 0:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("eve_sim", "Replay Unavailable"),
+                QCoreApplication.translate("eve_sim", "This recording has no world snapshots to replay."),
+            )
+            return
+        dialog = ReplayPlaybackDialog(player, self.ui_cfg, self.current_language, self)
+        dialog.resize(min(self.ui_cfg.width + 120, 1400), min(self.ui_cfg.height + 140, 920))
+        dialog.exec()
+
+    def open_battle_report_from_recording(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            QCoreApplication.translate("eve_sim", "Open Battle Recording"),
+            str((Path("logs") / "replays").resolve()),
+            QCoreApplication.translate("eve_sim", "Replay Files (*.replay.json *.json);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            recorder = ReplayRecorder.load(path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                QCoreApplication.translate("eve_sim", "Open Failed"),
+                str(exc),
+            )
+            return
+        duration = recorder.metadata.get("duration_s")
+        if duration is None and recorder.frame_count:
+            duration = recorder.duration_s
+        report = BattleReportService().build(
+            recorder.scenario_id,
+            recorder.events,
+            duration_s=float(duration) if duration is not None else None,
+        )
+        self._show_battle_report_dialog(report.to_dict())
+
+    def _show_battle_report_dialog(self, report: dict[str, Any]) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(QCoreApplication.translate("eve_sim", "Battle Report"))
+        layout = QVBoxLayout(dialog)
+        text = QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText(self._format_battle_report(report))
+        layout.addWidget(text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(760, 620)
+        dialog.exec()
+
+    def _format_battle_report(self, report: dict[str, Any]) -> str:
+        lines = [
+            "Battle Report",
+            f"Scenario: {report.get('scenario_id', '')}",
+            f"Duration: {float(report.get('duration_s', 0.0) or 0.0):.2f}s",
+            "",
+            "Total Damage By Team:",
+        ]
+        for team, value in sorted((report.get("total_damage_by_team", {}) or {}).items()):
+            lines.append(f"  {team}: {float(value):.1f}")
+        lines.append("")
+        lines.append("Rep Applied By Team:")
+        for team, value in sorted((report.get("rep_applied_by_team", {}) or {}).items()):
+            lines.append(f"  {team}: {float(value):.1f}")
+        lines.append("")
+        lines.append("Jam Uptime By Target:")
+        for target, value in sorted((report.get("jam_uptime_by_target", {}) or {}).items()):
+            lines.append(f"  {target}: {float(value):.1f}s")
+        lines.append("")
+        lines.append("Burst Coverage By Effect:")
+        for effect, value in sorted((report.get("burst_coverage_by_effect", {}) or {}).items()):
+            lines.append(f"  {effect}: {float(value):.1f}s")
+        lines.append("")
+        lines.append("Ship Deaths:")
+        deaths = report.get("ship_deaths", []) or []
+        if not deaths:
+            lines.append("  none")
+        for death in deaths:
+            lines.append(
+                f"  t={float(death.get('at', 0.0) or 0.0):.2f}s tick={int(death.get('tick', 0) or 0)} "
+                f"ship={death.get('ship_id', '')} source={death.get('source_id', '')}"
+            )
+        lines.extend(["", "Raw JSON:", json.dumps(report, ensure_ascii=False, indent=2)])
+        return "\n".join(lines)
+
     def _create_menu(self) -> None:
         lang = self.current_language()
         self.menu_overview = self.menuBar().addMenu(QCoreApplication.translate("eve_sim", 'Overview'))
@@ -1113,6 +1331,19 @@ class MainWindow(QMainWindow):
         self.act_overview_reset = QAction(QCoreApplication.translate("eve_sim", 'Reset Filters'), self)
         self.act_overview_reset.triggered.connect(self.reset_overview_options)
         self.menu_overview.addAction(self.act_overview_reset)
+
+        self.menu_battle = self.menuBar().addMenu(QCoreApplication.translate("eve_sim", "Battle"))
+        self.act_end_battle = QAction(QCoreApplication.translate("eve_sim", "End Battle and Save Recording"), self)
+        self.act_end_battle.triggered.connect(self.end_battle_and_save_recording)
+        self.menu_battle.addAction(self.act_end_battle)
+
+        self.act_open_replay = QAction(QCoreApplication.translate("eve_sim", "Open Recording Replay"), self)
+        self.act_open_replay.triggered.connect(self.open_replay_recording)
+        self.menu_battle.addAction(self.act_open_replay)
+
+        self.act_open_report = QAction(QCoreApplication.translate("eve_sim", "Battle Report from Recording"), self)
+        self.act_open_report.triggered.connect(self.open_battle_report_from_recording)
+        self.menu_battle.addAction(self.act_open_report)
 
     def _build_left_panel(self) -> QWidget:
         side = QWidget(self)
@@ -1302,6 +1533,10 @@ class MainWindow(QMainWindow):
         self.menu_overview.setTitle(QCoreApplication.translate("eve_sim", 'Overview'))
         self.act_overview_filter.setText(QCoreApplication.translate("eve_sim", 'Filters...'))
         self.act_overview_reset.setText(QCoreApplication.translate("eve_sim", 'Reset Filters'))
+        self.menu_battle.setTitle(QCoreApplication.translate("eve_sim", "Battle"))
+        self.act_end_battle.setText(QCoreApplication.translate("eve_sim", "End Battle and Save Recording"))
+        self.act_open_replay.setText(QCoreApplication.translate("eve_sim", "Open Recording Replay"))
+        self.act_open_report.setText(QCoreApplication.translate("eve_sim", "Battle Report from Recording"))
         self.lbl_selected_squad.setText(QCoreApplication.translate("eve_sim", 'Selected Squad'))
         self.lbl_language.setText(QCoreApplication.translate("eve_sim", 'Language'))
         self._refresh_language_combo(self.lang_combo.currentData())
@@ -3675,6 +3910,8 @@ class MainWindow(QMainWindow):
                 self.request_overview_refresh(force=True)
             if self.engine.world.tick % 10 == 0:
                 self.refresh_blue_roster()
+            if hasattr(self, "_record_battle_snapshot"):
+                self._record_battle_snapshot()
             return
 
         if self.network_mode == "host" and self.lan_server is not None:
@@ -3716,6 +3953,9 @@ class MainWindow(QMainWindow):
 
         if self.network_mode == "host":
             self._send_host_state(countdown_left=0.0, started=True)
+
+        if hasattr(self, "_record_battle_snapshot"):
+            self._record_battle_snapshot()
 
         self._ui_tick_counter += 1
         refresh_ui = (self._ui_tick_counter % self._ui_refresh_interval_ticks) == 0
@@ -3778,8 +4018,13 @@ class MainWindow(QMainWindow):
         self.store.save(self.prefs)
         if hasattr(self.engine, "combat") and hasattr(self.engine.combat, "flush_pending_events"):
             self.engine.combat.flush_pending_events()
+        if hasattr(self, "tick_timer"):
+            self.tick_timer.stop()
+        if hasattr(self, "render_timer"):
+            self.render_timer.stop()
         if hasattr(self, "system_graph_window"):
             self.system_graph_window.close()
+            self.system_graph_window.deleteLater()
         if self.lan_server is not None:
             self.lan_server.stop()
         if self.lan_client is not None:
