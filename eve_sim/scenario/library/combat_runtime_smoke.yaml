@@ -1,0 +1,23 @@
+scenario_id: combat_runtime_smoke
+name: Combat Runtime Smoke
+duration_s: 60
+seed: 1001
+metadata:
+  purpose: golden
+fleets:
+  - team: BLUE
+    ships:
+      - ship_id: blue-anchor
+        squad_id: BLUE-ALPHA
+        fit: basic-blue
+        role: line
+        count: 1
+        position: {x: -10000, y: 0}
+  - team: RED
+    ships:
+      - ship_id: red-anchor
+        squad_id: RED-ALPHA
+        fit: basic-red
+        role: line
+        count: 1
+        position: {x: 10000, y: 0}
