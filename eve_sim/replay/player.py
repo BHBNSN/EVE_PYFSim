@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 import json
 
+from .compact_json import expand_replay_document
 from .delta import apply_frame
 from .schema import CombatEvent, ReplayFrame, ReplaySnapshot
 
@@ -13,7 +14,6 @@ class ReplayPlayer:
         self,
         events: Iterable[CombatEvent] | None = None,
         *,
-        snapshots: Iterable[ReplaySnapshot] | None = None,
         frames: Iterable[ReplayFrame] | None = None,
         metadata: dict[str, Any] | None = None,
         scenario_id: str = "",
@@ -23,19 +23,17 @@ class ReplayPlayer:
         self.rng_seed = int(rng_seed)
         self.metadata: dict[str, Any] = dict(metadata or {})
         self.events = sorted(list(events), key=lambda event: (event.tick, event.at, event.rng_counter))
-        snapshot_frames = [ReplayFrame.from_snapshot(snapshot) for snapshot in (snapshots or ())]
-        self.frames = sorted(list(frames or snapshot_frames), key=lambda frame: (frame.tick, frame.at))
+        self.frames = sorted(list(frames or ()), key=lambda frame: (frame.tick, frame.at))
         self._last_resolved_index: int | None = None
         self._last_resolved_snapshot: dict[str, Any] | None = None
         self._keyframe_indices = [index for index, frame in enumerate(self.frames) if frame.kind == "keyframe"]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReplayPlayer":
+        data = expand_replay_document(data)
         frames = [ReplayFrame.from_dict(item) for item in data.get("frames", [])]
-        snapshots = [] if frames else [ReplaySnapshot.from_dict(item) for item in data.get("snapshots", [])]
         return cls(
             (CombatEvent.from_dict(item) for item in data.get("events", [])),
-            snapshots=snapshots,
             frames=frames,
             metadata=dict(data.get("metadata", {}) or {}),
             scenario_id=str(data.get("scenario_id", "")),

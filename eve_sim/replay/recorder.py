@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Iterable
 import json
 
+from .compact_json import compact_replay_data, expand_replay_document
 from .delta import frame_has_changes, make_delta_frame, make_keyframe, replay_frames_to_snapshots
 from .schema import SCHEMA_VERSION, CombatEvent, ReplayFrame, ReplaySnapshot
 
@@ -15,7 +16,6 @@ class ReplayRecorder:
         *,
         rng_seed: int = 0,
         events: Iterable[CombatEvent] | None = None,
-        snapshots: Iterable[ReplaySnapshot] | None = None,
         frames: Iterable[ReplayFrame] | None = None,
         metadata: dict[str, Any] | None = None,
         keyframe_interval_s: float = 30.0,
@@ -23,8 +23,7 @@ class ReplayRecorder:
         self.scenario_id = str(scenario_id)
         self.rng_seed = int(rng_seed)
         self.events: list[CombatEvent] = list(events or ())
-        snapshot_frames = [ReplayFrame.from_snapshot(snapshot) for snapshot in (snapshots or ())]
-        self.frames: list[ReplayFrame] = list(frames or snapshot_frames)
+        self.frames: list[ReplayFrame] = list(frames or ())
         self.metadata: dict[str, Any] = dict(metadata or {})
         self.keyframe_interval_s = max(1.0, float(keyframe_interval_s))
         self._last_full_snapshot: dict[str, Any] | None = None
@@ -107,14 +106,13 @@ class ReplayRecorder:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReplayRecorder":
+        data = expand_replay_document(data)
         events = [CombatEvent.from_dict(item) for item in data.get("events", [])]
         frames = [ReplayFrame.from_dict(item) for item in data.get("frames", [])]
-        snapshots = [] if frames else [ReplaySnapshot.from_dict(item) for item in data.get("snapshots", [])]
         return cls(
             scenario_id=str(data.get("scenario_id", "")),
             rng_seed=int(data.get("rng_seed", 0)),
             events=events,
-            snapshots=snapshots,
             frames=frames,
             metadata=dict(data.get("metadata", {}) or {}),
             keyframe_interval_s=float((data.get("metadata", {}) or {}).get("keyframe_interval_s", 30.0)),
@@ -123,7 +121,10 @@ class ReplayRecorder:
     def save(self, path: str | Path) -> None:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        target.write_text(
+            json.dumps(compact_replay_data(self.to_dict()), ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "ReplayRecorder":

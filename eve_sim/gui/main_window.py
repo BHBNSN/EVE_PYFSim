@@ -199,7 +199,7 @@ class MainWindow(QMainWindow):
         self._last_roster_refresh_tick: int | None = None
         self._lan_debug_enabled = False
         self._view_system_id: str = ""
-        self._battle_recorder = ReplayRecorder(self._new_recording_scenario_id(), keyframe_interval_s=30.0)
+        self._battle_recorder = ReplayRecorder(self._new_recording_scenario_id(), keyframe_interval_s=300.0)
         self._battle_recorder.metadata.update(self._recording_metadata())
         self._battle_recording_active = True
         self._battle_finished = False
@@ -1163,7 +1163,7 @@ class MainWindow(QMainWindow):
         if not force and self._last_recorded_snapshot_tick == tick:
             return
         at = float(snapshot.get("now", self.engine.world.now))
-        self._battle_recorder.record_snapshot(snapshot, tick=tick, at=at, force_frame=force)
+        self._battle_recorder.record_snapshot(snapshot, tick=tick, at=at, force_frame=True)
         self._last_recorded_snapshot_tick = tick
 
     def _default_replay_path(self) -> Path:

@@ -10,6 +10,7 @@ from .schema import ReplayFrame, ReplaySnapshot
 COLLECTION_FIELDS = ("ships", "projectiles", "projectile_blasts", "bubble_fields")
 REPLACE_FIELDS = ("intents", "squad_focus_queues")
 TIMELINE_FIELDS = {"tick", "now", "at"}
+FLOAT_EPSILON = 1e-3
 
 
 def normalize_snapshot(snapshot: Mapping[str, Any], *, tick: int, at: float) -> dict[str, Any]:
@@ -30,15 +31,94 @@ def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
 def _object_delta(previous: Mapping[str, Any], current: Mapping[str, Any]) -> dict[str, Any]:
     patch: dict[str, Any] = {}
     for key, value in current.items():
-        if previous.get(key) != value:
+        if not _values_equal(previous.get(key), value):
             patch[str(key)] = deepcopy(value)
     return patch
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) <= FLOAT_EPSILON
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        if set(left.keys()) != set(right.keys()):
+            return False
+        return all(_values_equal(left.get(key), right.get(key)) for key in left.keys())
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return False
+        return all(_values_equal(left_item, right_item) for left_item, right_item in zip(left, right))
+    return left == right
+
+
+def _position_plus_velocity(position: Any, velocity: Any, dt: float) -> Any:
+    if not isinstance(position, Mapping) or not isinstance(velocity, Mapping):
+        return deepcopy(position)
+    return {
+        "x": _float(position.get("x")) + (_float(velocity.get("x")) * dt),
+        "y": _float(position.get("y")) + (_float(velocity.get("y")) * dt),
+    }
+
+
+def _advance_cycle_timers(raw: Any, dt: float) -> Any:
+    if not isinstance(raw, Mapping):
+        return deepcopy(raw)
+    advanced: dict[str, float] = {}
+    for module_id, remaining in raw.items():
+        advanced[str(module_id)] = max(0.0, _float(remaining) - dt)
+    return advanced
+
+
+def _advance_collection_item(field: str, item: Mapping[str, Any], dt: float) -> dict[str, Any]:
+    advanced = deepcopy(dict(item))
+    if dt <= 0.0:
+        return advanced
+    if field in {"ships", "projectiles"} and "position" in advanced:
+        advanced["position"] = _position_plus_velocity(advanced.get("position"), advanced.get("velocity"), dt)
+    if field == "ships" and "module_cycle_timers" in advanced:
+        advanced["module_cycle_timers"] = _advance_cycle_timers(advanced.get("module_cycle_timers"), dt)
+    if field == "projectiles":
+        if "age" in advanced:
+            advanced["age"] = max(0.0, _float(advanced.get("age")) + dt)
+        if "flight_time" in advanced:
+            advanced["flight_time"] = max(0.0, _float(advanced.get("flight_time")) + dt)
+        if "distance_traveled" in advanced:
+            speed = _float(advanced.get("speed"), 0.0)
+            if speed <= 0.0 and isinstance(advanced.get("velocity"), Mapping):
+                vx = _float(advanced["velocity"].get("x"))
+                vy = _float(advanced["velocity"].get("y"))
+                speed = ((vx * vx) + (vy * vy)) ** 0.5
+            advanced["distance_traveled"] = max(0.0, _float(advanced.get("distance_traveled")) + (speed * dt))
+    return advanced
+
+
+def _timeline_delta(previous: Mapping[str, Any], at: float) -> float:
+    return max(0.0, float(at) - _float(previous.get("now", previous.get("at", at)), float(at)))
+
+
+def _advance_snapshot(snapshot: dict[str, Any], dt: float) -> None:
+    if dt <= 0.0:
+        return
+    for field in ("ships", "projectiles"):
+        collection = snapshot.get(field)
+        if not isinstance(collection, dict):
+            continue
+        for item_id, item in list(collection.items()):
+            if isinstance(item, Mapping):
+                collection[str(item_id)] = _advance_collection_item(field, item, dt)
 
 
 def make_delta_frame(previous: Mapping[str, Any], current: Mapping[str, Any], *, tick: int, at: float) -> ReplayFrame:
     normalized_current = normalize_snapshot(current, tick=tick, at=at)
     patch: dict[str, Any] = {}
     removed: dict[str, list[str]] = {}
+    dt = _timeline_delta(previous, at)
 
     for field in COLLECTION_FIELDS:
         previous_items = _mapping_or_empty(previous.get(field))
@@ -54,7 +134,8 @@ def make_delta_frame(previous: Mapping[str, Any], current: Mapping[str, Any], *,
             if not isinstance(previous_item, Mapping):
                 updates[sid] = deepcopy(dict(current_item))
                 continue
-            item_patch = _object_delta(previous_item, current_item)
+            predicted_previous_item = _advance_collection_item(field, previous_item, dt)
+            item_patch = _object_delta(predicted_previous_item, current_item)
             if item_patch:
                 updates[sid] = item_patch
         removed_ids = sorted(str(item_id) for item_id in previous_items.keys() if item_id not in current_items)
@@ -86,6 +167,8 @@ def apply_frame(previous: Mapping[str, Any] | None, frame: ReplayFrame) -> dict[
         return normalize_snapshot(frame.world, tick=frame.tick, at=frame.at)
 
     snapshot = deepcopy(dict(previous or {}))
+    dt = _timeline_delta(snapshot, frame.at)
+    _advance_snapshot(snapshot, dt)
     snapshot["tick"] = int(frame.tick)
     snapshot["now"] = float(frame.at)
 

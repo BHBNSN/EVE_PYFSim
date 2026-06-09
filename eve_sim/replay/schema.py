@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -110,13 +110,4 @@ class ReplayFrame:
                 for key, value in (data.get("removed", {}) or {}).items()
                 if isinstance(value, list)
             },
-        )
-
-    @classmethod
-    def from_snapshot(cls, snapshot: ReplaySnapshot) -> "ReplayFrame":
-        return cls(
-            tick=int(snapshot.tick),
-            at=float(snapshot.at),
-            kind="keyframe",
-            world=deepcopy(snapshot.snapshot),
         )

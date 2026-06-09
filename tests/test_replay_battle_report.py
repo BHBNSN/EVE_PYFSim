@@ -135,6 +135,12 @@ def test_replay_recorder_round_trips_events(tmp_path) -> None:
 
     assert loaded.to_dict() == recorder.to_dict()
     assert '"snapshots"' not in raw_saved
+    assert '"schema_version"' not in raw_saved
+    assert '"source_id"' not in raw_saved
+    assert '"ship_name"' not in raw_saved
+    assert '"v":4' in raw_saved
+    assert '"si":"blue-1"' in raw_saved
+    assert '"sn":"Rifter"' in raw_saved
     assert loaded.to_dict()["frames"][0]["kind"] == "keyframe"
     assert loaded.to_dict()["frames"][1]["kind"] == "delta"
     assert "ship_name" not in loaded.to_dict()["frames"][1]["patch"]["ships"]["blue-1"]
@@ -145,27 +151,63 @@ def test_replay_recorder_round_trips_events(tmp_path) -> None:
     assert player.snapshot_at_index(10).snapshot["ships"]["blue-1"]["position"] == {"x": 20.0, "y": 25.0}
 
 
-def test_replay_player_reads_legacy_v2_snapshots() -> None:
-    legacy = {
-        "schema_version": 2,
-        "scenario_id": "legacy",
-        "events": [],
-        "snapshots": [
-            {
-                "tick": 1,
-                "at": 0.5,
-                "snapshot": {"tick": 1, "now": 0.5, "ships": {}},
+def test_replay_delta_recomputes_predictable_motion_and_module_timers() -> None:
+    recorder = ReplayRecorder("predictive")
+    first = {
+        "tick": 1,
+        "now": 1.0,
+        "ships": {
+            "blue-1": {
+                "ship_id": "blue-1",
+                "team": "BLUE",
+                "squad_id": "SQ1",
+                "ship_name": "Rifter",
+                "alive": True,
+                "position": {"x": 0.0, "y": 0.0},
+                "velocity": {"x": 10.0, "y": -5.0},
+                "module_cycle_timers": {"gun-1": 5.0},
+                "shield": 50.0,
+                "armor": 40.0,
+                "structure": 30.0,
+                "shield_max": 100.0,
+                "armor_max": 100.0,
+                "structure_max": 100.0,
             }
-        ],
+        },
+    }
+    second = {
+        "tick": 2,
+        "now": 2.0,
+        "ships": {
+            "blue-1": {
+                "ship_id": "blue-1",
+                "team": "BLUE",
+                "squad_id": "SQ1",
+                "ship_name": "Rifter",
+                "alive": True,
+                "position": {"x": 10.0, "y": -5.0},
+                "velocity": {"x": 10.0, "y": -5.0},
+                "module_cycle_timers": {"gun-1": 4.0},
+                "shield": 50.0,
+                "armor": 40.0,
+                "structure": 30.0,
+                "shield_max": 100.0,
+                "armor_max": 100.0,
+                "structure_max": 100.0,
+            }
+        },
     }
 
-    recorder = ReplayRecorder.from_dict(legacy)
-    player = ReplayPlayer.from_dict(legacy)
+    recorder.record_snapshot(first)
+    recorder.record_snapshot(second, force_frame=True)
 
-    assert recorder.frame_count == 1
-    assert recorder.to_dict()["frames"][0]["kind"] == "keyframe"
-    assert player.snapshot_count == 1
-    assert player.snapshot_at_index(0).snapshot == {"tick": 1, "now": 0.5, "ships": {}}
+    assert recorder.frame_count == 2
+    assert recorder.to_dict()["frames"][1]["patch"] == {}
+
+    player = ReplayPlayer.from_dict(recorder.to_dict())
+    resolved = player.snapshot_at_index(1).snapshot["ships"]["blue-1"]
+    assert resolved["position"] == {"x": 10.0, "y": -5.0}
+    assert resolved["module_cycle_timers"] == {"gun-1": 4.0}
 
 
 def test_battle_report_service_aggregates_event_stream() -> None:
