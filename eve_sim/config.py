@@ -7,9 +7,10 @@ import os
 
 @dataclass(slots=True)
 class EngineConfig:
-    tick_rate: int = 30
+    tick_rate: int = 1
     physics_substeps: int = 1
     lockstep: bool = True
+    tidi_min_factor: float = 0.1
     detailed_logging: bool = False
     hotspot_logging: bool = False
     detail_log_file: str = "logs/sim_detail.log"

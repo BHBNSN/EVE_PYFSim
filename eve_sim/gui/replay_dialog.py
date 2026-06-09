@@ -42,7 +42,7 @@ class ReplayPlaybackDialog(QDialog):
         )
         self.engine = SimulationEngine(
             self.world,
-            EngineConfig(tick_rate=30, physics_substeps=1),
+            EngineConfig(physics_substeps=1),
             CombatSystem(PyfaBridge()),
         )
 

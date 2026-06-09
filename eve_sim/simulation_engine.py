@@ -31,8 +31,50 @@ class SimulationEngine:
         )
         self.logistics = LogisticsSystem()
 
-        self._dt = 1.0 / config.tick_rate
+        self.tidi_factor: float = 1.0
+        self.last_step_ms: float = 0.0
+        self.last_step_budget_ms: float = self.nominal_tick_interval_ms()
+        self._dt = 1.0 / float(self._configured_tick_rate())
         prewarm_world_base_cache(world)
+
+    def _configured_tick_rate(self) -> int:
+        try:
+            return max(1, int(float(self.config.tick_rate)))
+        except Exception:
+            return 1
+
+    def refresh_timing_from_config(self) -> None:
+        self._dt = 1.0 / float(self._configured_tick_rate())
+        self.last_step_budget_ms = self.nominal_tick_interval_ms()
+
+    def nominal_tick_interval_ms(self) -> float:
+        return 1000.0 / float(self._configured_tick_rate())
+
+    def tidi_tick_interval_ms(self) -> int:
+        factor = max(self._configured_tidi_min_factor(), min(1.0, float(self.tidi_factor or 1.0)))
+        return max(1, int(round(self.nominal_tick_interval_ms() / factor)))
+
+    def next_tick_delay_ms(self) -> int:
+        return max(1, int(round(float(self.tidi_tick_interval_ms()) - float(self.last_step_ms))))
+
+    def _configured_tidi_min_factor(self) -> float:
+        try:
+            return max(0.01, min(1.0, float(self.config.tidi_min_factor)))
+        except Exception:
+            return 0.1
+
+    def update_tidi_after_step(self, elapsed_ms: float) -> None:
+        try:
+            elapsed = max(0.0, float(elapsed_ms))
+        except Exception:
+            elapsed = 0.0
+        budget = self.nominal_tick_interval_ms()
+        self.last_step_ms = elapsed
+        self.last_step_budget_ms = budget
+        if elapsed <= 0.0 or elapsed <= budget:
+            self.tidi_factor = 1.0
+            return
+        self.tidi_factor = max(self._configured_tidi_min_factor(), min(1.0, budget / elapsed))
 
     def _log_hotspot(self, name: str, start_time: float, **fields) -> None:
         if not bool(getattr(self.config, "hotspot_logging", False)):

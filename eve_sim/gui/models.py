@@ -19,7 +19,7 @@ class UiState:
 
 @dataclass(slots=True)
 class UiPreferences:
-    config_version: int = 7
+    config_version: int = 8
     selected_squad: str = "BLUE-ALPHA"
     selected_map_id: str = "dual_system_crossroads"
     filter_team: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"] = "ALL"
@@ -30,7 +30,7 @@ class UiPreferences:
     sort_order: str = "ASC"
     zoom: float | None = None
     language: str = "zh_CN"
-    engine_tick_rate: int = 30
+    engine_tick_rate: int = 1
     engine_physics_substeps: int = 1
     engine_lockstep: bool = True
     engine_detailed_logging: bool = True
@@ -65,7 +65,7 @@ class AreaCycleOverlay:
 
 
 class PreferencesStore:
-    CURRENT_VERSION = 7
+    CURRENT_VERSION = 8
 
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
@@ -83,6 +83,13 @@ class PreferencesStore:
                 migrated["filter_team"] = legacy_team
             else:
                 migrated["filter_team"] = "ALL"
+        if version < 8:
+            try:
+                legacy_tick_rate = int(float(migrated.get("engine_tick_rate", 30)))
+            except Exception:
+                legacy_tick_rate = 30
+            if legacy_tick_rate == 30:
+                migrated["engine_tick_rate"] = 1
         migrated["config_version"] = self.CURRENT_VERSION
         return migrated
 

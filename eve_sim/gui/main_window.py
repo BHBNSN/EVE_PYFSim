@@ -176,21 +176,27 @@ class MainWindow(QMainWindow):
         self.ui_state = UiState(selected_squad=self.prefs.selected_squad, selected_enemy_target=None)
         self.setWindowTitle(QCoreApplication.translate("eve_sim", 'EVE SIM - Continuous Space Wargame'))
         self.resize(ui_cfg.width + 560, ui_cfg.height)
-        self._ui_refresh_interval_ticks = 3
-        self._overview_refresh_interval_ticks = 3
+        try:
+            configured_tick_rate = max(1, int(float(getattr(self.engine.config, "tick_rate", 1) or 1)))
+        except Exception:
+            configured_tick_rate = 1
+        refresh_interval_ticks = 3 if self.network_mode == "client" else max(1, int(round(configured_tick_rate / 10.0)))
+        self._ui_refresh_interval_ticks = refresh_interval_ticks
+        self._overview_refresh_interval_ticks = refresh_interval_ticks
         self._ui_tick_counter = 0
         self._last_overview_rows: list[dict] = []
         self._ship_type_display_cache: dict[tuple[str, str], str] = {}
         self._status_dialogs: dict[str, ShipStatusDialog] = {}
         self._step_ms_ema: float = 0.0
+        self._remote_tidi_factor: float = 1.0
+        self._client_poll_interval_ms: int = 50
         self._pending_tick_ops: list[Callable[[], None]] = []
         self._setup_synced = False
-        self._last_network_send_at: float = 0.0
-        self._last_full_sync_at: float = 0.0
-        self._network_send_interval_sec: float = 1.0 / 20.0
-        self._network_full_sync_interval_sec: float = 1.0
+        self._last_full_snapshot_sync_at: float = 0.0
+        self._snapshot_full_sync_interval_sec: float = 30.0
         self._last_sent_ship_signatures: dict[str, tuple] = {}
         self._last_sent_fit_texts: dict[str, str] = {}
+        self._last_roster_refresh_tick: int | None = None
         self._lan_debug_enabled = False
         self._view_system_id: str = ""
         self._battle_recorder = ReplayRecorder(self._new_recording_scenario_id(), keyframe_interval_s=30.0)
@@ -251,7 +257,7 @@ class MainWindow(QMainWindow):
 
         self.tick_timer = QTimer(self)
         self.tick_timer.timeout.connect(self.on_tick)
-        self.tick_timer.start(int(1000 / self.engine.config.tick_rate))
+        self.tick_timer.start(self._tick_timer_interval_ms())
 
         self.render_timer = QTimer(self)
         self.render_timer.timeout.connect(self.on_render_frame)
@@ -3444,6 +3450,12 @@ class MainWindow(QMainWindow):
             cfg_payload = lan.get("engine_config")
             if isinstance(cfg_payload, dict):
                 self._apply_host_engine_config(cfg_payload)
+            try:
+                self._remote_tidi_factor = max(0.0, min(1.0, float(lan.get("tidi_factor", self._remote_tidi_factor))))
+                if hasattr(self.engine, "tidi_factor"):
+                    self.engine.tidi_factor = self._remote_tidi_factor
+            except Exception:
+                pass
             map_payload = lan.get("map")
             if isinstance(map_payload, dict):
                 try:
@@ -3758,12 +3770,90 @@ class MainWindow(QMainWindow):
             tuple(sorted((str(k), str(v)) for k, v in module_target_modes.items())),
         )
 
+    @staticmethod
+    def _format_tidi_percent(tidi_factor: float) -> str:
+        try:
+            factor = float(tidi_factor)
+        except Exception:
+            factor = 1.0
+        factor = max(0.0, min(1.0, factor))
+        return f"{factor * 100.0:.0f}%"
+
+    def _effective_tidi_factor(self) -> float:
+        if self.network_mode == "client":
+            value = getattr(self, "_remote_tidi_factor", getattr(self.engine, "tidi_factor", 1.0))
+        else:
+            value = getattr(self.engine, "tidi_factor", 1.0)
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 1.0
+
+    def _tick_timer_interval_ms(self) -> int:
+        if self.network_mode == "client":
+            return max(1, int(getattr(self, "_client_poll_interval_ms", 50)))
+        if hasattr(self.engine, "next_tick_delay_ms"):
+            return int(self.engine.next_tick_delay_ms())
+        if hasattr(self.engine, "tidi_tick_interval_ms"):
+            return int(self.engine.tidi_tick_interval_ms())
+        try:
+            tick_rate = max(1, int(float(self.engine.config.tick_rate)))
+        except Exception:
+            tick_rate = 1
+        return max(1, int(round(1000.0 / float(tick_rate))))
+
+    def _reschedule_tick_timer(self) -> None:
+        timer = getattr(self, "tick_timer", None)
+        if timer is not None:
+            timer.setInterval(self._tick_timer_interval_ms())
+
+    def _status_tidi_text(self) -> str:
+        return f"TiDi: {self._format_tidi_percent(self._effective_tidi_factor())}"
+
+    def _refresh_sim_status(self) -> None:
+        if not hasattr(self, "status") or not hasattr(self, "canvas"):
+            return
+        alive_blue = 0
+        alive_red = 0
+        total_ships = 0
+        for ship in self.engine.world.ships.values():
+            total_ships += 1
+            if not ship.vital.alive:
+                continue
+            if ship.team == Team.BLUE:
+                alive_blue += 1
+            elif ship.team == Team.RED:
+                alive_red += 1
+        tick = self.engine.world.tick
+        self.status.setText(
+            f"{QCoreApplication.translate("eve_sim", 'Tick')}: {tick} | {QCoreApplication.translate("eve_sim", 'Ships')}: {total_ships} | "
+            f"{QCoreApplication.translate("eve_sim", 'BLUE')}: {alive_blue} | {QCoreApplication.translate("eve_sim", 'RED')}: {alive_red} | "
+            f"{self._status_tidi_text()} | {QCoreApplication.translate("eve_sim", 'Zoom')}: {self.canvas.zoom:.2f} | "
+            f"{QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f}"
+        )
+
+    def _set_waiting_status(self, message: str) -> None:
+        self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: {message} | {self._status_tidi_text()}")
+
+    def _refresh_roster_for_current_tick(self) -> None:
+        try:
+            tick = int(self.engine.world.tick)
+        except Exception:
+            return
+        if tick <= 0 or (tick % 10) != 0:
+            return
+        if getattr(self, "_last_roster_refresh_tick", None) == tick:
+            return
+        self.refresh_blue_roster()
+        self._last_roster_refresh_tick = tick
+
     def _engine_config_payload(self) -> dict[str, object]:
         cfg = self.engine.config
         return {
             "tick_rate": int(cfg.tick_rate),
             "physics_substeps": int(cfg.physics_substeps),
             "lockstep": bool(cfg.lockstep),
+            "tidi_min_factor": float(getattr(cfg, "tidi_min_factor", 0.1)),
             "detailed_logging": bool(cfg.detailed_logging),
             "hotspot_logging": bool(cfg.hotspot_logging),
             "detail_log_file": str(cfg.detail_log_file),
@@ -3786,11 +3876,15 @@ class MainWindow(QMainWindow):
             merge_window = max(0.1, float(payload.get("log_merge_window_sec", self.engine.config.log_merge_window_sec)))
         except Exception:
             merge_window = max(0.1, float(self.engine.config.log_merge_window_sec))
+        try:
+            tidi_min_factor = max(0.01, min(1.0, float(payload.get("tidi_min_factor", self.engine.config.tidi_min_factor))))
+        except Exception:
+            tidi_min_factor = max(0.01, min(1.0, float(getattr(self.engine.config, "tidi_min_factor", 0.1))))
 
-        old_tick_rate = int(self.engine.config.tick_rate)
         self.engine.config.tick_rate = tick_rate
         self.engine.config.physics_substeps = substeps
         self.engine.config.lockstep = bool(payload.get("lockstep", self.engine.config.lockstep))
+        self.engine.config.tidi_min_factor = tidi_min_factor
         self.engine.config.detailed_logging = bool(payload.get("detailed_logging", self.engine.config.detailed_logging))
         self.engine.config.hotspot_logging = bool(payload.get("hotspot_logging", self.engine.config.hotspot_logging))
         self.engine.config.detail_log_file = str(payload.get("detail_log_file", self.engine.config.detail_log_file))
@@ -3806,29 +3900,27 @@ class MainWindow(QMainWindow):
             self.engine.config.hotspot_logging,
         )
 
-        if hasattr(self.engine, "_dt"):
+        if hasattr(self.engine, "refresh_timing_from_config"):
+            self.engine.refresh_timing_from_config()
+        elif hasattr(self.engine, "_dt"):
             self.engine._dt = 1.0 / float(tick_rate)
-
-        if old_tick_rate != tick_rate:
-            self.tick_timer.setInterval(max(1, int(1000 / tick_rate)))
+        if hasattr(self, "_reschedule_tick_timer"):
+            self._reschedule_tick_timer()
 
     def _send_host_state(self, countdown_left: float | None = None, started: bool = True) -> None:
         if self.lan_server is None:
             return
         if not self.lan_server.client_connected:
-            self._last_network_send_at = 0.0
-            self._last_full_sync_at = 0.0
+            self._last_full_snapshot_sync_at = 0.0
             self._last_sent_ship_signatures.clear()
             self._last_sent_fit_texts.clear()
             return
         now = time.perf_counter()
         countdown_active = (countdown_left is not None) and (float(countdown_left) > 0.0)
-        if not countdown_active and (now - self._last_network_send_at) < self._network_send_interval_sec:
-            return
 
         full_sync = (
             countdown_active
-            or (now - self._last_full_sync_at) >= self._network_full_sync_interval_sec
+            or (now - self._last_full_snapshot_sync_at) >= self._snapshot_full_sync_interval_sec
             or not self._last_sent_ship_signatures
         )
 
@@ -3872,6 +3964,7 @@ class MainWindow(QMainWindow):
             "lan": {
                 "started": bool(started),
                 "countdown_left": float(max(0.0, countdown_left or 0.0)),
+                "tidi_factor": float(self._effective_tidi_factor()),
                 "engine_config": self._engine_config_payload(),
                 "map": (
                     serialize_map_definition(self.engine.world.map_definition)
@@ -3884,15 +3977,15 @@ class MainWindow(QMainWindow):
             f"send-snapshot ships={len(ships_out)} full={full_sync} removed={len(removed_ship_ids)} countdown={countdown_left} started={started}"
         )
         self.lan_server.send_state(packet)
-        self._last_network_send_at = now
         if full_sync:
-            self._last_full_sync_at = now
+            self._last_full_snapshot_sync_at = now
         self._last_sent_ship_signatures = next_signatures
         self._last_sent_fit_texts = {sid: self._ship_fit_texts.get(sid, "") for sid in next_signatures.keys()}
 
     def on_tick(self) -> None:
         self._flush_tick_ops()
         if self.network_mode == "client":
+            received_authoritative_snapshot = False
             if self.lan_client is None or not self.lan_client.connected:
                 self._setup_synced = False
             if not self._setup_synced and self.lan_client is not None and self.lan_client.connected:
@@ -3902,16 +3995,23 @@ class MainWindow(QMainWindow):
                 packet = self.lan_client.consume_latest_state()
                 if packet is not None:
                     self._apply_remote_snapshot(packet)
+                    received_authoritative_snapshot = True
+                    if hasattr(self, "canvas") and hasattr(self.canvas, "note_authoritative_frame"):
+                        self.canvas.note_authoritative_frame()
             self._update_approach_targets()
             self._ui_tick_counter += 1
             if (self._ui_tick_counter % self._ui_refresh_interval_ticks) == 0:
                 self._sync_blue_squads()
             if (self._ui_tick_counter % self._overview_refresh_interval_ticks) == 0:
                 self.request_overview_refresh(force=True)
-            if self.engine.world.tick % 10 == 0:
+            if hasattr(self, "_refresh_roster_for_current_tick"):
+                self._refresh_roster_for_current_tick()
+            elif self.engine.world.tick % 10 == 0:
                 self.refresh_blue_roster()
-            if hasattr(self, "_record_battle_snapshot"):
+            if received_authoritative_snapshot and hasattr(self, "_record_battle_snapshot"):
                 self._record_battle_snapshot()
+            if hasattr(self, "_refresh_sim_status") and (self._ui_tick_counter % self._ui_refresh_interval_ticks) == 0:
+                self._refresh_sim_status()
             return
 
         if self.network_mode == "host" and self.lan_server is not None:
@@ -3921,13 +4021,13 @@ class MainWindow(QMainWindow):
             if not self.lan_server.client_connected:
                 self._countdown_started_at = None
                 self._match_started = False
-                self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: waiting for red client...")
+                self._set_waiting_status("waiting for red client...")
                 self._send_host_state(countdown_left=10.0, started=False)
                 return
             if not has_remote_red:
                 self._countdown_started_at = None
                 self._match_started = False
-                self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: waiting for red fleet sync...")
+                self._set_waiting_status("waiting for red fleet sync...")
                 self._send_host_state(countdown_left=10.0, started=False)
                 return
             if not self._match_started:
@@ -3936,7 +4036,7 @@ class MainWindow(QMainWindow):
                     self._countdown_started_at = now
                 left = 10.0 - (now - self._countdown_started_at)
                 if left > 0:
-                    self.status.setText(f"{QCoreApplication.translate("eve_sim", 'Tick')}: match starts in {left:.1f}s")
+                    self._set_waiting_status(f"match starts in {left:.1f}s")
                     self._send_host_state(countdown_left=left, started=False)
                     return
                 self._match_started = True
@@ -3945,11 +4045,17 @@ class MainWindow(QMainWindow):
 
         t0 = time.perf_counter()
         self.engine.step()
+        if hasattr(self, "canvas") and hasattr(self.canvas, "note_authoritative_frame"):
+            self.canvas.note_authoritative_frame()
         step_ms = (time.perf_counter() - t0) * 1000.0
         if self._step_ms_ema <= 0:
             self._step_ms_ema = step_ms
         else:
             self._step_ms_ema = self._step_ms_ema * 0.85 + step_ms * 0.15
+        if hasattr(self.engine, "update_tidi_after_step"):
+            self.engine.update_tidi_after_step(step_ms)
+        if hasattr(self, "_reschedule_tick_timer"):
+            self._reschedule_tick_timer()
 
         if self.network_mode == "host":
             self._send_host_state(countdown_left=0.0, started=True)
@@ -3963,29 +4069,15 @@ class MainWindow(QMainWindow):
 
         if refresh_ui:
             self._refresh_propulsion_button_text()
-            lang = self.current_language()
-            alive_blue = 0
-            alive_red = 0
-            total_ships = 0
-            for ship in self.engine.world.ships.values():
-                total_ships += 1
-                if not ship.vital.alive:
-                    continue
-                if ship.team == Team.BLUE:
-                    alive_blue += 1
-                elif ship.team == Team.RED:
-                    alive_red += 1
-            tick = self.engine.world.tick
-            self.status.setText(
-                f"{QCoreApplication.translate("eve_sim", 'Tick')}: {tick} | {QCoreApplication.translate("eve_sim", 'Ships')}: {total_ships} | "
-                f"{QCoreApplication.translate("eve_sim", 'BLUE')}: {alive_blue} | {QCoreApplication.translate("eve_sim", 'RED')}: {alive_red} | "
-                f"{QCoreApplication.translate("eve_sim", 'Zoom')}: {self.canvas.zoom:.2f} | {QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f}"
-            )
+        if hasattr(self, "_refresh_sim_status"):
+            self._refresh_sim_status()
 
         if refresh_overview:
             self.request_overview_refresh()
 
-        if self.engine.world.tick % 10 == 0:
+        if hasattr(self, "_refresh_roster_for_current_tick"):
+            self._refresh_roster_for_current_tick()
+        elif self.engine.world.tick % 10 == 0:
             self.refresh_blue_roster()
 
         if self.ui_state.selected_enemy_target:

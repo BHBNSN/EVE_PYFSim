@@ -176,6 +176,7 @@ class BattleCanvas(QWidget):
         self._bg_cache_w = 0
         self._bg_cache_h = 0
         self._area_cycle_overlays: dict[tuple[str, str], AreaCycleOverlay] = {}
+        self._authoritative_frame_wall_time = time.perf_counter()
 
     @staticmethod
     def _focus_key(team: Team, squad_id: str) -> str:
@@ -330,6 +331,36 @@ class BattleCanvas(QWidget):
     def _current_system_center(self) -> Vector2:
         return Vector2(0.0, 0.0)
 
+    def note_authoritative_frame(self) -> None:
+        self._authoritative_frame_wall_time = time.perf_counter()
+
+    def _render_lookahead_s(self) -> float:
+        try:
+            elapsed_wall = max(0.0, time.perf_counter() - float(self._authoritative_frame_wall_time))
+        except Exception:
+            return 0.0
+        try:
+            tidi_factor = max(0.0, min(1.0, float(getattr(self.engine, "tidi_factor", 1.0) or 1.0)))
+        except Exception:
+            tidi_factor = 1.0
+        try:
+            max_dt = max(0.0, float(getattr(self.engine, "_dt", 1.0)))
+        except Exception:
+            max_dt = 1.0
+        return max(0.0, min(max_dt, elapsed_wall * tidi_factor))
+
+    def _project_position(self, position: Vector2, velocity: Vector2 | None) -> Vector2:
+        dt = self._render_lookahead_s()
+        if dt <= 1e-6 or velocity is None:
+            return position
+        return Vector2(float(position.x) + float(velocity.x) * dt, float(position.y) + float(velocity.y) * dt)
+
+    def _ship_render_position(self, ship: ShipEntity) -> Vector2:
+        return self._project_position(ship.nav.position, ship.nav.velocity)
+
+    def _projectile_render_position(self, projectile) -> Vector2:
+        return self._project_position(projectile.position, getattr(projectile, "velocity", None))
+
     def world_scale(self) -> float:
         return max(1e-12, float(self.zoom) * float(self._ZOOM_WORLD_SCALE_BASE))
 
@@ -343,7 +374,7 @@ class BattleCanvas(QWidget):
                 continue
             if not self._matches_current_view_system(getattr(ship.nav, "system_id", "")):
                 continue
-            sx, sy = self._to_screen(ship.nav.position)
+            sx, sy = self._to_screen(self._ship_render_position(ship))
             dx = sx - p.x()
             dy = sy - p.y()
             dist = (dx * dx + dy * dy) ** 0.5
@@ -829,7 +860,11 @@ class BattleCanvas(QWidget):
                 else:
                     progress = 1.0
                 radius_px = max(1.0, float(overlay.radius_m) * scale * progress)
-                rect = self._screen_circle_rect(overlay.center, radius_px)
+                center = overlay.center
+                ship = self.engine.world.ships.get(str(getattr(overlay, "ship_id", "") or ""))
+                if ship is not None:
+                    center = self._ship_render_position(ship)
+                rect = self._screen_circle_rect(center, radius_px)
                 if rect is None:
                     continue
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -880,7 +915,7 @@ class BattleCanvas(QWidget):
                     continue
                 projectile_color, _trail_color = self._projectile_colors(projectile.kind)
                 radius_px = 3.0 if str(projectile.kind) == "bomb" else 2.0
-                rect = self._screen_circle_rect(projectile.position, radius_px)
+                rect = self._screen_circle_rect(self._projectile_render_position(projectile), radius_px)
                 if rect is None:
                     continue
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -889,7 +924,7 @@ class BattleCanvas(QWidget):
 
             leader_ship = self._selected_squad_leader_ship()
             if leader_ship is not None:
-                leader_point = self._screen_point_if_visible(leader_ship.nav.position, 1.0)
+                leader_point = self._screen_point_if_visible(self._ship_render_position(leader_ship), 1.0)
                 if leader_point is not None:
                     cx, cy = leader_point
                 else:
@@ -954,7 +989,7 @@ class BattleCanvas(QWidget):
             visible_ships.sort(key=self._ship_draw_priority)
             for ship in visible_ships:
                 color = self._ship_draw_color(ship, controlled_team, self.selected_squad)
-                point = self._screen_point_if_visible(ship.nav.position, self._SHIP_ICON_SIZE_PX)
+                point = self._screen_point_if_visible(self._ship_render_position(ship), self._SHIP_ICON_SIZE_PX)
                 if point is None:
                     continue
                 x, y = point
@@ -1005,7 +1040,7 @@ class BattleCanvas(QWidget):
 
             guidance_target = self.squad_guidance_target_getter(self.selected_squad)
             if leader_ship is not None and guidance_target is not None:
-                start_point = self._screen_point_if_visible(leader_ship.nav.position, 1.0)
+                start_point = self._screen_point_if_visible(self._ship_render_position(leader_ship), 1.0)
                 end_point = self._screen_point_if_visible(guidance_target, 1.0)
                 if start_point is not None and end_point is not None:
                     painter.setPen(QPen(QColor(120, 210, 255), 2, Qt.PenStyle.DashLine))
