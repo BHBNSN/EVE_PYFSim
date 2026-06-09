@@ -1,0 +1,26 @@
+{
+  "scenario_id": "combat_runtime_smoke",
+  "duration_s": 6.0,
+  "total_damage_by_team": {
+    "BLUE": 115.0
+  },
+  "rep_applied_by_team": {
+    "BLUE": 25.0
+  },
+  "jam_uptime_by_target": {
+    "red-1": 20.0
+  },
+  "burst_coverage_by_effect": {
+    "Shield Harmonizing": 60.0
+  },
+  "ship_deaths": [
+    {
+      "tick": 6,
+      "at": 6.0,
+      "ship_id": "red-1",
+      "source_id": "blue-1",
+      "module_id": "gun-1",
+      "team": "RED"
+    }
+  ]
+}
