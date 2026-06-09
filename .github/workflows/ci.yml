@@ -9,6 +9,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout pyfa source
+        uses: actions/checkout@v4
+        with:
+          repository: pyfa-org/Pyfa
+          ref: v2.66.4
+          path: Pyfa-master
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -16,6 +22,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Restore pyfa database
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath third_party/pyfa/eve_db.zip -DestinationPath Pyfa-master -Force
+          if (-not (Test-Path -LiteralPath Pyfa-master/eve.db)) {
+            throw "Pyfa eve.db was not restored"
+          }
+      - name: Validate data manifest
+        run: |
+          python -c "from eve_sim.sde_manifest import validate_default_manifest; errors = validate_default_manifest(); print(errors); raise SystemExit(1 if errors else 0)"
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen

@@ -1,6 +1,6 @@
 {
   "sde_build": null,
-  "pyfa_version": null,
-  "eve_db_sha256": null,
-  "eve_db_size": null
+  "pyfa_version": "v2.66.4",
+  "eve_db_sha256": "add72e0334e6ffe2d138c3ae2c2de1704d930a47aaa0e0ff082428a1256045df",
+  "eve_db_size": 99368960
 }

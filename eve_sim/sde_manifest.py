@@ -45,12 +45,28 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _read_pyfa_version(root: Path) -> str | None:
+    version_file = root / "version.yml"
+    if not version_file.exists():
+        return None
+    for line in version_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip().startswith("version:"):
+            continue
+        return line.split(":", 1)[1].strip() or None
+    return None
+
+
 def build_current_manifest(pyfa_root: str | Path | None = None) -> DataVersionManifest:
     root = Path(pyfa_root) if pyfa_root is not None else resolve_pyfa_source_dir()
     eve_db = root / "eve.db"
+    pyfa_version = _read_pyfa_version(root)
     if not eve_db.exists():
-        return DataVersionManifest()
-    return DataVersionManifest(eve_db_sha256=_sha256(eve_db), eve_db_size=eve_db.stat().st_size)
+        return DataVersionManifest(pyfa_version=pyfa_version)
+    return DataVersionManifest(
+        pyfa_version=pyfa_version,
+        eve_db_sha256=_sha256(eve_db),
+        eve_db_size=eve_db.stat().st_size,
+    )
 
 
 def load_manifest(path: str | Path = DEFAULT_MANIFEST_PATH) -> DataVersionManifest:
