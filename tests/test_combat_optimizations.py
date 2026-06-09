@@ -3237,6 +3237,75 @@ Small Auxiliary Thrusters II
         self.assertAlmostEqual(ship.nav.velocity.x, expected_x, places=6)
         self.assertAlmostEqual(ship.nav.velocity.y, expected_y, places=6)
 
+    def test_orbit_command_uses_stable_orbit_speed_below_max_speed(self) -> None:
+        ship = _make_ship("ship-orbit", [], team=Team.BLUE)
+        target = _make_ship("ship-orbit-target", [], team=Team.RED)
+        _set_motion_state(ship, max_speed=1_000.0, mass=10_000_000.0, agility=0.5)
+        target.nav.position = Vector2(0.0, 0.0)
+        ship.nav.position = Vector2(1_120.0, 0.0)
+        ship.nav.command_target = Vector2(target.nav.position.x, target.nav.position.y)
+        ship.nav.command_mode = "orbit"
+        ship.nav.command_target_ship_id = target.ship_id
+        ship.nav.command_range_m = 1_000.0
+        world = WorldState(ships={ship.ship_id: ship, target.ship_id: target})
+        movement = MovementSystem()
+
+        desired_velocity, _ = movement._desired_navigation_velocity(world, ship, ship.nav.max_speed, movement._motion_tau(ship, ship.nav.max_speed))
+        movement.run(world, 1.0)
+
+        self.assertGreater(desired_velocity.length(), 0.0)
+        self.assertLess(desired_velocity.length(), ship.nav.max_speed)
+        self.assertGreater(ship.nav.velocity.y, 0.0)
+        self.assertLess(ship.nav.velocity.length(), ship.nav.max_speed)
+
+    def test_orbit_command_approaches_straight_before_capture_band(self) -> None:
+        ship = _make_ship("ship-orbit-entry", [], team=Team.BLUE)
+        target = _make_ship("ship-orbit-entry-target", [], team=Team.RED)
+        _set_motion_state(ship, max_speed=1_000.0, mass=10_000_000.0, agility=0.5)
+        target.nav.position = Vector2(0.0, 0.0)
+        ship.nav.position = Vector2(10_000.0, 0.0)
+        ship.nav.command_target = Vector2(target.nav.position.x, target.nav.position.y)
+        ship.nav.command_mode = "orbit"
+        ship.nav.command_target_ship_id = target.ship_id
+        ship.nav.command_range_m = 1_000.0
+        world = WorldState(ships={ship.ship_id: ship, target.ship_id: target})
+        movement = MovementSystem()
+
+        desired_velocity, _ = movement._desired_navigation_velocity(world, ship, ship.nav.max_speed, movement._motion_tau(ship, ship.nav.max_speed))
+
+        self.assertLess(desired_velocity.x, 0.0)
+        self.assertAlmostEqual(desired_velocity.y, 0.0, places=6)
+        self.assertAlmostEqual(desired_velocity.length(), ship.nav.max_speed, places=6)
+
+    def test_keep_range_command_moves_out_when_close_and_in_when_far(self) -> None:
+        target = _make_ship("ship-keep-target", [], team=Team.RED)
+        target.nav.position = Vector2(0.0, 0.0)
+
+        close_ship = _make_ship("ship-keep-close", [], team=Team.BLUE)
+        _set_motion_state(close_ship, max_speed=500.0, mass=10_000_000.0, agility=0.5)
+        close_ship.nav.position = Vector2(2_000.0, 0.0)
+        close_ship.nav.command_target = Vector2(target.nav.position.x, target.nav.position.y)
+        close_ship.nav.command_mode = "keep_range"
+        close_ship.nav.command_target_ship_id = target.ship_id
+        close_ship.nav.command_range_m = 5_000.0
+
+        far_ship = _make_ship("ship-keep-far", [], team=Team.BLUE)
+        _set_motion_state(far_ship, max_speed=500.0, mass=10_000_000.0, agility=0.5)
+        far_ship.nav.position = Vector2(10_000.0, 0.0)
+        far_ship.nav.command_target = Vector2(target.nav.position.x, target.nav.position.y)
+        far_ship.nav.command_mode = "keep_range"
+        far_ship.nav.command_target_ship_id = target.ship_id
+        far_ship.nav.command_range_m = 5_000.0
+
+        world = WorldState(ships={close_ship.ship_id: close_ship, far_ship.ship_id: far_ship, target.ship_id: target})
+        close_start_x = close_ship.nav.position.x
+        far_start_x = far_ship.nav.position.x
+
+        MovementSystem().run(world, 1.0)
+
+        self.assertGreater(close_ship.nav.position.x, close_start_x)
+        self.assertLess(far_ship.nav.position.x, far_start_x)
+
     def test_movement_uses_updated_profile_mass_and_speed_cap(self) -> None:
         ship = _make_ship("ship-mass-feedback", [])
         _set_motion_state(ship, max_speed=500.0, mass=10_000_000.0, agility=0.5)

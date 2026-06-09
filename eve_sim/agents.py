@@ -50,6 +50,15 @@ class ShipAgent(BaseAgent):
             return True
         return leader.nav.velocity.length() > 5.0
 
+    @staticmethod
+    def _clear_navigation_command(ship: ShipEntity) -> None:
+        ship.nav.command_target = None
+        ship.nav.command_mode = "move"
+        ship.nav.command_target_ship_id = None
+        ship.nav.command_target_structure_id = None
+        ship.nav.command_range_m = 0.0
+        ship.nav.command_orbit_clockwise = True
+
     def sense(self, world: WorldState) -> None:
         ship = self._ship(world)
         self.perception_buffer = ship.perception.copy()
@@ -132,23 +141,33 @@ class ShipAgent(BaseAgent):
             ship.nav.warp.bubble_immune_snapshot = False
             ship.nav.warp.interdiction_snapshots_captured = False
             ship.nav.warp.interdiction_snapshots = tuple()
-            ship.nav.command_target = None
+            self._clear_navigation_command(ship)
             self.current_order = None
 
         if self.current_order and self.current_order.kind == "USE_STARGATE":
             target_structure_id = str(self.current_order.payload.get("target_structure_id", "") or "").strip()
             ship.nav.gate.target_structure_id = target_structure_id or None
-            ship.nav.command_target = None
+            self._clear_navigation_command(ship)
             self.current_order = None
 
         if str(getattr(ship.nav.warp, "phase", "idle") or "idle") != "idle":
             return
 
         if self.current_order and self.current_order.kind == "MOVE" and is_leader:
-            move_target = Vector2(self.current_order.payload["x"], self.current_order.payload["y"])
+            payload = self.current_order.payload
+            move_target = Vector2(float(payload["x"]), float(payload["y"]))
+            mode = str(payload.get("mode", "move") or "move").strip().lower()
+            ship.nav.command_mode = mode if mode in {"move", "approach", "keep_range", "orbit"} else "move"
+            ship.nav.command_target_ship_id = str(payload.get("target_ship_id", "") or "").strip() or None
+            ship.nav.command_target_structure_id = str(payload.get("target_structure_id", "") or "").strip() or None
+            ship.nav.command_range_m = max(0.0, float(payload.get("range_m", 0.0) or 0.0))
+            ship.nav.command_orbit_clockwise = bool(payload.get("orbit_clockwise", True))
             arrive_radius = max(120.0, ship.nav.radius * 1.5)
-            if ship.nav.position.distance_to(move_target) <= arrive_radius and ship.nav.velocity.length() <= 50.0:
+            if ship.nav.command_mode == "move" and ship.nav.position.distance_to(move_target) <= arrive_radius and ship.nav.velocity.length() <= 50.0:
                 ship.nav.command_target = None
+                ship.nav.command_target_ship_id = None
+                ship.nav.command_target_structure_id = None
+                ship.nav.command_range_m = 0.0
                 self.current_order = None
             else:
                 ship.nav.command_target = move_target
@@ -424,7 +443,16 @@ class CommanderAgent(BaseAgent):
                     ship.order_queue.append(
                         Order(
                             kind="MOVE",
-                            payload={"x": intent.target_position.x, "y": intent.target_position.y, "immediate": True},
+                            payload={
+                                "x": intent.target_position.x,
+                                "y": intent.target_position.y,
+                                "mode": str(intent.movement_mode or "move"),
+                                "target_ship_id": str(intent.target_ship_id or ""),
+                                "target_structure_id": str(intent.target_structure_id or ""),
+                                "range_m": max(0.0, float(intent.target_range_m or 0.0)),
+                                "orbit_clockwise": True,
+                                "immediate": True,
+                            },
                             issue_time=world.now,
                         )
                     )

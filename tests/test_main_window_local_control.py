@@ -490,10 +490,122 @@ class MainWindowLocalControlTests(unittest.TestCase):
             enemy_texts = [action.text() for action in enemy_menu.actions()]
             friendly_texts = [action.text() for action in friendly_menu.actions()]
 
-            self.assertEqual(len(friendly_texts), 2)
-            self.assertEqual(len(enemy_texts), 5)
+            self.assertEqual(len(friendly_texts), 5)
+            self.assertEqual(len(enemy_texts), 8)
+            self.assertEqual(len([action for action in enemy_menu.actions() if action.menu() is not None]), 2)
+            self.assertEqual(len([action for action in friendly_menu.actions() if action.menu() is not None]), 2)
             self.assertTrue(all(red_ship.ship_id in text for text in enemy_texts))
             self.assertTrue(all(blue_ship.ship_id in text for text in friendly_texts))
+        finally:
+            window.close()
+
+    @patch("eve_sim.gui.main_window.PreferencesStore.save", return_value=None)
+    @patch(
+        "eve_sim.gui.main_window.PreferencesStore.load",
+        return_value=UiPreferences(filter_team="ALL", selected_squad="BLUE-ALPHA"),
+    )
+    def test_ship_context_menu_orbit_range_action_sets_navigation_intent(
+        self,
+        _load,
+        _save,
+    ) -> None:
+        blue_ship = _make_runtime_ship("blue-1", Team.BLUE, "BLUE-ALPHA", Vector2(0.0, 0.0), "blue-fit")
+        red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
+        world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
+        world.squad_leaders[f"{Team.BLUE.value}:BLUE-ALPHA"] = blue_ship.ship_id
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        engine.register_commander(blue_commander)
+        engine.register_commander(red_commander)
+        for ship_id in world.ships:
+            engine.register_ship(ship_id)
+
+        window = MainWindow(
+            engine=engine,
+            ui_cfg=UiConfig(),
+            blue_commander=blue_commander,
+            red_commander=red_commander,
+            manual_setup=[],
+            network_mode="local",
+            controlled_team=Team.BLUE,
+        )
+
+        try:
+            window.tick_timer.stop()
+            window.render_timer.stop()
+            window._undeployed_ship_ids.clear()
+            window.ui_state.selected_squad = "BLUE-ALPHA"
+            window.canvas.selected_squad = "BLUE-ALPHA"
+
+            menu = window._build_ship_context_menu(red_ship.ship_id)
+            self.assertIsNotNone(menu)
+            orbit_action = next(action for action in menu.actions() if action.menu() is not None)
+            orbit_menu = orbit_action.menu()
+            self.assertIsNotNone(orbit_menu)
+            ten_km_action = next(action for action in orbit_menu.actions() if action.text() == "10 km")
+
+            ten_km_action.trigger()
+            window._flush_tick_ops()
+
+            intent = window.engine.world.intents[f"{Team.BLUE.value}:BLUE-ALPHA"]
+            self.assertEqual(intent.movement_mode, "orbit")
+            self.assertEqual(intent.target_ship_id, red_ship.ship_id)
+            self.assertIsNone(intent.target_structure_id)
+            self.assertEqual(intent.target_range_m, 10_000.0)
+            self.assertEqual(intent.target_position, red_ship.nav.position)
+        finally:
+            window.close()
+
+    @patch("eve_sim.gui.main_window.PreferencesStore.save", return_value=None)
+    @patch(
+        "eve_sim.gui.main_window.PreferencesStore.load",
+        return_value=UiPreferences(filter_team="ALL", selected_squad="BLUE-ALPHA"),
+    )
+    def test_guidance_target_follows_moving_navigation_target(
+        self,
+        _load,
+        _save,
+    ) -> None:
+        blue_ship = _make_runtime_ship("blue-1", Team.BLUE, "BLUE-ALPHA", Vector2(0.0, 0.0), "blue-fit")
+        red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
+        world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        engine.register_commander(blue_commander)
+        engine.register_commander(red_commander)
+        for ship_id in world.ships:
+            engine.register_ship(ship_id)
+
+        window = MainWindow(
+            engine=engine,
+            ui_cfg=UiConfig(),
+            blue_commander=blue_commander,
+            red_commander=red_commander,
+            manual_setup=[],
+            network_mode="local",
+            controlled_team=Team.BLUE,
+        )
+
+        try:
+            window.tick_timer.stop()
+            window.render_timer.stop()
+            window._undeployed_ship_ids.clear()
+            blue_ship.vital.alive = True
+            red_ship.vital.alive = True
+            world.squad_leaders[f"{Team.BLUE.value}:BLUE-ALPHA"] = blue_ship.ship_id
+            blue_ship.nav.command_mode = "orbit"
+            blue_ship.nav.command_target_ship_id = red_ship.ship_id
+            blue_ship.nav.command_target = Vector2(red_ship.nav.position.x, red_ship.nav.position.y)
+
+            first_target = window._guidance_target_for_squad("BLUE-ALPHA")
+            red_ship.nav.position = Vector2(25_000.0, 5_000.0)
+            window.canvas.note_authoritative_frame()
+            second_target = window._guidance_target_for_squad("BLUE-ALPHA")
+
+            self.assertEqual(first_target, Vector2(10_000.0, 0.0))
+            self.assertEqual(second_target, Vector2(25_000.0, 5_000.0))
         finally:
             window.close()
 

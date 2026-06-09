@@ -182,6 +182,11 @@ class NavigationState:
     system_id: str = ""
     radius: float = 60.0
     command_target: Vector2 | None = None
+    command_mode: str = "move"
+    command_target_ship_id: str | None = None
+    command_target_structure_id: str | None = None
+    command_range_m: float = 0.0
+    command_orbit_clockwise: bool = True
     propulsion_command_active: bool = False
     warp: WarpState = field(default_factory=WarpState)
     gate: GateTransitState = field(default_factory=GateTransitState)
@@ -394,5 +399,9 @@ Beacon = StructureEntity
 class FleetIntent:
     squad_id: str
     target_position: Vector2 | None = None
+    movement_mode: str = "move"
+    target_ship_id: str | None = None
+    target_structure_id: str | None = None
+    target_range_m: float = 0.0
     focus_target: str | None = None
     propulsion_active: bool | None = None

@@ -87,6 +87,15 @@ class MovementSystem:
         gate.target_structure_id = None
 
     @staticmethod
+    def _clear_navigation_command(ship) -> None:
+        ship.nav.command_target = None
+        ship.nav.command_mode = "move"
+        ship.nav.command_target_ship_id = None
+        ship.nav.command_target_structure_id = None
+        ship.nav.command_range_m = 0.0
+        ship.nav.command_orbit_clockwise = True
+
+    @staticmethod
     def _edge_distance_to_structure(position: Vector2, structure) -> float:
         radius = max(0.0, float(getattr(structure, "radius", 0.0) or 0.0))
         return max(0.0, position.distance_to(structure.position) - radius)
@@ -331,6 +340,11 @@ class MovementSystem:
         ship.nav.warp.interdiction_snapshots_captured = False
         ship.nav.warp.interdiction_snapshots = tuple()
         ship.nav.command_target = None
+        ship.nav.command_mode = "move"
+        ship.nav.command_target_ship_id = None
+        ship.nav.command_target_structure_id = None
+        ship.nav.command_range_m = 0.0
+        ship.nav.command_orbit_clockwise = True
 
     def _resolve_warp_target(self, world: WorldState, ship) -> tuple[Vector2 | None, float]:
         warp = ship.nav.warp
@@ -416,6 +430,11 @@ class MovementSystem:
         ship.nav.warp.warp_elapsed = 0.0
         ship.nav.warp.capacitor_cost = cap_cost
         ship.nav.command_target = None
+        ship.nav.command_mode = "move"
+        ship.nav.command_target_ship_id = None
+        ship.nav.command_target_structure_id = None
+        ship.nav.command_range_m = 0.0
+        ship.nav.command_orbit_clockwise = True
         average_speed = destination_distance / max(1e-6, duration)
         ship.nav.velocity = direction * average_speed
         ship.nav.facing_deg = direction.angle_deg()
@@ -525,16 +544,16 @@ class MovementSystem:
         structure = world.structures.get(target_structure_id)
         if structure is None or str(getattr(structure, "kind", "") or "").upper() != "STARGATE":
             self._clear_gate_transit(ship)
-            ship.nav.command_target = None
+            self._clear_navigation_command(ship)
             return
         if str(getattr(structure, "system_id", "") or "") != str(getattr(ship.nav, "system_id", "") or ""):
             self._clear_gate_transit(ship)
-            ship.nav.command_target = None
+            self._clear_navigation_command(ship)
             return
         linked_id = str(getattr(structure, "linked_structure_id", "") or "").strip()
         if not linked_id or world.structures.get(linked_id) is None:
             self._clear_gate_transit(ship)
-            ship.nav.command_target = None
+            self._clear_navigation_command(ship)
             return
 
         activation_range = max(
@@ -545,6 +564,10 @@ class MovementSystem:
         if self._edge_distance_to_structure(ship.nav.position, structure) <= activation_range:
             self._activate_stargate_jump(world, ship, structure, world.structures[linked_id])
             return
+        ship.nav.command_mode = "approach"
+        ship.nav.command_target_ship_id = None
+        ship.nav.command_target_structure_id = str(target_structure_id)
+        ship.nav.command_range_m = activation_range
         ship.nav.command_target = Vector2(structure.position.x, structure.position.y)
 
     def _update_gate_cloak(self, world: WorldState, ship) -> None:
@@ -625,6 +648,149 @@ class MovementSystem:
             return 0.0
         return max(0.0, float(speed)) / radius
 
+    @classmethod
+    def _stable_orbit_speed(cls, radius_m: float, speed_cap: float, tau: float) -> float:
+        radius = max(0.0, float(radius_m))
+        cap = max(0.0, float(speed_cap))
+        if radius <= 1e-6 or cap <= 1e-6:
+            return 0.0
+        lo = 0.0
+        hi = cap * 0.999
+        for _ in range(40):
+            mid = (lo + hi) * 0.5
+            stable_radius = cls._stable_turn_radius(mid, cap, tau)
+            if stable_radius <= radius:
+                lo = mid
+            else:
+                hi = mid
+        return max(0.0, min(cap, lo))
+
+    @staticmethod
+    def _rotate_90(v: Vector2, clockwise: bool) -> Vector2:
+        if clockwise:
+            return Vector2(v.y, -v.x)
+        return Vector2(-v.y, v.x)
+
+    @staticmethod
+    def _clamped_vector(v: Vector2, max_length: float) -> Vector2:
+        length = v.length()
+        cap = max(0.0, float(max_length))
+        if length <= cap or length <= 1e-9:
+            return v
+        return v.normalized() * cap
+
+    @staticmethod
+    def _command_target_info(world: WorldState, ship) -> tuple[Vector2 | None, float, Vector2]:
+        target_ship_id = str(getattr(ship.nav, "command_target_ship_id", "") or "").strip()
+        if target_ship_id:
+            target_ship = world.ships.get(target_ship_id)
+            if target_ship is None or not target_ship.vital.alive:
+                return None, 0.0, Vector2(0.0, 0.0)
+            if str(getattr(target_ship.nav, "system_id", "") or "") != str(getattr(ship.nav, "system_id", "") or ""):
+                return None, 0.0, Vector2(0.0, 0.0)
+            return (
+                Vector2(target_ship.nav.position.x, target_ship.nav.position.y),
+                max(0.0, float(getattr(target_ship.nav, "radius", 0.0) or 0.0)),
+                Vector2(target_ship.nav.velocity.x, target_ship.nav.velocity.y),
+            )
+        target_structure_id = str(getattr(ship.nav, "command_target_structure_id", "") or "").strip()
+        if target_structure_id:
+            structure = world.structures.get(target_structure_id)
+            if structure is None:
+                return None, 0.0, Vector2(0.0, 0.0)
+            if str(getattr(structure, "system_id", "") or "") != str(getattr(ship.nav, "system_id", "") or ""):
+                return None, 0.0, Vector2(0.0, 0.0)
+            return (
+                Vector2(structure.position.x, structure.position.y),
+                max(0.0, float(getattr(structure, "radius", 0.0) or 0.0)),
+                Vector2(0.0, 0.0),
+            )
+        target = getattr(ship.nav, "command_target", None)
+        if target is None:
+            return None, 0.0, Vector2(0.0, 0.0)
+        return Vector2(target.x, target.y), 0.0, Vector2(0.0, 0.0)
+
+    def _relative_command_velocity(self, target_velocity: Vector2, relative_velocity: Vector2, speed_cap: float) -> Vector2:
+        if target_velocity.length() <= 1e-6:
+            return self._clamped_vector(relative_velocity, speed_cap)
+        return self._clamped_vector(target_velocity + relative_velocity, speed_cap)
+
+    def _desired_navigation_velocity(self, world: WorldState, ship, speed_cap: float, tau: float) -> tuple[Vector2, float]:
+        current_velocity = ship.nav.velocity
+        current_speed = current_velocity.length()
+        target_position, target_radius, target_velocity = self._command_target_info(world, ship)
+        if target_position is None:
+            self._clear_navigation_command(ship)
+            return Vector2(0.0, 0.0), float(ship.nav.facing_deg or 0.0)
+        ship.nav.command_target = target_position
+
+        to_target = target_position - ship.nav.position
+        center_distance = to_target.length()
+        if center_distance <= 1e-6:
+            radial = self._heading_vector(float(ship.nav.facing_deg or 0.0))
+        else:
+            radial = to_target.normalized()
+        desired_angle = radial.angle_deg()
+        mode = str(getattr(ship.nav, "command_mode", "move") or "move").strip().lower()
+        own_radius = max(0.0, float(getattr(ship.nav, "radius", 0.0) or 0.0))
+        edge_distance = max(0.0, center_distance - target_radius - own_radius)
+        requested_range = max(0.0, float(getattr(ship.nav, "command_range_m", 0.0) or 0.0))
+
+        if mode == "move":
+            arrive_radius = max(120.0, own_radius * 1.5)
+            if center_distance <= arrive_radius:
+                return Vector2(0.0, 0.0), desired_angle
+            return radial * speed_cap, desired_angle
+
+        if mode == "approach":
+            stop_range = max(0.0, requested_range)
+            if edge_distance <= max(120.0, stop_range):
+                desired = self._relative_command_velocity(target_velocity, Vector2(0.0, 0.0), speed_cap)
+                return desired, desired.angle_deg() if desired.length() > 1e-6 else desired_angle
+            desired = self._relative_command_velocity(target_velocity, radial * speed_cap, speed_cap)
+            return desired, desired.angle_deg() if desired.length() > 1e-6 else desired_angle
+
+        if mode == "keep_range":
+            error = edge_distance - requested_range
+            tolerance = max(100.0, min(1_000.0, requested_range * 0.05))
+            if abs(error) <= tolerance:
+                desired = self._relative_command_velocity(target_velocity, Vector2(0.0, 0.0), speed_cap)
+                return desired, desired.angle_deg() if desired.length() > 1e-6 else current_velocity.angle_deg() if current_speed > 1e-6 else desired_angle
+            direction = radial if error > 0.0 else radial * -1.0
+            ramp = max(500.0, requested_range * 0.25)
+            speed = speed_cap * max(0.15, min(1.0, abs(error) / ramp))
+            desired = self._relative_command_velocity(target_velocity, direction * speed, speed_cap)
+            return desired, desired.angle_deg() if desired.length() > 1e-6 else direction.angle_deg()
+
+        if mode == "orbit":
+            orbit_radius = max(target_radius + own_radius + requested_range, own_radius + target_radius + 100.0)
+            if center_distance <= 1e-6:
+                return Vector2(0.0, 0.0), desired_angle
+            tangent = self._rotate_90(radial, bool(getattr(ship.nav, "command_orbit_clockwise", True)))
+            orbit_speed = self._stable_orbit_speed(orbit_radius, speed_cap, tau)
+            relative_current_velocity = current_velocity - target_velocity
+            relative_current_speed = relative_current_velocity.length()
+            radial_error = center_distance - orbit_radius
+            entry_margin = max(500.0, min(20_000.0, orbit_radius * 0.18 + relative_current_speed * tau * 0.35))
+            if radial_error > entry_margin:
+                desired = self._relative_command_velocity(target_velocity, radial * speed_cap, speed_cap)
+                return desired, desired.angle_deg() if desired.length() > 1e-6 else desired_angle
+            if radial_error < -entry_margin:
+                outward = radial * -speed_cap
+                desired = self._relative_command_velocity(target_velocity, outward, speed_cap)
+                return desired, desired.angle_deg() if desired.length() > 1e-6 else outward.angle_deg()
+
+            tangent_factor = 1.0 if entry_margin <= 1e-6 else max(0.0, min(1.0, 1.0 - abs(radial_error) / entry_margin))
+            correction_time = max(0.5, min(8.0, tau * 0.75))
+            radial_speed = max(-speed_cap * 0.65, min(speed_cap * 0.65, radial_error / correction_time))
+            relative_desired = tangent * (orbit_speed * tangent_factor) + radial * radial_speed
+            desired = self._relative_command_velocity(target_velocity, relative_desired, speed_cap)
+            if desired.length() <= 1e-6:
+                return Vector2(0.0, 0.0), tangent.angle_deg()
+            return desired, desired.angle_deg()
+
+        return radial * speed_cap, desired_angle
+
     def _effective_speed_cap(self, world: WorldState, ship) -> float:
         base_cap = max(1.0, float(ship.nav.max_speed))
         squad_key = f"{ship.team.value}:{ship.squad_id}"
@@ -637,27 +803,25 @@ class MovementSystem:
         return max(1.0, min(base_cap, cap) * self._bubble_speed_multiplier(world, ship))
 
     def _update_velocity_with_inertia(self, world: WorldState, ship, dt: float) -> Vector2:
-        target = ship.nav.command_target
         speed_cap = self._effective_speed_cap(world, ship)
         desired_angle = ship.nav.facing_deg
-        target_speed = 0.0
         current_velocity = ship.nav.velocity
         current_speed = current_velocity.length()
+        target_speed = 0.0
+        desired_velocity = Vector2(0.0, 0.0)
 
-        if target is not None:
-            to_target = target - ship.nav.position
-            distance = to_target.length()
-            if distance > max(120.0, ship.nav.radius * 1.5):
-                desired_angle = to_target.angle_deg()
-                target_speed = speed_cap
+        if ship.nav.command_target is not None:
+            tau = self._motion_tau(ship, speed_cap)
+            desired_velocity, desired_angle = self._desired_navigation_velocity(world, ship, speed_cap, tau)
+            target_speed = desired_velocity.length()
         elif bool(ship.nav.propulsion_command_active):
             if current_speed > 1e-6:
                 # Keep burning along the existing travel vector when propulsion toggles on mid-flight.
                 desired_angle = current_velocity.angle_deg()
                 target_speed = speed_cap
+                desired_velocity = self._heading_vector(desired_angle) * target_speed
 
         tau = self._motion_tau(ship, speed_cap)
-        desired_velocity = self._heading_vector(desired_angle) * target_speed
         new_velocity, displacement = self._exponential_velocity_step(current_velocity, desired_velocity, tau, dt)
 
         if target_speed > 1e-6 and current_speed > 1e-6:

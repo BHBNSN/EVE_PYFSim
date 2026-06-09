@@ -2655,6 +2655,30 @@
         <translation>{squad} 使用星门 {structure}</translation>
     </message>
     <message>
+        <source>Current Distance ({km:.1f} km)</source>
+        <translation>当前距离（{km:.1f} km）</translation>
+    </message>
+    <message>
+        <source>{km:g} km</source>
+        <translation>{km:g} km</translation>
+    </message>
+    <message>
+        <source>{km:.1f} km</source>
+        <translation>{km:.1f} km</translation>
+    </message>
+    <message>
+        <source>{squad} Approach {target}</source>
+        <translation>{squad} 接近 {target}</translation>
+    </message>
+    <message>
+        <source>{squad} Orbit {target}</source>
+        <translation>{squad} 环绕 {target}</translation>
+    </message>
+    <message>
+        <source>{squad} Keep Range {target}</source>
+        <translation>{squad} 保持距离 {target}</translation>
+    </message>
+    <message>
         <source>{system} Stargate</source>
         <translation>{system} 星门</translation>
     </message>

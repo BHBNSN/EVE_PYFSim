@@ -176,7 +176,15 @@ class BattleCanvas(QWidget):
         self._bg_cache_w = 0
         self._bg_cache_h = 0
         self._area_cycle_overlays: dict[tuple[str, str], AreaCycleOverlay] = {}
-        self._authoritative_frame_wall_time = time.perf_counter()
+        now = time.perf_counter()
+        self._authoritative_frame_wall_time = now
+        self._render_frame_wall_time = now
+        self._render_frame_dt_s = 0.0
+        self._render_frame_index = 0
+        self._visual_ship_positions: dict[str, Vector2] = {}
+        self._visual_ship_frame_ids: dict[str, int] = {}
+        self._visual_ship_system_ids: dict[str, str] = {}
+        self._rendering_visual_frame = False
 
     @staticmethod
     def _focus_key(team: Team, squad_id: str) -> str:
@@ -333,6 +341,13 @@ class BattleCanvas(QWidget):
 
     def note_authoritative_frame(self) -> None:
         self._authoritative_frame_wall_time = time.perf_counter()
+        self._render_frame_index += 1
+
+    def _begin_render_frame(self) -> None:
+        now = time.perf_counter()
+        self._render_frame_dt_s = max(0.0, min(0.1, now - float(self._render_frame_wall_time)))
+        self._render_frame_wall_time = now
+        self._render_frame_index += 1
 
     def _render_lookahead_s(self) -> float:
         try:
@@ -356,10 +371,43 @@ class BattleCanvas(QWidget):
         return Vector2(float(position.x) + float(velocity.x) * dt, float(position.y) + float(velocity.y) * dt)
 
     def _ship_render_position(self, ship: ShipEntity) -> Vector2:
-        return self._project_position(ship.nav.position, ship.nav.velocity)
+        target = self._project_position(ship.nav.position, ship.nav.velocity)
+        if not bool(getattr(self, "_rendering_visual_frame", False)):
+            return target
+        ship_id = str(ship.ship_id)
+        if self._visual_ship_frame_ids.get(ship_id) == self._render_frame_index:
+            return self._visual_ship_positions.get(ship_id, target)
+
+        system_id = str(getattr(ship.nav, "system_id", "") or "")
+        previous = self._visual_ship_positions.get(ship_id)
+        previous_system = self._visual_ship_system_ids.get(ship_id)
+        if previous is None or previous_system != system_id:
+            visual = target
+        else:
+            correction = previous.distance_to(target)
+            speed = max(0.0, float(ship.nav.velocity.length()))
+            snap_distance = max(20_000.0, speed * 8.0)
+            if correction >= snap_distance:
+                visual = target
+            else:
+                alpha = 1.0 - math.exp(-max(0.0, self._render_frame_dt_s) / 0.12)
+                visual = previous * (1.0 - alpha) + target * alpha
+
+        self._visual_ship_positions[ship_id] = visual
+        self._visual_ship_frame_ids[ship_id] = self._render_frame_index
+        self._visual_ship_system_ids[ship_id] = system_id
+        return visual
 
     def _projectile_render_position(self, projectile) -> Vector2:
         return self._project_position(projectile.position, getattr(projectile, "velocity", None))
+
+    def _prune_visual_ship_positions(self) -> None:
+        live_ship_ids = {str(ship_id) for ship_id in self.engine.world.ships.keys()}
+        stale = [ship_id for ship_id in self._visual_ship_positions.keys() if ship_id not in live_ship_ids]
+        for ship_id in stale:
+            self._visual_ship_positions.pop(ship_id, None)
+            self._visual_ship_frame_ids.pop(ship_id, None)
+            self._visual_ship_system_ids.pop(ship_id, None)
 
     def world_scale(self) -> float:
         return max(1e-12, float(self.zoom) * float(self._ZOOM_WORLD_SCALE_BASE))
@@ -825,6 +873,8 @@ class BattleCanvas(QWidget):
 
     def paintEvent(self, event) -> None:
         del event
+        self._begin_render_frame()
+        self._rendering_visual_frame = True
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1058,6 +1108,8 @@ class BattleCanvas(QWidget):
             painter.drawText(right_x, 20, QCoreApplication.translate("eve_sim", '{squad} Current Focus: {target}').format(squad=self.selected_squad, target=current_focus))
             painter.drawText(right_x, 40, QCoreApplication.translate("eve_sim", 'Pre-focus Queue: {targets}').format(targets=prefocus_list))
         finally:
+            self._rendering_visual_frame = False
+            self._prune_visual_ship_positions()
             if painter.isActive():
                 painter.end()
 
