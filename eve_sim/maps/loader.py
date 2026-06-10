@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from .models import (
     MapDefinition,
     MapSpawnAnchorDefinition,
     MapSystemDefinition,
+    normalize_stargate_links,
 )
 
 
@@ -102,21 +104,22 @@ def deserialize_map_definition(payload: dict[str, object]) -> MapDefinition:
             )
         )
     map_id = str(payload.get("map_id", DEFAULT_MAP_ID) or DEFAULT_MAP_ID).strip() or DEFAULT_MAP_ID
-    return MapDefinition(
+    return normalize_stargate_links(MapDefinition(
         map_id=map_id,
         name=str(payload.get("name", map_id) or map_id),
         description=str(payload.get("description", "") or ""),
         version=max(1, int(float(payload.get("version", 1) or 1))),
         systems=systems,
-    )
+    ))
 
 
 def serialize_map_definition(map_definition: MapDefinition) -> dict[str, object]:
+    normalized = normalize_stargate_links(deepcopy(map_definition))
     return {
-        "map_id": map_definition.map_id,
-        "name": map_definition.name,
-        "description": map_definition.description,
-        "version": int(map_definition.version),
+        "map_id": normalized.map_id,
+        "name": normalized.name,
+        "description": normalized.description,
+        "version": int(normalized.version),
         "systems": [
             {
                 "system_id": system.system_id,
@@ -147,7 +150,7 @@ def serialize_map_definition(map_definition: MapDefinition) -> dict[str, object]
                     for anchor in system.spawn_anchors
                 ],
             }
-            for system in map_definition.systems
+            for system in normalized.systems
         ],
     }
 
@@ -213,7 +216,8 @@ def save_map_definition(map_definition: MapDefinition, path: str | Path | None =
 
 def instantiate_structures(map_definition: MapDefinition) -> dict[str, StructureEntity]:
     structures: dict[str, StructureEntity] = {}
-    for system in map_definition.systems:
+    normalized = normalize_stargate_links(deepcopy(map_definition))
+    for system in normalized.systems:
         for building in system.buildings:
             structures[building.building_id] = StructureEntity(
                 structure_id=building.building_id,

@@ -14,6 +14,8 @@ from .models import (
     MapDefinition,
     MapSpawnAnchorDefinition,
     MapSystemDefinition,
+    is_stargate_building,
+    normalize_stargate_links,
 )
 
 __all__ = [
@@ -25,9 +27,11 @@ __all__ = [
     "MapSystemDefinition",
     "deserialize_map_definition",
     "instantiate_structures",
+    "is_stargate_building",
     "list_map_catalog",
     "load_map_definition",
     "map_directory",
+    "normalize_stargate_links",
     "save_map_definition",
     "serialize_map_definition",
 ]

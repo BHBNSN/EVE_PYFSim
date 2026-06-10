@@ -2611,6 +2611,10 @@
         <translation>星门连接</translation>
     </message>
     <message>
+        <source>Already linked to {target}</source>
+        <translation>已与 {target} 链接</translation>
+    </message>
+    <message>
         <source>Click canvas to place selected building</source>
         <translation>点击画布放置当前选中的建筑</translation>
     </message>

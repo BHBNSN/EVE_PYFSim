@@ -25,7 +25,7 @@ from ..fit_runtime import (
     ModuleState,
     SkillProfile,
 )
-from ..maps import DEFAULT_MAP_ID, MapDefinition, instantiate_structures, load_map_definition
+from ..maps import DEFAULT_MAP_ID, MapDefinition, instantiate_structures, load_map_definition, normalize_stargate_links
 from ..math2d import Vector2
 from ..models import (
     CombatState,
@@ -3439,7 +3439,7 @@ def build_world_from_manual_setup(
     ship_setups: list[ManualShipSetup],
     map_definition: MapDefinition | None = None,
 ) -> WorldState:
-    selected_map = map_definition or load_map_definition(DEFAULT_MAP_ID)
+    selected_map = normalize_stargate_links(deepcopy(map_definition)) if map_definition is not None else load_map_definition(DEFAULT_MAP_ID)
     world = WorldState(
         map_id=selected_map.map_id,
         map_name=selected_map.name,

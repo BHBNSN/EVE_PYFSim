@@ -14,9 +14,10 @@ from eve_sim.agents import CommanderAgent
 from eve_sim.config import EngineConfig, UiConfig
 from eve_sim.fleet_setup import build_world_from_manual_setup
 from eve_sim.gui.main_window import MainWindow
+from eve_sim.gui.map_editor_dialog import MapEditorDialog
 from eve_sim.gui.models import UiPreferences
-from eve_sim.maps.models import MapDefinition, MapSystemDefinition
-from eve_sim.maps import load_map_definition
+from eve_sim.maps.models import MapBuildingDefinition, MapDefinition, MapSystemDefinition, normalize_stargate_links
+from eve_sim.maps import load_map_definition, serialize_map_definition
 from eve_sim.math2d import Vector2
 from eve_sim.models import CombatState, FitDescriptor, NavigationState, QualityLevel, QualityState, ShipEntity, Team, VitalState
 from eve_sim.pyfa_bridge import PyfaBridge
@@ -84,6 +85,87 @@ def _make_ship(ship_id: str, team: Team, squad_id: str, position: Vector2, *, sy
     )
 
 
+def _map_building(
+    building_id: str,
+    system_id: str,
+    *,
+    kind: str = "STARGATE",
+    linked_building_id: str | None = None,
+) -> MapBuildingDefinition:
+    return MapBuildingDefinition(
+        building_id=building_id,
+        system_id=system_id,
+        position=Vector2(0.0, 0.0),
+        radius_m=10_000.0,
+        kind=kind,
+        name=building_id,
+        interaction_range_m=2_500.0 if kind == "STARGATE" else 0.0,
+        icon_key="stargate" if kind == "STARGATE" else "structure",
+        linked_building_id=linked_building_id,
+    )
+
+
+def _editor_link_test_map() -> MapDefinition:
+    return MapDefinition(
+        map_id="link-test",
+        name="Link Test",
+        systems=[
+            MapSystemDefinition(
+                system_id="alpha",
+                name="Alpha",
+                radius_m=30.0 * 149_597_870_700.0,
+                buildings=[
+                    _map_building("alpha_gate", "alpha"),
+                    _map_building("alpha_gate_2", "alpha"),
+                    _map_building("alpha_structure", "alpha", kind="STRUCTURE", linked_building_id="beta_gate"),
+                ],
+            ),
+            MapSystemDefinition(
+                system_id="beta",
+                name="Beta",
+                radius_m=30.0 * 149_597_870_700.0,
+                buildings=[_map_building("beta_gate", "beta")],
+            ),
+            MapSystemDefinition(
+                system_id="gamma",
+                name="Gamma",
+                radius_m=30.0 * 149_597_870_700.0,
+                buildings=[
+                    _map_building("gamma_gate", "gamma"),
+                    _map_building("gamma_gate_2", "gamma"),
+                ],
+            ),
+        ],
+    )
+
+
+def _dual_gate_test_map() -> MapDefinition:
+    return MapDefinition(
+        map_id="dual-gate-test",
+        name="Dual Gate Test",
+        systems=[
+            MapSystemDefinition(
+                system_id="alpha",
+                name="Alpha",
+                radius_m=30.0 * 149_597_870_700.0,
+                buildings=[
+                    _map_building("alpha_gate_to_beta", "alpha", linked_building_id="beta_gate_to_alpha"),
+                    _map_building("alpha_structure", "alpha", kind="STRUCTURE"),
+                ],
+            ),
+            MapSystemDefinition(
+                system_id="beta",
+                name="Beta",
+                radius_m=30.0 * 149_597_870_700.0,
+                buildings=[
+                    _map_building("beta_gate_to_alpha", "beta", linked_building_id="alpha_gate_to_beta"),
+                    _map_building("beta_structure", "beta", kind="STRUCTURE"),
+                ],
+            ),
+        ],
+    )
+
+
 class MapSystemTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -96,6 +178,98 @@ class MapSystemTests(unittest.TestCase):
         self.assertIn("alpha_gate_to_beta", world.structures)
         self.assertIn("beta_gate_to_alpha", world.structures)
         self.assertNotIn("gate-1", world.structures)
+
+    def test_map_normalization_enforces_stargate_pair_links(self) -> None:
+        map_definition = _editor_link_test_map()
+        map_definition.building_by_id("alpha_gate").linked_building_id = "beta_gate"
+        map_definition.building_by_id("alpha_gate_2").linked_building_id = "alpha_gate"
+        map_definition.building_by_id("beta_gate").linked_building_id = "gamma_gate"
+
+        normalize_stargate_links(map_definition)
+        payload = serialize_map_definition(map_definition)
+
+        self.assertIsNone(map_definition.building_by_id("alpha_gate").linked_building_id)
+        self.assertIsNone(map_definition.building_by_id("alpha_gate_2").linked_building_id)
+        self.assertIsNone(map_definition.building_by_id("alpha_structure").linked_building_id)
+        self.assertEqual(map_definition.building_by_id("beta_gate").linked_building_id, "gamma_gate")
+        self.assertEqual(map_definition.building_by_id("gamma_gate").linked_building_id, "beta_gate")
+        alpha_structure_payload = next(
+            building
+            for system in payload["systems"]
+            if system["system_id"] == "alpha"
+            for building in system["buildings"]
+            if building["building_id"] == "alpha_structure"
+        )
+        self.assertIsNone(alpha_structure_payload["linked_building_id"])
+
+    def test_map_editor_stargate_link_combo_only_lists_other_system_gates_and_previews_edges(self) -> None:
+        dialog = MapEditorDialog(_editor_link_test_map())
+        try:
+            beta_gate = dialog._map.building_by_id("beta_gate")
+            gamma_gate = dialog._map.building_by_id("gamma_gate")
+            dialog._set_stargate_link(beta_gate, "gamma_gate")
+
+            dialog.system_combo.setCurrentIndex(dialog.system_combo.findData("alpha"))
+            dialog.building_combo.setCurrentIndex(dialog.building_combo.findData("alpha_gate"))
+            dialog.sync_forms_from_selection()
+
+            link_ids = {
+                str(dialog.combo_building_link.itemData(index) or "")
+                for index in range(dialog.combo_building_link.count())
+            }
+            self.assertTrue(dialog.combo_building_link.isEnabled())
+            self.assertIn("beta_gate", link_ids)
+            self.assertIn("gamma_gate", link_ids)
+            self.assertNotIn("alpha_gate_2", link_ids)
+            self.assertNotIn("alpha_structure", link_ids)
+            beta_idx = dialog.combo_building_link.findData("beta_gate")
+            gamma_idx = dialog.combo_building_link.findData("gamma_gate")
+            gamma_2_idx = dialog.combo_building_link.findData("gamma_gate_2")
+            self.assertGreaterEqual(beta_idx, 0)
+            self.assertGreaterEqual(gamma_idx, 0)
+            self.assertGreaterEqual(gamma_2_idx, 0)
+            self.assertLess(gamma_2_idx, beta_idx)
+            self.assertLess(gamma_2_idx, gamma_idx)
+            self.assertIn("To Gamma", dialog.combo_building_link.itemText(beta_idx))
+            self.assertIn("To Beta", dialog.combo_building_link.itemText(beta_idx))
+            self.assertIn("To Beta", dialog.combo_building_link.itemText(gamma_idx))
+            self.assertIn("To Gamma", dialog.combo_building_link.itemText(gamma_idx))
+
+            alpha_gate = dialog._map.building_by_id("alpha_gate")
+            dialog._set_stargate_link(alpha_gate, "beta_gate")
+            self.assertEqual(alpha_gate.linked_building_id, "beta_gate")
+            self.assertEqual(beta_gate.linked_building_id, "alpha_gate")
+            self.assertEqual(alpha_gate.name, "To Beta")
+            self.assertEqual(beta_gate.name, "To Alpha")
+            self.assertEqual(dialog.system_graph_canvas.system_edges(), (("alpha", "beta"),))
+
+            dialog._map.system_by_id("alpha").name = "New Alpha"
+            dialog._map.system_by_id("beta").name = "New Beta"
+            dialog._sync_linked_stargate_names()
+            self.assertEqual(alpha_gate.name, "To New Beta")
+            self.assertEqual(beta_gate.name, "To New Alpha")
+
+            dialog.system_combo.setCurrentIndex(dialog.system_combo.findData("beta"))
+            dialog.sync_forms_from_selection()
+            dialog.edit_system_name.setText("Renamed Beta")
+            self.assertEqual(alpha_gate.name, "To Renamed Beta")
+            self.assertEqual(beta_gate.name, "To New Alpha")
+
+            dialog._set_stargate_link(beta_gate, "gamma_gate")
+            self.assertIsNone(alpha_gate.linked_building_id)
+            self.assertEqual(beta_gate.linked_building_id, "gamma_gate")
+            self.assertEqual(gamma_gate.linked_building_id, "beta_gate")
+            self.assertEqual(beta_gate.name, "To Gamma")
+            self.assertEqual(gamma_gate.name, "To Renamed Beta")
+            self.assertEqual(dialog.system_graph_canvas.system_edges(), (("beta", "gamma"),))
+
+            dialog.system_combo.setCurrentIndex(dialog.system_combo.findData("alpha"))
+            dialog.sync_forms_from_selection()
+            dialog.building_combo.setCurrentIndex(dialog.building_combo.findData("alpha_structure"))
+            dialog.sync_forms_from_selection()
+            self.assertFalse(dialog.combo_building_link.isEnabled())
+        finally:
+            dialog.close()
 
     def test_warp_to_stargate_does_not_auto_jump_ship(self) -> None:
         map_definition = load_map_definition("dual_system_crossroads")
@@ -118,7 +292,7 @@ class MapSystemTests(unittest.TestCase):
         self.assertAlmostEqual(ship.nav.position.distance_to(source_gate.position), 0.0, delta=0.01)
 
     def test_gate_use_applies_gate_cloak_and_follow_hold(self) -> None:
-        map_definition = load_map_definition("dual_system_crossroads")
+        map_definition = _dual_gate_test_map()
         world = build_world_from_manual_setup([], map_definition=map_definition)
         source_gate = world.structures["alpha_gate_to_beta"]
         dest_gate = world.structures["beta_gate_to_alpha"]
@@ -429,7 +603,7 @@ class MapSystemTests(unittest.TestCase):
         return_value=UiPreferences(filter_team="FRIENDLY", selected_squad="BLUE-ALPHA", selected_map_id="dual_system_crossroads"),
     )
     def test_system_graph_derives_stargate_connections(self, _load_mock, _save_mock) -> None:
-        map_definition = load_map_definition("dual_system_crossroads")
+        map_definition = _dual_gate_test_map()
         world = build_world_from_manual_setup([], map_definition=map_definition)
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
         commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
