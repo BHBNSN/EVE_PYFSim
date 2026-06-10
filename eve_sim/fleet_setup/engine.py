@@ -3254,8 +3254,12 @@ def _ship_group_to_icon_key(group_name: str) -> str | None:
         return "capsule"
     if "super capital" in group or group == "supercapital":
         return "superCapital"
-    if "carrier" in group or "dreadnought" in group or "force auxiliary" in group or group == "capital":
-        return "capital"
+    if "carrier" in group:
+        return "carrier"
+    if "dreadnought" in group:
+        return "dreadnought"
+    if "force auxiliary" in group:
+        return "forceauxiliary"
     if "battlecruiser" in group or "command ship" in group:
         return "battlecruiser"
     if "battleship" in group or "marauder" in group or "black ops" in group:
