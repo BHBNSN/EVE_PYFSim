@@ -29,6 +29,12 @@ from ..maps import DEFAULT_MAP_ID, MapDefinition, instantiate_structures, load_m
 from ..math2d import Vector2
 from ..models import (
     CombatState,
+    DamageProfile,
+    DeployableControlState,
+    DeployableEwarProfile,
+    DroneBayEntry,
+    FighterAbilityProfile,
+    FighterBayEntry,
     FitDescriptor,
     NavigationState,
     QualityLevel,
@@ -2001,6 +2007,365 @@ class RuntimeFromEftFactory:
             raise UserFacingError("Missing cached pyfa profile result.")
         return replace(cached)
 
+    @staticmethod
+    def _deployable_attr(item: Any, name: str, default: float = 0.0) -> float:
+        try:
+            value = item.getModifiedItemAttr(name, None)
+        except Exception:
+            try:
+                value = item.getAttribute(name, None)
+            except Exception:
+                value = None
+        if value is None:
+            return float(default)
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _damage_profile_from_pyfa(value: Any) -> DamageProfile:
+        return DamageProfile(
+            em=max(0.0, float(getattr(value, "em", 0.0) or 0.0)),
+            thermal=max(0.0, float(getattr(value, "thermal", 0.0) or 0.0)),
+            kinetic=max(0.0, float(getattr(value, "kinetic", 0.0) or 0.0)),
+            explosive=max(0.0, float(getattr(value, "explosive", 0.0) or 0.0)),
+        )
+
+    @classmethod
+    def _deployable_sensor_strengths(cls, item: Any) -> dict[str, float]:
+        return {
+            "gravimetric": max(0.0, cls._deployable_attr(item, "scanGravimetricStrength", 0.0)),
+            "ladar": max(0.0, cls._deployable_attr(item, "scanLadarStrength", 0.0)),
+            "magnetometric": max(0.0, cls._deployable_attr(item, "scanMagnetometricStrength", 0.0)),
+            "radar": max(0.0, cls._deployable_attr(item, "scanRadarStrength", 0.0)),
+        }
+
+    @classmethod
+    def _drone_ewar_profile(cls, drone: Any) -> DeployableEwarProfile:
+        ecm_duration = cls._deployable_attr(drone, "ecmJamDuration", 0.0) / 1000.0
+        ecm_cycle = cls._deployable_attr(drone, "ECMDuration", 0.0) / 1000.0
+        neut_cycle = cls._deployable_attr(drone, "energyNeutralizerDuration", 0.0) / 1000.0
+        generic_cycle = cls._deployable_attr(drone, "duration", 0.0) / 1000.0
+        cycle = max(0.0, ecm_cycle, neut_cycle, generic_cycle)
+
+        ecm_optimal = cls._deployable_attr(drone, "ECMRangeOptimal", 0.0)
+        neut_optimal = cls._deployable_attr(drone, "energyNeutralizerRangeOptimal", 0.0)
+        optimal = max(
+            0.0,
+            ecm_optimal,
+            neut_optimal,
+            cls._deployable_attr(drone, "maxRange", 0.0),
+            cls._deployable_attr(drone, "entityAttackRange", 0.0),
+        )
+        speed_factor = cls._deployable_attr(drone, "speedFactor", 0.0)
+        speed_factor_mult = 1.0
+        if abs(speed_factor) > 1e-9:
+            speed_factor_mult = max(0.01, 1.0 + (speed_factor / 100.0))
+
+        return DeployableEwarProfile(
+            cycle_time_s=max(0.1, cycle or 5.0),
+            optimal_range_m=optimal,
+            falloff_m=max(0.0, cls._deployable_attr(drone, "falloff", 0.0)),
+            duration_s=max(0.0, ecm_duration or cycle or 5.0),
+            speed_factor_mult=speed_factor_mult,
+            signature_radius_bonus_pct=cls._deployable_attr(drone, "signatureRadiusBonus", 0.0),
+            scan_resolution_bonus_pct=cls._deployable_attr(drone, "scanResolutionBonus", 0.0),
+            max_target_range_bonus_pct=cls._deployable_attr(drone, "maxTargetRangeBonus", 0.0),
+            tracking_bonus_pct=cls._deployable_attr(drone, "trackingSpeedBonus", 0.0),
+            optimal_bonus_pct=cls._deployable_attr(drone, "maxRangeBonus", 0.0),
+            falloff_bonus_pct=cls._deployable_attr(drone, "falloffBonus", 0.0),
+            capacitor_neutralized=max(0.0, cls._deployable_attr(drone, "energyNeutralizerAmount", 0.0)),
+            warp_disrupt_strength=max(
+                0.0,
+                cls._deployable_attr(drone, "warpScrambleStrength", 0.0)
+                + cls._deployable_attr(drone, "warpDisruptStrength", 0.0),
+            ),
+            ecm_gravimetric=max(0.0, cls._deployable_attr(drone, "scanGravimetricStrengthBonus", 0.0)),
+            ecm_ladar=max(0.0, cls._deployable_attr(drone, "scanLadarStrengthBonus", 0.0)),
+            ecm_magnetometric=max(0.0, cls._deployable_attr(drone, "scanMagnetometricStrengthBonus", 0.0)),
+            ecm_radar=max(0.0, cls._deployable_attr(drone, "scanRadarStrengthBonus", 0.0)),
+        )
+
+    @classmethod
+    def _drone_bay_entry(cls, drone: Any, quantity: int) -> DroneBayEntry:
+        group_name = str(getattr(getattr(drone.item, "group", None), "name", "") or "")
+        max_velocity = max(0.0, cls._deployable_attr(drone, "maxVelocity", 0.0))
+        is_sentry = "sentry" in group_name.lower() or max_velocity <= 1.0
+        try:
+            volley = drone.getVolley()
+        except Exception:
+            volley = None
+        ewar = cls._drone_ewar_profile(drone)
+        optimal = max(0.0, cls._deployable_attr(drone, "maxRange", 0.0))
+        if optimal <= 0.0 and ewar.has_effect:
+            optimal = max(0.0, ewar.optimal_range_m)
+        falloff = max(0.0, cls._deployable_attr(drone, "falloff", 0.0))
+        control_range = max(
+            optimal + falloff,
+            cls._deployable_attr(drone, "entityAttackRange", 0.0),
+            ewar.optimal_range_m + ewar.falloff_m,
+        )
+        orbit_range = max(
+            0.0,
+            cls._deployable_attr(drone, "entityFlyRange", 0.0),
+            min(max(0.0, optimal), 2_500.0) if optimal > 0.0 else 0.0,
+        )
+        if is_sentry:
+            orbit_range = 0.0
+        sensors = cls._deployable_sensor_strengths(drone)
+        return DroneBayEntry(
+            type_name=str(getattr(drone.item, "typeName", "") or getattr(drone.item, "name", "") or ""),
+            quantity=max(0, int(quantity)),
+            group_name=group_name,
+            bandwidth_mbit=max(0.0, cls._deployable_attr(drone, "droneBandwidthUsed", 0.0)),
+            volume_m3=max(0.0, cls._deployable_attr(drone, "volume", 0.0)),
+            max_velocity=max_velocity,
+            orbit_range_m=orbit_range,
+            control_range_m=max(1_000.0, control_range),
+            cycle_time_s=max(0.1, cls._deployable_attr(drone, "speed", 0.0) / 1000.0 or ewar.cycle_time_s),
+            optimal_range_m=max(0.0, optimal),
+            falloff_m=max(0.0, falloff),
+            tracking=max(0.0, cls._deployable_attr(drone, "trackingSpeed", 0.0)),
+            damage=cls._damage_profile_from_pyfa(volley),
+            shield_hp=max(1.0, cls._deployable_attr(drone, "shieldCapacity", 1.0)),
+            armor_hp=max(1.0, cls._deployable_attr(drone, "armorHP", 1.0)),
+            structure_hp=max(1.0, cls._deployable_attr(drone, "hp", 1.0)),
+            signature_radius=max(1.0, cls._deployable_attr(drone, "signatureRadius", 25.0)),
+            scan_resolution=max(1.0, cls._deployable_attr(drone, "scanResolution", 200.0)),
+            sensor_strength_gravimetric=sensors["gravimetric"],
+            sensor_strength_ladar=sensors["ladar"],
+            sensor_strength_magnetometric=sensors["magnetometric"],
+            sensor_strength_radar=sensors["radar"],
+            is_sentry=is_sentry,
+            ewar=ewar,
+        )
+
+    @classmethod
+    def _fighter_ability_range(cls, fighter: Any, ability: Any) -> tuple[float, float]:
+        prefix = str(getattr(ability, "attrPrefix", "") or "")
+        candidates = []
+        falloff_candidates = []
+        if prefix:
+            candidates.extend((f"{prefix}Range", f"{prefix}OptimalRange", f"{prefix}RangeOptimal"))
+            falloff_candidates.extend((f"{prefix}FalloffRange", f"{prefix}RangeFalloff"))
+        name = str(getattr(getattr(ability, "effect", None), "name", "") or "")
+        if name == "fighterAbilityTackle":
+            candidates.append("fighterAbilityTackleRange")
+        optimal = 0.0
+        for attr_name in candidates:
+            optimal = max(optimal, cls._deployable_attr(fighter, attr_name, 0.0))
+        falloff = 0.0
+        for attr_name in falloff_candidates:
+            falloff = max(falloff, cls._deployable_attr(fighter, attr_name, 0.0))
+        return optimal, falloff
+
+    @classmethod
+    def _fighter_ability_ewar(cls, fighter: Any, ability: Any) -> DeployableEwarProfile:
+        prefix = str(getattr(ability, "attrPrefix", "") or "")
+        optimal, falloff = cls._fighter_ability_range(fighter, ability)
+        cycle = max(0.0, float(getattr(ability, "cycleTime", 0.0) or 0.0) / 1000.0)
+        speed_factor_mult = 1.0
+        for attr_name in (
+            f"{prefix}SpeedPenalty" if prefix else "",
+            "fighterAbilityTackleWebSpeedPenalty",
+            "fighterAbilityStasisWebifierSpeedPenalty",
+        ):
+            if not attr_name:
+                continue
+            value = cls._deployable_attr(fighter, attr_name, 0.0)
+            if abs(value) > 1e-9:
+                speed_factor_mult = min(speed_factor_mult, max(0.01, 1.0 + value / 100.0))
+        return DeployableEwarProfile(
+            cycle_time_s=max(0.1, cycle or 5.0),
+            optimal_range_m=optimal,
+            falloff_m=falloff,
+            duration_s=max(0.0, cycle or 5.0),
+            speed_factor_mult=speed_factor_mult,
+            capacitor_neutralized=max(
+                0.0,
+                cls._deployable_attr(fighter, f"{prefix}EnergyNeutralizerAmount", 0.0) if prefix else 0.0,
+            ),
+            warp_disrupt_strength=max(
+                0.0,
+                cls._deployable_attr(fighter, "fighterAbilityTackleWarpDisruptionPointStrength", 0.0)
+                + cls._deployable_attr(fighter, "fighterAbilityTackleWarpScrambleStrength", 0.0),
+            ),
+        )
+
+    @classmethod
+    def _fighter_ability_profile(cls, fighter: Any, ability: Any) -> FighterAbilityProfile:
+        effect = getattr(ability, "effect", None)
+        effect_name = str(getattr(effect, "name", "") or "")
+        display_name = str(getattr(ability, "name", "") or effect_name)
+        prefix = str(getattr(ability, "attrPrefix", "") or "")
+        try:
+            volley = ability.getVolley()
+        except Exception:
+            volley = None
+        damage = cls._damage_profile_from_pyfa(volley)
+        optimal, falloff = cls._fighter_ability_range(fighter, ability)
+        kind = "ewar"
+        if effect_name in {"fighterAbilityMicroWarpDrive", "fighterAbilityEvasiveManeuvers"}:
+            kind = "mwd"
+        elif effect_name == "fighterAbilityLaunchBomb" or int(getattr(ability, "numShots", 0) or 0) > 0:
+            kind = "heavy_attack"
+        elif damage.total > 0.0:
+            kind = "normal_attack"
+        ewar = cls._fighter_ability_ewar(fighter, ability)
+        speed_bonus_pct = 0.0
+        duration_s = max(0.0, float(getattr(ability, "cycleTime", 0.0) or 0.0) / 1000.0)
+        if kind == "mwd":
+            for attr_name in (
+                "fighterAbilityMicroWarpDriveSpeedBonus",
+                "fighterAbilityEvasiveManeuversSpeedBonus",
+            ):
+                speed_bonus_pct = max(speed_bonus_pct, cls._deployable_attr(fighter, attr_name, 0.0))
+            duration_s = max(
+                duration_s,
+                cls._deployable_attr(fighter, "fighterAbilityMicroWarpDriveDuration", 0.0) / 1000.0,
+                cls._deployable_attr(fighter, "fighterAbilityEvasiveManeuversDuration", 0.0) / 1000.0,
+            )
+        return FighterAbilityProfile(
+            ability_id=str(getattr(ability, "effectID", "") or effect_name),
+            name=display_name,
+            effect_name=effect_name,
+            kind=kind,
+            cycle_time_s=max(0.0, float(getattr(ability, "cycleTime", 0.0) or 0.0) / 1000.0),
+            optimal_range_m=max(0.0, optimal),
+            falloff_m=max(0.0, falloff),
+            tracking=max(0.0, cls._deployable_attr(fighter, f"{prefix}TrackingSpeed", 0.0) if prefix else 0.0),
+            damage=damage,
+            explosion_radius=max(0.0, cls._deployable_attr(fighter, f"{prefix}ExplosionRadius", 0.0) if prefix else 0.0),
+            explosion_velocity=max(0.0, cls._deployable_attr(fighter, f"{prefix}ExplosionVelocity", 0.0) if prefix else 0.0),
+            damage_reduction_factor=max(
+                0.1,
+                cls._deployable_attr(fighter, f"{prefix}DamageReductionFactor", 0.5) if prefix else 0.5,
+            ),
+            ammo_capacity=max(0, int(getattr(ability, "numShots", 0) or 0)),
+            reload_time_s=max(0.0, float(getattr(ability, "reloadTime", 0.0) or 0.0) / 1000.0),
+            speed_bonus_pct=max(0.0, speed_bonus_pct),
+            duration_s=max(0.0, duration_s),
+            cooldown_s=max(0.0, float(getattr(ability, "reloadTime", 0.0) or 0.0) / 1000.0),
+            ewar=ewar,
+        )
+
+    @classmethod
+    def _fighter_bay_entry(cls, fighter: Any, quantity: int) -> FighterBayEntry:
+        group_name = str(getattr(getattr(fighter.item, "group", None), "name", "") or "")
+        squadron_size = max(1, int(float(getattr(fighter, "amount", 1) or 1)))
+        slot_kind = "support"
+        lower_group = group_name.lower()
+        if "light" in lower_group:
+            slot_kind = "light"
+        elif "heavy" in lower_group:
+            slot_kind = "heavy"
+        abilities = tuple(cls._fighter_ability_profile(fighter, ability) for ability in getattr(fighter, "abilities", []) or [])
+        sensors = cls._deployable_sensor_strengths(fighter)
+        return FighterBayEntry(
+            type_name=str(getattr(fighter.item, "typeName", "") or getattr(fighter.item, "name", "") or ""),
+            quantity=max(0, int(quantity)),
+            group_name=group_name,
+            slot_kind=slot_kind,
+            squadron_size=squadron_size,
+            max_velocity=max(0.0, cls._deployable_attr(fighter, "maxVelocity", 0.0)),
+            orbit_range_m=5_000.0,
+            shield_hp=max(1.0, cls._deployable_attr(fighter, "shieldCapacity", 1.0)) * squadron_size,
+            armor_hp=max(0.0, cls._deployable_attr(fighter, "armorHP", 0.0)) * squadron_size,
+            structure_hp=max(1.0, cls._deployable_attr(fighter, "hp", 1.0)) * squadron_size,
+            signature_radius=max(1.0, cls._deployable_attr(fighter, "signatureRadius", 100.0)),
+            scan_resolution=max(1.0, cls._deployable_attr(fighter, "scanResolution", 500.0)),
+            sensor_strength_gravimetric=sensors["gravimetric"],
+            sensor_strength_ladar=sensors["ladar"],
+            sensor_strength_magnetometric=sensors["magnetometric"],
+            sensor_strength_radar=sensors["radar"],
+            warp_speed_au_s=max(0.0, cls._deployable_attr(fighter, "warpSpeedMultiplier", 1.5)),
+            abilities=abilities,
+        )
+
+    def build_deployable_manifest(
+        self,
+        parsed: ParsedEftFit,
+    ) -> tuple[list[DroneBayEntry], list[FighterBayEntry], DeployableControlState]:
+        if not self._pyfa.available or not self._pyfa.fit_engine_ready:
+            return [], [], DeployableControlState()
+
+        cargo_specs = list(parsed.cargo_specs or [])
+        if not cargo_specs and parsed.cargo_item_names:
+            cargo_specs = [
+                type("ParsedCargoSpecCompat", (), {"item_name": item_name, "quantity": quantity})()
+                for item_name, quantity in Counter(parsed.cargo_item_names).items()
+            ]
+        if not cargo_specs:
+            try:
+                fit_ctx, _fitted_modules = self._build_pyfa_fit(parsed, calculate_modified_attributes=False)
+                fit_ctx.calculated = False
+                fit_ctx.calculateModifiedAttributes()
+                ship = fit_ctx.ship
+                return [], [], DeployableControlState(
+                    drone_bandwidth_mbit=max(0.0, float(ship.getModifiedItemAttr("droneBandwidth") or 0.0)),
+                    max_active_drones=max(0, int(float(ship.getModifiedItemAttr("maxActiveDrones") or 0.0))),
+                    fighter_tubes=max(0, int(float(ship.getModifiedItemAttr("fighterTubes") or 0.0))),
+                    fighter_light_slots=max(0, int(float(ship.getModifiedItemAttr("fighterLightSlots") or 0.0))),
+                    fighter_support_slots=max(0, int(float(ship.getModifiedItemAttr("fighterSupportSlots") or 0.0))),
+                    fighter_heavy_slots=max(0, int(float(ship.getModifiedItemAttr("fighterHeavySlots") or 0.0))),
+                )
+            except Exception:
+                return [], [], DeployableControlState()
+
+        try:
+            fit_ctx, _fitted_modules = self._build_pyfa_fit(parsed, calculate_modified_attributes=False)
+            drone_cls = importlib.import_module("eos.saveddata.drone").Drone
+            fighter_cls = importlib.import_module("eos.saveddata.fighter").Fighter
+        except Exception:
+            return [], [], DeployableControlState()
+
+        drone_objects: list[tuple[Any, int]] = []
+        fighter_objects: list[tuple[Any, int]] = []
+        for spec in cargo_specs:
+            item_name = self._pyfa.resolve_type_name(str(getattr(spec, "item_name", "") or ""))
+            quantity = max(1, int(getattr(spec, "quantity", 1) or 1))
+            item = self._pyfa.get_item(item_name)
+            if item is None:
+                continue
+            category_name = str(getattr(getattr(item, "category", None), "name", "") or "")
+            try:
+                if category_name == "Drone":
+                    drone = drone_cls(item)
+                    drone.amount = 1
+                    drone.amountActive = 1
+                    fit_ctx.drones.append(drone)
+                    drone_objects.append((drone, quantity))
+                elif category_name == "Fighter":
+                    fighter = fighter_cls(item)
+                    fighter.active = True
+                    fit_ctx.fighters.append(fighter)
+                    fighter_objects.append((fighter, quantity))
+            except Exception:
+                continue
+
+        try:
+            fit_ctx.calculated = False
+            fit_ctx.calculateModifiedAttributes()
+        except Exception:
+            pass
+
+        drones = [self._drone_bay_entry(drone, quantity) for drone, quantity in drone_objects]
+        fighters = [self._fighter_bay_entry(fighter, quantity) for fighter, quantity in fighter_objects]
+        try:
+            ship = fit_ctx.ship
+            control = DeployableControlState(
+                drone_bandwidth_mbit=max(0.0, float(ship.getModifiedItemAttr("droneBandwidth") or 0.0)),
+                max_active_drones=max(0, int(float(ship.getModifiedItemAttr("maxActiveDrones") or 0.0))),
+                fighter_tubes=max(0, int(float(ship.getModifiedItemAttr("fighterTubes") or 0.0))),
+                fighter_light_slots=max(0, int(float(ship.getModifiedItemAttr("fighterLightSlots") or 0.0))),
+                fighter_support_slots=max(0, int(float(ship.getModifiedItemAttr("fighterSupportSlots") or 0.0))),
+                fighter_heavy_slots=max(0, int(float(ship.getModifiedItemAttr("fighterHeavySlots") or 0.0))),
+            )
+        except Exception:
+            control = DeployableControlState()
+        return drones, fighters, control
+
     @property
     def backend_status(self) -> str:
         return self._pyfa.status
@@ -3465,6 +3830,7 @@ def build_world_from_manual_setup(
         runtime_template, fit = factory.build(parsed)
         runtime = deepcopy(runtime_template)
         profile = factory.build_profile(parsed)
+        drone_bay, fighter_bay, deployable_control = factory.build_deployable_manifest(parsed)
 
         key = (setup.team, setup.squad_id)
         if key not in squad_centers:
@@ -3512,6 +3878,9 @@ def build_world_from_manual_setup(
                 ignore_order_probability=quality.ignore_order_probability,
                 formation_jitter=quality.formation_jitter,
             ),
+            drone_bay=list(drone_bay),
+            fighter_bay=list(fighter_bay),
+            deployable_control=deepcopy(deployable_control),
         )
         world.ships[ship_id] = ship
 

@@ -1411,7 +1411,8 @@ Remote Sensor Dampener II
         ) as run:
             engine.step()
 
-        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[1], 1.0)
 
     def test_engine_prewarms_world_base_cache_on_init(self) -> None:
         world = WorldState()

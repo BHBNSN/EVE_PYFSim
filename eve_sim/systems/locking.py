@@ -182,10 +182,16 @@ class LockingMixin:
             if not self._ensure_lock_slot_capacity(ship, target_id):
                 return False
             profile_for_lock = target_profile if target_profile is not None else target.profile
+            lock_time = self._cached_lock_time(ship.profile, profile_for_lock)
+            if lock_time <= 1e-9:
+                ship.combat.lock_targets.add(target_id)
+                self._remember_lock_started(ship, target_id, now_value)
+                self._clear_lock_timer(ship, target_id)
+                return True
             self._schedule_lock_deadline(
                 ship,
                 target_id,
-                duration=self._cached_lock_time(ship.profile, profile_for_lock),
+                duration=lock_time,
                 now=now_value,
             )
             if self.detailed_logging and self.logger is not None:
@@ -200,7 +206,7 @@ class LockingMixin:
 
     def _advance_target_locks(self, world: WorldState, dt: float, now: float | None = None) -> None:
         now_value = self._decision_now(world, now)
-        for ship in world.ships.values():
+        for ship in world.iter_combat_entities():
             if not ship.vital.alive:
                 continue
             if self._ship_combat_suppressed(ship, now_value):
@@ -210,7 +216,7 @@ class LockingMixin:
                 continue
             self._prepare_ship_timer_views(ship, now_value)
             for target_id in list(ship.combat.lock_targets):
-                target = world.ships.get(target_id)
+                target = world.combat_entity(target_id)
                 if (
                     target is None
                     or not target.vital.alive
@@ -220,7 +226,7 @@ class LockingMixin:
                 ):
                     self._drop_lock_target(ship, target_id)
             for target_id, left in list(ship.combat.lock_timers.items()):
-                target = world.ships.get(target_id)
+                target = world.combat_entity(target_id)
                 if (
                     target is None
                     or not target.vital.alive
@@ -330,7 +336,7 @@ class LockingMixin:
         ally_ids: set[str] = set()
         enemy_ids: set[str] = set()
         for candidate_id in visible_ids:
-            candidate = world.ships.get(candidate_id)
+            candidate = world.combat_entity(candidate_id)
             if candidate is None or not candidate.vital.alive or self._ship_hidden_from_targeting(candidate):
                 continue
             candidate_nav = getattr(candidate, "nav", None)

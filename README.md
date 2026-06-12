@@ -273,14 +273,18 @@ python main.py
 - ✅ 炸弹机制
 - ✅ Warp mechanics
 - ✅ 跃迁机制
+- ✅ Adaptation for drones/carriers
+- ✅ 无人机/舰载机的适配
 
 ### In Progress 进行中
 - 🔄 More comprehensive and smart EWAR effects
 - 🔄 更全面智能的电子战效果
+- 🔄 More advanced squad movement mechanics (e.g. squadmates can not only follow leader but also freely orbit)
+- 🔄 更多移动操作（比如小队队员不止能跟着队长，还能自由环绕）
 
 ### Planned 计划中
-- 📅 Adaptation for drones/carriers
-- 📅 无人机/舰载机的适配
+- 📅 ai
+- 📅 AI
 
 ---
 

@@ -316,7 +316,7 @@ class AuthoritativeTickMixin:
                     targets: list[tuple[Any, CycleTargetSnapshot, float]] = []
                     if metadata.is_smart_bomb:
                         for target_id, target_snapshot in cycle_target_snapshots.items():
-                            target = world.ships.get(target_id)
+                            target = world.combat_entity(target_id)
                             if target is None or not target.vital.alive or self._ship_hidden_from_targeting(target):
                                 continue
                             strength = self._cycle_effect_strength(effect, effect_index, target_snapshot)
@@ -326,7 +326,7 @@ class AuthoritativeTickMixin:
                         tgt_id = source.combat.projected_targets.get(module.module_id)
                         if not tgt_id:
                             continue
-                        target = world.ships.get(tgt_id)
+                        target = world.combat_entity(tgt_id)
                         if target is None or not target.vital.alive or self._ship_hidden_from_targeting(target):
                             continue
                         got_snapshot = cycle_target_snapshots.get(tgt_id)
@@ -455,7 +455,7 @@ class AuthoritativeTickMixin:
 
             current_target_id = ship.combat.current_target
             if current_target_id:
-                current_target = world.ships.get(current_target_id)
+                current_target = world.combat_entity(current_target_id)
                 if (
                     current_target is None
                     or not current_target.vital.alive
@@ -468,7 +468,7 @@ class AuthoritativeTickMixin:
             if not ship.combat.current_target:
                 queue = list(world.squad_focus_queues.get(self._focus_key(ship.team, ship.squad_id), []))
                 for candidate_id in queue:
-                    candidate = world.ships.get(candidate_id)
+                    candidate = world.combat_entity(candidate_id)
                     if (
                         candidate is None
                         or not candidate.vital.alive

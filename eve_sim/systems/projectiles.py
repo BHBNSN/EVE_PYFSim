@@ -331,7 +331,7 @@ class ProjectilesMixin:
         if max_range <= 0.0 and max_speed <= 0.0:
             return
 
-        target = world.ships.get(target_id) if target_id else None
+        target = world.combat_entity(target_id) if target_id else None
         if target is not None and target.vital.alive:
             direction = (target.nav.position - source.nav.position).normalized()
         else:
@@ -427,10 +427,10 @@ class ProjectilesMixin:
             )
 
     def _resolve_projectile_hit(self, world: WorldState, projectile: ProjectileEntity) -> None:
-        target = world.ships.get(projectile.target_ship_id or "")
+        target = world.combat_entity(projectile.target_ship_id or "")
         if target is None or not target.vital.alive:
             return
-        source = world.ships.get(projectile.source_ship_id)
+        source = world.combat_entity(projectile.source_ship_id)
         damage_factor = self._missile_damage_factor(projectile, target, target.profile)
         self._apply_direct_damage(
             world,
@@ -443,7 +443,7 @@ class ProjectilesMixin:
         )
 
     def _resolve_bomb_explosion(self, world: WorldState, projectile: ProjectileEntity) -> None:
-        source = world.ships.get(projectile.source_ship_id)
+        source = world.combat_entity(projectile.source_ship_id)
         blast_radius = max(0.0, float(projectile.blast_radius or 0.0))
         if blast_radius <= 0.0:
             return
@@ -454,7 +454,7 @@ class ProjectilesMixin:
             radius_m=blast_radius,
             system_id=str(getattr(projectile, "system_id", "") or ""),
         )
-        for target in world.ships.values():
+        for target in world.iter_combat_entities():
             if not target.vital.alive:
                 continue
             if projectile.position.distance_to(target.nav.position) > (blast_radius + max(0.0, float(target.nav.radius or 0.0))):
@@ -495,7 +495,7 @@ class ProjectilesMixin:
                 world.projectiles.pop(projectile_id, None)
                 continue
 
-            target = world.ships.get(projectile.target_ship_id or "")
+            target = world.combat_entity(projectile.target_ship_id or "")
             if projectile.kind == "missile" and target is not None and target.vital.alive:
                 direction = (target.nav.position - projectile.position).normalized()
                 if direction.length() > 1e-9:

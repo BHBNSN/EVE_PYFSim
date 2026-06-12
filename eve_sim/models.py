@@ -59,6 +59,148 @@ class FitDescriptor:
     is_shuttle: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class DamageProfile:
+    em: float = 0.0
+    thermal: float = 0.0
+    kinetic: float = 0.0
+    explosive: float = 0.0
+
+    @property
+    def total(self) -> float:
+        return max(0.0, self.em) + max(0.0, self.thermal) + max(0.0, self.kinetic) + max(0.0, self.explosive)
+
+
+@dataclass(frozen=True, slots=True)
+class DeployableEwarProfile:
+    cycle_time_s: float = 5.0
+    optimal_range_m: float = 0.0
+    falloff_m: float = 0.0
+    duration_s: float = 0.0
+    speed_factor_mult: float = 1.0
+    signature_radius_bonus_pct: float = 0.0
+    scan_resolution_bonus_pct: float = 0.0
+    max_target_range_bonus_pct: float = 0.0
+    tracking_bonus_pct: float = 0.0
+    optimal_bonus_pct: float = 0.0
+    falloff_bonus_pct: float = 0.0
+    capacitor_neutralized: float = 0.0
+    warp_disrupt_strength: float = 0.0
+    ecm_gravimetric: float = 0.0
+    ecm_ladar: float = 0.0
+    ecm_magnetometric: float = 0.0
+    ecm_radar: float = 0.0
+
+    @property
+    def has_effect(self) -> bool:
+        return (
+            self.speed_factor_mult < 0.999
+            or abs(self.signature_radius_bonus_pct) > 1e-9
+            or abs(self.scan_resolution_bonus_pct) > 1e-9
+            or abs(self.max_target_range_bonus_pct) > 1e-9
+            or abs(self.tracking_bonus_pct) > 1e-9
+            or abs(self.optimal_bonus_pct) > 1e-9
+            or abs(self.falloff_bonus_pct) > 1e-9
+            or self.capacitor_neutralized > 0.0
+            or self.warp_disrupt_strength > 0.0
+            or max(self.ecm_gravimetric, self.ecm_ladar, self.ecm_magnetometric, self.ecm_radar) > 0.0
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneBayEntry:
+    type_name: str
+    quantity: int
+    group_name: str
+    bandwidth_mbit: float
+    volume_m3: float
+    max_velocity: float
+    orbit_range_m: float
+    control_range_m: float
+    cycle_time_s: float
+    optimal_range_m: float
+    falloff_m: float
+    tracking: float
+    damage: DamageProfile
+    shield_hp: float
+    armor_hp: float
+    structure_hp: float
+    signature_radius: float
+    scan_resolution: float = 200.0
+    sensor_strength_gravimetric: float = 0.0
+    sensor_strength_ladar: float = 0.0
+    sensor_strength_magnetometric: float = 0.0
+    sensor_strength_radar: float = 0.0
+    is_sentry: bool = False
+    ewar: DeployableEwarProfile = field(default_factory=DeployableEwarProfile)
+
+
+@dataclass(frozen=True, slots=True)
+class FighterAbilityProfile:
+    ability_id: str
+    name: str
+    effect_name: str
+    kind: str
+    cycle_time_s: float
+    optimal_range_m: float
+    falloff_m: float
+    tracking: float
+    damage: DamageProfile
+    explosion_radius: float = 0.0
+    explosion_velocity: float = 0.0
+    damage_reduction_factor: float = 0.5
+    ammo_capacity: int = 0
+    reload_time_s: float = 0.0
+    speed_bonus_pct: float = 0.0
+    duration_s: float = 0.0
+    cooldown_s: float = 0.0
+    ewar: DeployableEwarProfile = field(default_factory=DeployableEwarProfile)
+
+    @property
+    def has_damage(self) -> bool:
+        return self.damage.total > 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class FighterBayEntry:
+    type_name: str
+    quantity: int
+    group_name: str
+    slot_kind: str
+    squadron_size: int
+    max_velocity: float
+    orbit_range_m: float
+    shield_hp: float
+    armor_hp: float
+    structure_hp: float
+    signature_radius: float
+    scan_resolution: float
+    sensor_strength_gravimetric: float = 0.0
+    sensor_strength_ladar: float = 0.0
+    sensor_strength_magnetometric: float = 0.0
+    sensor_strength_radar: float = 0.0
+    warp_speed_au_s: float = 0.0
+    abilities: tuple[FighterAbilityProfile, ...] = field(default_factory=tuple)
+
+
+@dataclass(slots=True)
+class DeployableControlState:
+    drone_bandwidth_mbit: float = 0.0
+    max_active_drones: int = 0
+    fighter_tubes: int = 0
+    fighter_light_slots: int = 0
+    fighter_support_slots: int = 0
+    fighter_heavy_slots: int = 0
+    drone_attack_target_id: str | None = None
+    drone_attack_command_at: float = 0.0
+    pending_drone_attack_target_id: str | None = None
+    pending_drone_attack_command_at: float = 0.0
+    fighter_attack_target_id: str | None = None
+    fighter_attack_command_at: float = 0.0
+    pending_fighter_attack_target_id: str | None = None
+    pending_fighter_attack_command_at: float = 0.0
+
+
 @dataclass(slots=True)
 class ShipProfile:
     dps: float
@@ -373,6 +515,62 @@ class ShipEntity:
     perception_allies: list[str] = field(default_factory=list)
     perception_enemies: list[str] = field(default_factory=list)
     perception_split_ready: bool = False
+    drone_bay: list[DroneBayEntry] = field(default_factory=list)
+    fighter_bay: list[FighterBayEntry] = field(default_factory=list)
+    deployable_control: DeployableControlState = field(default_factory=DeployableControlState)
+
+
+@dataclass(slots=True)
+class DroneEntity:
+    ship_id: str
+    owner_ship_id: str
+    team: Team
+    squad_id: str
+    definition: DroneBayEntry
+    fit: FitDescriptor
+    profile: ShipProfile
+    nav: NavigationState
+    combat: CombatState
+    vital: VitalState
+    state: str = "idle"
+    target_id: str | None = None
+    connected: bool = True
+    target_command_at: float = 0.0
+    cycle_timer: float = 0.0
+    ewar_cycle_timer: float = 0.0
+
+    @property
+    def type_name(self) -> str:
+        return self.definition.type_name
+
+
+@dataclass(slots=True)
+class FighterEntity:
+    ship_id: str
+    owner_ship_id: str
+    team: Team
+    squad_id: str
+    definition: FighterBayEntry
+    fit: FitDescriptor
+    profile: ShipProfile
+    nav: NavigationState
+    combat: CombatState
+    vital: VitalState
+    state: str = "idle"
+    target_id: str | None = None
+    owner_squad_id: str = ""
+    connected: bool = True
+    target_command_at: float = 0.0
+    ability_cycle_timers: dict[str, float] = field(default_factory=dict)
+    ability_ammo_remaining: dict[str, int] = field(default_factory=dict)
+    ability_reload_timers: dict[str, float] = field(default_factory=dict)
+    pending_manual_abilities: set[str] = field(default_factory=set)
+    mwd_active_timer: float = 0.0
+    mwd_cooldown_timer: float = 0.0
+
+    @property
+    def type_name(self) -> str:
+        return self.definition.type_name
 
 
 @dataclass(slots=True)

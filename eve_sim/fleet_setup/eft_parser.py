@@ -4,12 +4,13 @@ import hashlib
 import re
 
 from ..user_errors import UserFacingError
-from .models import ParsedEftFit, ParsedModuleSpec
+from .models import ParsedCargoSpec, ParsedEftFit, ParsedModuleSpec
 
 
 class EftFitParser:
     _header_re = re.compile(r"^\[(?P<ship>[^,\]]+)\s*,\s*(?P<name>[^\]]+)\]$")
     _offline_suffixes = ("/offline", "/OFFLINE")
+    _stack_re = re.compile(r"^(?P<name>.+?)\s+x(?P<qty>\d+)$", re.IGNORECASE)
 
     def parse(self, fit_text: str) -> ParsedEftFit:
         lines = [line.strip() for line in fit_text.splitlines()]
@@ -27,6 +28,7 @@ class EftFitParser:
         modules: list[str] = []
         module_specs: list[ParsedModuleSpec] = []
         cargo_item_names: list[str] = []
+        cargo_specs: list[ParsedCargoSpec] = []
 
         for raw in lines[1:]:
             if raw.lower().startswith("dna:"):
@@ -34,10 +36,13 @@ class EftFitParser:
             if raw.lower().startswith("x-"):
                 continue
             line = raw
-            if " x" in line:
-                qty_name = line.split(" x", 1)[0].strip()
+            stack_match = self._stack_re.match(line)
+            if stack_match:
+                qty_name = stack_match.group("name").strip()
+                qty = max(1, int(stack_match.group("qty")))
                 if qty_name:
                     cargo_item_names.append(qty_name)
+                    cargo_specs.append(ParsedCargoSpec(item_name=qty_name, quantity=qty))
                 continue
             offline = False
             for suffix in self._offline_suffixes:
@@ -67,6 +72,7 @@ class EftFitParser:
             module_specs=module_specs,
             cargo_item_names=cargo_item_names,
             fit_key=f"eft-{fit_key}",
+            cargo_specs=cargo_specs,
         )
 
 

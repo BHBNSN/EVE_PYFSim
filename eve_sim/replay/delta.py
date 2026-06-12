@@ -7,8 +7,8 @@ from typing import Any
 from .schema import ReplayFrame, ReplaySnapshot
 
 
-COLLECTION_FIELDS = ("ships", "projectiles", "projectile_blasts", "bubble_fields")
-REPLACE_FIELDS = ("intents", "squad_focus_queues")
+COLLECTION_FIELDS = ("ships", "drones", "fighters", "projectiles", "projectile_blasts", "bubble_fields")
+REPLACE_FIELDS = ("intents", "squad_focus_queues", "squad_focus_updated_at")
 TIMELINE_FIELDS = {"tick", "now", "at"}
 FLOAT_EPSILON = 1e-3
 
@@ -79,10 +79,22 @@ def _advance_collection_item(field: str, item: Mapping[str, Any], dt: float) -> 
     advanced = deepcopy(dict(item))
     if dt <= 0.0:
         return advanced
-    if field in {"ships", "projectiles"} and "position" in advanced:
+    if field in {"ships", "drones", "fighters", "projectiles"} and "position" in advanced:
         advanced["position"] = _position_plus_velocity(advanced.get("position"), advanced.get("velocity"), dt)
     if field == "ships" and "module_cycle_timers" in advanced:
         advanced["module_cycle_timers"] = _advance_cycle_timers(advanced.get("module_cycle_timers"), dt)
+    if field == "drones":
+        for timer_key in ("cycle_timer", "ewar_cycle_timer"):
+            if timer_key in advanced:
+                advanced[timer_key] = max(0.0, _float(advanced.get(timer_key)) - dt)
+    if field == "fighters":
+        if "ability_cycle_timers" in advanced:
+            advanced["ability_cycle_timers"] = _advance_cycle_timers(advanced.get("ability_cycle_timers"), dt)
+        if "ability_reload_timers" in advanced:
+            advanced["ability_reload_timers"] = _advance_cycle_timers(advanced.get("ability_reload_timers"), dt)
+        for timer_key in ("mwd_active_timer", "mwd_cooldown_timer"):
+            if timer_key in advanced:
+                advanced[timer_key] = max(0.0, _float(advanced.get(timer_key)) - dt)
     if field == "projectiles":
         if "age" in advanced:
             advanced["age"] = max(0.0, _float(advanced.get("age")) + dt)
@@ -105,7 +117,7 @@ def _timeline_delta(previous: Mapping[str, Any], at: float) -> float:
 def _advance_snapshot(snapshot: dict[str, Any], dt: float) -> None:
     if dt <= 0.0:
         return
-    for field in ("ships", "projectiles"):
+    for field in COLLECTION_FIELDS:
         collection = snapshot.get(field)
         if not isinstance(collection, dict):
             continue

@@ -80,7 +80,7 @@ class EwarMixin:
             self._enforce_ecm_restrictions(ship, now_value)
 
     def _resolve_ecm_cycle(self, world: WorldState, source, module, target_id: str) -> None:
-        target = world.ships.get(target_id)
+        target = world.combat_entity(target_id)
         if target is None or not target.vital.alive:
             return
         if target_id not in source.combat.lock_targets:

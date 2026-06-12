@@ -100,7 +100,7 @@ class ShipAgent(BaseAgent):
         if self.current_order and self.current_order.kind == "ATTACK":
             target_id = str(self.current_order.payload.get("target_id", "") or "")
             queue = world.squad_focus_queues.get(self._focus_key(ship.team, ship.squad_id), [])
-            target = world.ships.get(target_id)
+            target = world.combat_entity(target_id)
             if not target_id or target_id not in queue or target is None or not target.vital.alive:
                 self.current_order = None
                 ship.combat.current_target = None
@@ -234,7 +234,7 @@ class CommanderAgent(BaseAgent):
             target_id = ship.combat.current_target
             if not target_id:
                 continue
-            target = world.ships.get(target_id)
+            target = world.combat_entity(target_id)
             if target is not None and target.vital.alive and target.team != ship.team:
                 return target_id
         return None
@@ -249,7 +249,7 @@ class CommanderAgent(BaseAgent):
         for target_id in queue:
             if target_id in seen:
                 continue
-            target = world.ships.get(target_id)
+            target = world.combat_entity(target_id)
             if (
                 target is None
                 or not target.vital.alive
@@ -335,6 +335,7 @@ class CommanderAgent(BaseAgent):
         members = self._alive_members(world, squad_id, self.team)
         if not members:
             world.squad_focus_queues.pop(focus_key, None)
+            world.squad_focus_updated_at.pop(focus_key, None)
             world.squad_prelocked_targets.pop(focus_key, None)
             world.squad_prelock_timers.pop(focus_key, None)
             return
@@ -361,7 +362,7 @@ class CommanderAgent(BaseAgent):
             current_target = ship.combat.current_target
             current_valid = False
             if current_target:
-                current_entity = world.ships.get(current_target)
+                current_entity = world.combat_entity(current_target)
                 current_valid = (
                     current_entity is not None
                     and current_entity.vital.alive
@@ -432,6 +433,7 @@ class CommanderAgent(BaseAgent):
             else:
                 queue = [intent.focus_target] + [tid for tid in queue if tid != intent.focus_target]
             world.squad_focus_queues[focus_key] = queue
+            world.squad_focus_updated_at[focus_key] = float(world.now)
             self._issue_attack(members, intent.focus_target, world.now)
 
         for ship in world.ships.values():

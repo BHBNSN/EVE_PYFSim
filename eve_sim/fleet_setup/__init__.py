@@ -24,12 +24,13 @@ from .engine import (
     resolve_module_type_name,
     resolve_runtime_from_pyfa_runtime,
 )
-from .models import ManualShipSetup, ParsedEftFit, ParsedModuleSpec, QUALITY_PRESETS
+from .models import ManualShipSetup, ParsedCargoSpec, ParsedEftFit, ParsedModuleSpec, QUALITY_PRESETS
 
 
 __all__ = [
     "EftFitParser",
     "ManualShipSetup",
+    "ParsedCargoSpec",
     "ParsedEftFit",
     "ParsedModuleSpec",
     "QUALITY_PRESETS",

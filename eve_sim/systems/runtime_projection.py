@@ -1006,7 +1006,7 @@ class RuntimeProjectionMixin:
                     target_id = source.combat.projected_targets.get(module.module_id)
                     if not target_id:
                         continue
-                    target = world.ships.get(target_id)
+                    target = world.combat_entity(target_id)
                     if target is None or not target.vital.alive or self._ship_hidden_from_targeting(target):
                         continue
 
@@ -1083,7 +1083,7 @@ class RuntimeProjectionMixin:
                 target_id = source.combat.projected_targets.get(active_projected_module.module_id)
                 if not target_id:
                     continue
-                target = world.ships.get(target_id)
+                target = world.combat_entity(target_id)
                 if target is None or not target.vital.alive or self._ship_hidden_from_targeting(target) or target.runtime is None:
                     continue
                 target_snapshot = self._module_cycle_snapshot_for_target(source.ship_id, active_projected_module.module_id, target_id)

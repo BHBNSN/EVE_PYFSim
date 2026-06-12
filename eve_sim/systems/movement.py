@@ -350,7 +350,7 @@ class MovementSystem:
         warp = ship.nav.warp
         source_system_id = str(getattr(ship.nav, "system_id", "") or "")
         if warp.target_ship_id:
-            target_ship = world.ships.get(str(warp.target_ship_id))
+            target_ship = world.combat_entity(str(warp.target_ship_id))
             if target_ship is None or not target_ship.vital.alive:
                 return None, 0.0
             if str(getattr(target_ship.nav, "system_id", "") or "") != source_system_id:
@@ -683,7 +683,7 @@ class MovementSystem:
     def _command_target_info(world: WorldState, ship) -> tuple[Vector2 | None, float, Vector2]:
         target_ship_id = str(getattr(ship.nav, "command_target_ship_id", "") or "").strip()
         if target_ship_id:
-            target_ship = world.ships.get(target_ship_id)
+            target_ship = world.combat_entity(target_ship_id)
             if target_ship is None or not target_ship.vital.alive:
                 return None, 0.0, Vector2(0.0, 0.0)
             if str(getattr(target_ship.nav, "system_id", "") or "") != str(getattr(ship.nav, "system_id", "") or ""):

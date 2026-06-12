@@ -29,6 +29,12 @@ QUALITY_PRESETS = {
 
 
 @dataclass(slots=True)
+class ParsedCargoSpec:
+    item_name: str
+    quantity: int = 1
+
+
+@dataclass(slots=True)
 class ParsedEftFit:
     ship_name: str
     fit_name: str
@@ -36,6 +42,7 @@ class ParsedEftFit:
     module_specs: list["ParsedModuleSpec"]
     cargo_item_names: list[str]
     fit_key: str
+    cargo_specs: list[ParsedCargoSpec] | None = None
 
 
 @dataclass(slots=True)
@@ -57,6 +64,7 @@ class ManualShipSetup:
 
 __all__ = [
     "ManualShipSetup",
+    "ParsedCargoSpec",
     "ParsedEftFit",
     "ParsedModuleSpec",
     "QUALITY_PRESETS",

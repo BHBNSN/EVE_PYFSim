@@ -8,7 +8,7 @@ from .agents import CommanderAgent, ShipAgent
 from .config import EngineConfig
 from .fleet_setup import prewarm_runtime_base_cache, prewarm_world_base_cache
 from .sim_logging import get_sim_logger, log_sim_event
-from .systems import CombatSystem, LogisticsSystem, MovementSystem, PerceptionSystem
+from .systems import CombatSystem, DeployableSystem, LogisticsSystem, MovementSystem, PerceptionSystem
 from .world import WorldState
 
 
@@ -29,6 +29,7 @@ class SimulationEngine:
             self.config.log_merge_window_sec,
             self.config.hotspot_logging,
         )
+        self.deployables = DeployableSystem(self.combat, self.movement)
         self.logistics = LogisticsSystem()
 
         self.tidi_factor: float = 1.0
@@ -121,6 +122,10 @@ class SimulationEngine:
             agent.think(self.world)
         self._log_hotspot("engine.ship_agents", perf_started, tick=self.world.tick, agents=len(self.ship_agents))
 
+        perf_started = time.perf_counter()
+        self.deployables.run(self.world, self._dt, advance_physics=False, apply_effects=False)
+        self._log_hotspot("engine.deployables.prepare", perf_started, tick=self.world.tick)
+
         substep_count = max(1, int(self.config.physics_substeps))
         base_slice_dt = self._dt / substep_count
         self.world.now = step_start
@@ -139,14 +144,23 @@ class SimulationEngine:
             self._log_hotspot("engine.movement", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
 
             perf_started = time.perf_counter()
-            self.combat.run(self.world, slice_dt)
-            self._log_hotspot("engine.combat", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
-
-            perf_started = time.perf_counter()
-            self.logistics.run(self.world, slice_dt)
-            self._log_hotspot("engine.logistics", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
+            self.deployables.run_physics(self.world, slice_dt)
+            self._log_hotspot("engine.deployables.physics", perf_started, tick=self.world.tick, slice_index=slice_index, slice_dt=slice_dt)
 
         self.world.now = step_end
+
+        perf_started = time.perf_counter()
+        self.combat.run(self.world, self._dt)
+        self._log_hotspot("engine.combat", perf_started, tick=self.world.tick, dt=self._dt)
+
+        perf_started = time.perf_counter()
+        self.deployables.run(self.world, self._dt, advance_physics=False, apply_effects=True)
+        self._log_hotspot("engine.deployables", perf_started, tick=self.world.tick, dt=self._dt)
+
+        perf_started = time.perf_counter()
+        self.logistics.run(self.world, self._dt)
+        self._log_hotspot("engine.logistics", perf_started, tick=self.world.tick, dt=self._dt)
+
         self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=substep_count)
 
     def snapshot(self) -> dict:
@@ -200,6 +214,72 @@ class SimulationEngine:
             "tick": self.world.tick,
             "now": self.world.now,
             "ships": ships,
+            "drones": {
+                drone_id: {
+                    "ship_id": drone_id,
+                    "owner_ship_id": drone.owner_ship_id,
+                    "team": drone.team.value,
+                    "squad_id": drone.squad_id,
+                    "type_name": drone.definition.type_name,
+                    "group_name": drone.definition.group_name,
+                    "max_velocity": float(drone.definition.max_velocity),
+                    "state": drone.state,
+                    "target_id": drone.target_id,
+                    "connected": bool(drone.connected),
+                    "target_command_at": float(drone.target_command_at),
+                    "alive": drone.vital.alive,
+                    "is_sentry": bool(drone.definition.is_sentry),
+                    "position": {"x": drone.nav.position.x, "y": drone.nav.position.y},
+                    "velocity": {"x": drone.nav.velocity.x, "y": drone.nav.velocity.y},
+                    "facing_deg": drone.nav.facing_deg,
+                    "system_id": str(getattr(drone.nav, "system_id", "") or ""),
+                    "shield": drone.vital.shield,
+                    "armor": drone.vital.armor,
+                    "structure": drone.vital.structure,
+                    "shield_max": drone.vital.shield_max,
+                    "armor_max": drone.vital.armor_max,
+                    "structure_max": drone.vital.structure_max,
+                    "cycle_timer": float(drone.cycle_timer),
+                    "ewar_cycle_timer": float(drone.ewar_cycle_timer),
+                }
+                for drone_id, drone in self.world.drones.items()
+            },
+            "fighters": {
+                fighter_id: {
+                    "ship_id": fighter_id,
+                    "owner_ship_id": fighter.owner_ship_id,
+                    "team": fighter.team.value,
+                    "squad_id": fighter.squad_id,
+                    "owner_squad_id": fighter.owner_squad_id,
+                    "type_name": fighter.definition.type_name,
+                    "group_name": fighter.definition.group_name,
+                    "slot_kind": fighter.definition.slot_kind,
+                    "squadron_size": int(fighter.definition.squadron_size),
+                    "max_velocity": float(fighter.definition.max_velocity),
+                    "state": fighter.state,
+                    "target_id": fighter.target_id,
+                    "connected": bool(fighter.connected),
+                    "target_command_at": float(fighter.target_command_at),
+                    "alive": fighter.vital.alive,
+                    "position": {"x": fighter.nav.position.x, "y": fighter.nav.position.y},
+                    "velocity": {"x": fighter.nav.velocity.x, "y": fighter.nav.velocity.y},
+                    "facing_deg": fighter.nav.facing_deg,
+                    "system_id": str(getattr(fighter.nav, "system_id", "") or ""),
+                    "shield": fighter.vital.shield,
+                    "armor": fighter.vital.armor,
+                    "structure": fighter.vital.structure,
+                    "shield_max": fighter.vital.shield_max,
+                    "armor_max": fighter.vital.armor_max,
+                    "structure_max": fighter.vital.structure_max,
+                    "ability_cycle_timers": {k: float(v) for k, v in fighter.ability_cycle_timers.items()},
+                    "ability_ammo_remaining": {k: int(v) for k, v in fighter.ability_ammo_remaining.items()},
+                    "ability_reload_timers": {k: float(v) for k, v in fighter.ability_reload_timers.items()},
+                    "pending_manual_abilities": sorted(str(k) for k in fighter.pending_manual_abilities),
+                    "mwd_active_timer": float(fighter.mwd_active_timer),
+                    "mwd_cooldown_timer": float(fighter.mwd_cooldown_timer),
+                }
+                for fighter_id, fighter in self.world.fighters.items()
+            },
             "projectiles": {
                 projectile_id: {
                     "projectile_id": projectile.projectile_id,
@@ -252,4 +332,5 @@ class SimulationEngine:
             },
             "intents": {k: asdict(v) for k, v in self.world.intents.items()},
             "squad_focus_queues": {k: list(v) for k, v in self.world.squad_focus_queues.items()},
+            "squad_focus_updated_at": {k: float(v) for k, v in self.world.squad_focus_updated_at.items()},
         }

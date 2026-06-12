@@ -17,6 +17,42 @@ class _NoopCombat:
         pass
 
 
+class _CountingMovement:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def run(self, _world, dt: float) -> None:
+        self.calls.append(float(dt))
+
+
+class _CountingCombat(_NoopCombat):
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def run(self, _world, dt: float) -> None:
+        self.calls.append(float(dt))
+
+
+class _CountingDeployables:
+    def __init__(self) -> None:
+        self.logic_calls: list[tuple[float, bool, bool]] = []
+        self.physics_calls: list[float] = []
+
+    def run(self, _world, dt: float, *, advance_physics: bool = True, apply_effects: bool = True) -> None:
+        self.logic_calls.append((float(dt), bool(advance_physics), bool(apply_effects)))
+
+    def run_physics(self, _world, dt: float) -> None:
+        self.physics_calls.append(float(dt))
+
+
+class _CountingLogistics:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def run(self, _world, dt: float) -> None:
+        self.calls.append(float(dt))
+
+
 class _FakeLanServer:
     client_connected = True
 
@@ -55,6 +91,30 @@ class SimulationTidiTests(unittest.TestCase):
         engine.step()
         self.assertEqual(engine.world.tick, 1)
         self.assertAlmostEqual(engine.world.now, 1.0)
+
+    def test_physics_substeps_only_repeat_position_velocity_systems(self) -> None:
+        combat = _CountingCombat()
+        engine = SimulationEngine(WorldState(), EngineConfig(tick_rate=1, physics_substeps=4), combat)  # type: ignore[arg-type]
+        movement = _CountingMovement()
+        deployables = _CountingDeployables()
+        logistics = _CountingLogistics()
+        engine.movement = movement  # type: ignore[assignment]
+        engine.deployables = deployables  # type: ignore[assignment]
+        engine.logistics = logistics  # type: ignore[assignment]
+
+        engine.step()
+
+        self.assertEqual(len(movement.calls), 4)
+        self.assertEqual(len(deployables.physics_calls), 4)
+        self.assertEqual(combat.calls, [1.0])
+        self.assertEqual(logistics.calls, [1.0])
+        self.assertEqual(
+            deployables.logic_calls,
+            [
+                (1.0, False, False),
+                (1.0, False, True),
+            ],
+        )
 
     def test_tidi_uses_elapsed_step_time_over_nominal_budget(self) -> None:
         engine = self._make_engine()

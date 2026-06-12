@@ -51,9 +51,9 @@ from ..fleet_setup import (
     get_fit_backend_status,
     get_common_chargeable_modules,
     get_ship_icon_key,
+    get_type_display_name,
     get_module_reload_time_sec,
     resolve_module_type_name,
-    get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
 
@@ -95,10 +95,13 @@ from ..systems import CombatSystem
 from .models import AreaCycleOverlay
 class BattleCanvas(QWidget):
     _SHIP_ICON_SIZE_PX = 25
+    _DEPLOYABLE_ICON_SIZE_PX = 16
     _STRUCTURE_ICON_SIZE_PX = 18
     _SCREEN_DRAW_MARGIN_PX = 256.0
     _SHIP_ICON_SOURCE_CACHE: dict[str, QImage] | None = None
     _SHIP_ICON_PIXMAP_CACHE: dict[tuple[str, int, int, int, int, int], QPixmap] = {}
+    _DEPLOYABLE_ICON_SOURCE_CACHE: dict[str, QImage] | None = None
+    _DEPLOYABLE_ICON_PIXMAP_CACHE: dict[tuple[str, int, int, int, int, int], QPixmap] = {}
     _MIN_ZOOM = 0.3
     _MAX_ZOOM = 100.0
     _ZOOM_WORLD_SCALE_BASE = 0.003
@@ -134,6 +137,11 @@ class BattleCanvas(QWidget):
         on_select_squad: Callable[[str], None],
         on_select_enemy: Callable[[str], None],
         on_show_structure_context_menu: Callable[[str, QPoint], None] | None = None,
+        squad_drone_types_getter: Callable[[str], list[str]] | None = None,
+        squad_fighter_types_getter: Callable[[str], list[str]] | None = None,
+        on_launch_squad_drones: Callable[[str, str], None] | None = None,
+        on_launch_squad_fighters: Callable[[str, str], None] | None = None,
+        on_recall_squad_deployables: Callable[[str], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -158,6 +166,11 @@ class BattleCanvas(QWidget):
         self.controlled_team_getter = controlled_team_getter
         self.on_select_squad = on_select_squad
         self.on_select_enemy = on_select_enemy
+        self.squad_drone_types_getter = squad_drone_types_getter or (lambda _squad: [])
+        self.squad_fighter_types_getter = squad_fighter_types_getter or (lambda _squad: [])
+        self.on_launch_squad_drones = on_launch_squad_drones or (lambda _squad, _type_name: None)
+        self.on_launch_squad_fighters = on_launch_squad_fighters or (lambda _squad, _type_name: None)
+        self.on_recall_squad_deployables = on_recall_squad_deployables or (lambda _squad: None)
         self.setMinimumSize(ui_cfg.width, ui_cfg.height)
 
         self.zoom = self._clamp_zoom(ui_cfg.world_to_screen_scale)
@@ -189,6 +202,19 @@ class BattleCanvas(QWidget):
     @staticmethod
     def _focus_key(team: Team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
+
+    def _ui_text(self, text: str) -> str:
+        if not str(self.language_getter() or "").lower().startswith("zh"):
+            return QCoreApplication.translate("eve_sim", text)
+        translations = {
+            "Launch Squad Drones": "释放小队无人机",
+            "Launch Squad Fighters": "释放小队舰载机",
+            "Recall Squad Drones/Fighters": "收回小队无人机/舰载机",
+        }
+        return translations.get(text, QCoreApplication.translate("eve_sim", text))
+
+    def _display_type_name(self, type_name: str) -> str:
+        return get_type_display_name(str(type_name or ""), language=self.language_getter())
 
     @classmethod
     def _ship_icon_dir(cls) -> Path:
@@ -256,6 +282,102 @@ class BattleCanvas(QWidget):
         if not icon_key:
             return None
         return cls._ship_icon_pixmap(icon_key, color, size_px or cls._SHIP_ICON_SIZE_PX)
+
+    @classmethod
+    def _ensure_deployable_icon_sources(cls) -> None:
+        if cls._DEPLOYABLE_ICON_SOURCE_CACHE is not None:
+            return
+        sources: dict[str, QImage] = {}
+        icon_dir = cls._ship_icon_dir()
+        if icon_dir.exists():
+            for path in sorted(icon_dir.glob("*_16.png")):
+                image = QImage(str(path))
+                if image.isNull():
+                    continue
+                stem = path.stem
+                icon_key = stem[:-3] if stem.endswith("_16") else stem
+                sources[str(icon_key)] = image
+        cls._DEPLOYABLE_ICON_SOURCE_CACHE = sources
+
+    @classmethod
+    def _deployable_icon_pixmap(cls, icon_key: str, color: QColor, size_px: int | None = None) -> QPixmap | None:
+        cls._ensure_deployable_icon_sources()
+        source = (cls._DEPLOYABLE_ICON_SOURCE_CACHE or {}).get(str(icon_key))
+        if source is None:
+            return None
+        size = int(size_px or cls._DEPLOYABLE_ICON_SIZE_PX)
+        cache_key = (
+            str(icon_key),
+            size,
+            int(color.red()),
+            int(color.green()),
+            int(color.blue()),
+            int(color.alpha()),
+        )
+        cached = cls._DEPLOYABLE_ICON_PIXMAP_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        scaled = source.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        tinted = QImage(scaled.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        try:
+            painter.drawImage(0, 0, scaled)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.fillRect(tinted.rect(), color)
+        finally:
+            if painter.isActive():
+                painter.end()
+        pixmap = QPixmap.fromImage(tinted)
+        cls._DEPLOYABLE_ICON_PIXMAP_CACHE[cache_key] = pixmap
+        return pixmap
+
+    @staticmethod
+    def _deployable_icon_key(entity) -> str:
+        definition = getattr(entity, "definition", None)
+        role = str(getattr(getattr(entity, "fit", None), "role", "") or "").upper()
+        group = str(getattr(definition, "group_name", "") or "").lower()
+        type_name = str(getattr(definition, "type_name", "") or "").lower()
+        if role.startswith("FIGHTER"):
+            slot = str(getattr(definition, "slot_kind", "") or "").lower()
+            if slot == "heavy":
+                return "fightersquadh"
+            if slot == "support":
+                return "fightersquadm"
+            return "fightersquad"
+        if bool(getattr(definition, "is_sentry", False)):
+            return "dronesentry"
+        if "logistic" in group or "logistic" in type_name:
+            return "dronelogistics"
+        ewar = getattr(definition, "ewar", None)
+        if "electronic" in group or "ewar" in group or bool(getattr(ewar, "has_effect", False)):
+            return "droneew"
+        if "fighter" in group or "fighter" in type_name:
+            return "dronefighter"
+        if "heavy" in group or "heavy" in type_name:
+            return "droneheavyattack"
+        if "medium" in group or "medium" in type_name:
+            return "dronemediumscout"
+        if "light" in group or "light" in type_name:
+            return "dronelightscout"
+        if "mining" in group or "mining" in type_name:
+            return "dronemining"
+        return "droneattack"
+
+    @classmethod
+    def _deployable_draw_color(cls, entity, controlled_team: Team, selected_squad: str) -> QColor:
+        if not entity.vital.alive:
+            return QColor(cls._DESTROYED_SHIP_COLOR)
+        if entity.team == controlled_team and entity.squad_id == selected_squad:
+            return QColor(cls._SELECTED_SQUAD_COLOR)
+        if entity.team == Team.BLUE:
+            return QColor(cls._TEAM_BLUE_COLOR)
+        return QColor(cls._TEAM_RED_COLOR)
 
     @classmethod
     def _ship_draw_color(cls, ship: ShipEntity, controlled_team: Team, selected_squad: str) -> QColor:
@@ -428,6 +550,23 @@ class BattleCanvas(QWidget):
             dist = (dx * dx + dy * dy) ** 0.5
             if dist <= chosen_dist:
                 chosen = ship
+                chosen_dist = dist
+        return chosen
+
+    def _pick_deployable_at(self, p: QPoint, max_px_distance: float = 12.0):
+        chosen = None
+        chosen_dist = max_px_distance
+        for entity in list(self.engine.world.drones.values()) + list(self.engine.world.fighters.values()):
+            if not entity.vital.alive:
+                continue
+            if not self._matches_current_view_system(getattr(entity.nav, "system_id", "")):
+                continue
+            sx, sy = self._to_screen(self._project_position(entity.nav.position, entity.nav.velocity))
+            dx = sx - p.x()
+            dy = sy - p.y()
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= chosen_dist:
+                chosen = entity
                 chosen_dist = dist
         return chosen
 
@@ -632,7 +771,8 @@ class BattleCanvas(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             clicked = self._pick_ship_at(event.position().toPoint())
-            clicked_beacon = None if clicked is not None else self._pick_beacon_at(event.position().toPoint())
+            clicked_deployable = None if clicked is not None else self._pick_deployable_at(event.position().toPoint())
+            clicked_beacon = None if clicked is not None or clicked_deployable is not None else self._pick_beacon_at(event.position().toPoint())
             if clicked is not None:
                 self.selected_ship_id = clicked.ship_id
                 self.selected_structure_id = None
@@ -643,6 +783,16 @@ class BattleCanvas(QWidget):
                 else:
                     self.selected_enemy_target = clicked.ship_id
                     self.on_select_enemy(clicked.ship_id)
+            elif clicked_deployable is not None:
+                self.selected_ship_id = clicked_deployable.ship_id
+                self.selected_structure_id = None
+                controlled_team = self.controlled_team_getter()
+                if clicked_deployable.team == controlled_team:
+                    self.selected_squad = clicked_deployable.squad_id
+                    self.on_select_squad(clicked_deployable.squad_id)
+                else:
+                    self.selected_enemy_target = clicked_deployable.ship_id
+                    self.on_select_enemy(clicked_deployable.ship_id)
             elif clicked_beacon is not None:
                 self.selected_ship_id = None
                 self.selected_structure_id = str(clicked_beacon.structure_id)
@@ -668,11 +818,18 @@ class BattleCanvas(QWidget):
         if event.button() == Qt.MouseButton.RightButton:
             world_target = self._to_world(event.position().toPoint())
             clicked = self._pick_ship_at(event.position().toPoint())
-            clicked_beacon = None if clicked is not None else self._pick_beacon_at(event.position().toPoint())
+            clicked_deployable = None if clicked is not None else self._pick_deployable_at(event.position().toPoint())
+            clicked_beacon = None if clicked is not None or clicked_deployable is not None else self._pick_beacon_at(event.position().toPoint())
             if clicked is not None and clicked.vital.alive:
                 self.selected_ship_id = clicked.ship_id
                 self.selected_structure_id = None
                 self.on_show_ship_context_menu(clicked.ship_id, event.globalPosition().toPoint())
+                self.update()
+                return
+            elif clicked_deployable is not None and clicked_deployable.vital.alive:
+                self.selected_ship_id = clicked_deployable.ship_id
+                self.selected_structure_id = None
+                self.on_show_ship_context_menu(clicked_deployable.ship_id, event.globalPosition().toPoint())
                 self.update()
                 return
             elif clicked_beacon is not None:
@@ -683,6 +840,27 @@ class BattleCanvas(QWidget):
                 return
 
             menu = QMenu(self)
+            squad = str(self.selected_squad or "")
+            drone_menu = menu.addMenu(self._ui_text("Launch Squad Drones"))
+            for type_name in self.squad_drone_types_getter(squad):
+                action = QAction(self._display_type_name(type_name), self)
+                action.triggered.connect(lambda _checked=False, name=type_name, sid=squad: self.on_launch_squad_drones(sid, name))
+                drone_menu.addAction(action)
+            if not drone_menu.actions():
+                drone_menu.setEnabled(False)
+
+            fighter_menu = menu.addMenu(self._ui_text("Launch Squad Fighters"))
+            for type_name in self.squad_fighter_types_getter(squad):
+                action = QAction(self._display_type_name(type_name), self)
+                action.triggered.connect(lambda _checked=False, name=type_name, sid=squad: self.on_launch_squad_fighters(sid, name))
+                fighter_menu.addAction(action)
+            if not fighter_menu.actions():
+                fighter_menu.setEnabled(False)
+
+            action_recall = QAction(self._ui_text("Recall Squad Drones/Fighters"), self)
+            action_recall.triggered.connect(lambda _checked=False, sid=squad: self.on_recall_squad_deployables(sid))
+            action_recall.setEnabled(bool(squad))
+            menu.addAction(action_recall)
             menu.addSeparator()
             squad_menu = menu.addMenu(QCoreApplication.translate("eve_sim", 'Induce Squad Here'))
             squads = self.controlled_squads_getter()
@@ -708,13 +886,20 @@ class BattleCanvas(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         clicked = self._pick_ship_at(event.position().toPoint())
-        clicked_beacon = None if clicked is not None else self._pick_beacon_at(event.position().toPoint())
+        clicked_deployable = None if clicked is not None else self._pick_deployable_at(event.position().toPoint())
+        clicked_beacon = None if clicked is not None or clicked_deployable is not None else self._pick_beacon_at(event.position().toPoint())
         if clicked is not None and clicked.vital.alive and self.selected_squad:
             controlled_team = self.controlled_team_getter()
             if clicked.team != controlled_team:
                 self.selected_enemy_target = clicked.ship_id
                 self.on_select_enemy(clicked.ship_id)
             self.on_issue_approach(self.selected_squad, clicked.ship_id)
+        elif clicked_deployable is not None and clicked_deployable.vital.alive and self.selected_squad:
+            controlled_team = self.controlled_team_getter()
+            if clicked_deployable.team != controlled_team:
+                self.selected_enemy_target = clicked_deployable.ship_id
+                self.on_select_enemy(clicked_deployable.ship_id)
+            self.on_issue_approach(self.selected_squad, clicked_deployable.ship_id)
         elif clicked_beacon is not None:
             self.focus_structure(str(clicked_beacon.structure_id))
         elif self.selected_squad:
@@ -971,6 +1156,87 @@ class BattleCanvas(QWidget):
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(projectile_color)
                 painter.drawEllipse(rect)
+
+            controlled_team = self.controlled_team_getter()
+            for drone in self.engine.world.drones.values():
+                if not drone.vital.alive or not self._matches_current_view_system(getattr(drone.nav, "system_id", "")):
+                    continue
+                point = self._screen_point_if_visible(self._project_position(drone.nav.position, drone.nav.velocity), 8.0)
+                if point is None:
+                    continue
+                x, y = point
+                color = self._deployable_draw_color(drone, controlled_team, self.selected_squad)
+                icon_key = self._deployable_icon_key(drone)
+                icon = self._deployable_icon_pixmap(icon_key, color)
+                if str(drone.ship_id) == str(self.selected_ship_id or ""):
+                    highlight_icon = self._deployable_icon_pixmap(
+                        icon_key,
+                        self._SELECTION_HIGHLIGHT_COLOR,
+                        self._DEPLOYABLE_ICON_SIZE_PX + 6,
+                    )
+                    if highlight_icon is not None:
+                        painter.drawPixmap(
+                            x - (highlight_icon.width() // 2),
+                            y - (highlight_icon.height() // 2),
+                            highlight_icon,
+                        )
+                    else:
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(self._SELECTION_HIGHLIGHT_COLOR)
+                        painter.drawEllipse(x - 6, y - 6, 12, 12)
+                if icon is not None:
+                    old_opacity = painter.opacity()
+                    if not getattr(drone, "connected", True):
+                        painter.setOpacity(0.42)
+                    painter.drawPixmap(x - (icon.width() // 2), y - (icon.height() // 2), icon)
+                    painter.setOpacity(old_opacity)
+                else:
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(color)
+                    painter.drawEllipse(x - 4, y - 4, 8, 8)
+
+            for fighter in self.engine.world.fighters.values():
+                if not fighter.vital.alive or not self._matches_current_view_system(getattr(fighter.nav, "system_id", "")):
+                    continue
+                point = self._screen_point_if_visible(self._project_position(fighter.nav.position, fighter.nav.velocity), 10.0)
+                if point is None:
+                    continue
+                x, y = point
+                color = self._deployable_draw_color(fighter, controlled_team, self.selected_squad)
+                icon_key = self._deployable_icon_key(fighter)
+                icon = self._deployable_icon_pixmap(icon_key, color)
+                if str(fighter.ship_id) == str(self.selected_ship_id or ""):
+                    highlight_icon = self._deployable_icon_pixmap(
+                        icon_key,
+                        self._SELECTION_HIGHLIGHT_COLOR,
+                        self._DEPLOYABLE_ICON_SIZE_PX + 8,
+                    )
+                    if highlight_icon is not None:
+                        painter.drawPixmap(
+                            x - (highlight_icon.width() // 2),
+                            y - (highlight_icon.height() // 2),
+                            highlight_icon,
+                        )
+                    else:
+                        painter.setPen(QPen(self._SELECTION_HIGHLIGHT_COLOR, 3))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawLine(x, y - 10, x + 10, y)
+                        painter.drawLine(x + 10, y, x, y + 10)
+                        painter.drawLine(x, y + 10, x - 10, y)
+                        painter.drawLine(x - 10, y, x, y - 10)
+                if icon is not None:
+                    old_opacity = painter.opacity()
+                    if not getattr(fighter, "connected", True):
+                        painter.setOpacity(0.42)
+                    painter.drawPixmap(x - (icon.width() // 2), y - (icon.height() // 2), icon)
+                    painter.setOpacity(old_opacity)
+                else:
+                    painter.setPen(QPen(color, 2))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawLine(x, y - 7, x + 7, y)
+                    painter.drawLine(x + 7, y, x, y + 7)
+                    painter.drawLine(x, y + 7, x - 7, y)
+                    painter.drawLine(x - 7, y, x, y - 7)
 
             leader_ship = self._selected_squad_leader_ship()
             if leader_ship is not None:

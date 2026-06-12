@@ -206,7 +206,7 @@ class ModuleCyclesMixin:
         for candidate_id in (previous_target_id, getattr(source.combat, "current_target", None)):
             if not candidate_id:
                 continue
-            target = world.ships.get(str(candidate_id))
+            target = world.combat_entity(str(candidate_id))
             if target is None or not target.vital.alive or target.team == source.team:
                 continue
             if not self._target_within_lock_range(source, target):
@@ -532,7 +532,7 @@ class ModuleCyclesMixin:
     ) -> tuple[str, ...]:
         retained_ids: list[str] = []
         for target_id in self._module_cycle_snapshots_for(source_ship_id, module_id):
-            target = world.ships.get(target_id)
+            target = world.combat_entity(target_id)
             if target is None or not target.vital.alive or self._ship_hidden_from_targeting(target):
                 continue
             if team is not None and target.team != team:
@@ -594,7 +594,7 @@ class ModuleCyclesMixin:
             if not projected_target_id:
                 self._module_cycle_target_snapshots.pop(snapshot_key, None)
                 return
-            target = world.ships.get(projected_target_id)
+            target = world.combat_entity(projected_target_id)
             if target is None or not target.vital.alive:
                 self._module_cycle_target_snapshots.pop(snapshot_key, None)
                 return
@@ -895,7 +895,7 @@ class ModuleCyclesMixin:
         if not target_id:
             return False
 
-        target = world.ships.get(target_id)
+        target = world.combat_entity(target_id)
         if target is None or not target.vital.alive or self._ship_hidden_from_targeting(target):
             return False
         if not self._target_within_lock_range(source, target):
@@ -1021,7 +1021,7 @@ class ModuleCyclesMixin:
         valid_prefocus_id: str | None = None
         for queue_index, raw_target_id in enumerate(focus_queue[:2]):
             target_id = str(raw_target_id)
-            target = world.ships.get(target_id)
+            target = world.combat_entity(target_id)
             if target is None or not target.vital.alive or target.team == source.team:
                 continue
             if not self._target_within_lock_range(source, target):
@@ -1593,7 +1593,7 @@ class ModuleCyclesMixin:
                 if desired_active and activation_target_id is not None and not metadata.is_bomb_launcher:
                     lock_ready = lock_ready_cache.get(activation_target_id)
                     if lock_ready is None:
-                        activation_target = world.ships.get(activation_target_id)
+                        activation_target = world.combat_entity(activation_target_id)
                         lock_ready = self._ensure_target_lock(
                             world,
                             ship,
@@ -1687,7 +1687,7 @@ class ModuleCyclesMixin:
                     if self._module_affects_pyfa_remote_inputs(module):
                         active_pyfa_remote_inputs_dirty = True
                     state_target_id = projected_target_id or previous_projected_target
-                    state_target = world.ships.get(state_target_id) if state_target_id else None
+                    state_target = world.combat_entity(state_target_id) if state_target_id else None
                     self._queue_merged_event(
                         "active_module_state_switch",
                         merge_fields={
@@ -1704,7 +1704,7 @@ class ModuleCyclesMixin:
 
                 if cycle_started:
                     effects = ",".join(effect.name for effect in active_effects)
-                    cycle_target = world.ships.get(projected_target_id) if projected_target_id else None
+                    cycle_target = world.combat_entity(projected_target_id) if projected_target_id else None
                     self._queue_merged_event(
                         "active_module_cycle",
                         merge_fields={
@@ -1817,7 +1817,7 @@ class ModuleCyclesMixin:
             for target_id in queue:
                 if target_id in seen:
                     continue
-                target = world.ships.get(target_id)
+                target = world.combat_entity(target_id)
                 if target is None or (not target.vital.alive) or self._ship_hidden_from_targeting(target) or target.team == own_team:
                     continue
                 seen.add(target_id)
@@ -1858,7 +1858,7 @@ class ModuleCyclesMixin:
                 for target_id in pre_targets:
                     if target_id in ship_prelocked:
                         continue
-                    target = world.ships.get(target_id)
+                    target = world.combat_entity(target_id)
                     if target is None or not target.vital.alive:
                         continue
                     if not self._target_within_lock_range(ship, target, source_profile=attacker_profile):
