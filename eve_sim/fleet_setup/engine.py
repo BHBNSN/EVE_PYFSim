@@ -3647,6 +3647,7 @@ def _ship_group_to_icon_key(group_name: str) -> str | None:
         or "assault frigate" in group
         or "expedition frigate" in group
         or "logistics frigate" in group
+        or "stealth bomber" in group
     ):
         return "frigate"
     if "industrial" in group or "hauler" in group:
