@@ -8,6 +8,52 @@ from .models import FleetIntent, Order, ShipEntity, Team
 from .world import WorldState
 
 
+def _ship_warp_idle(ship: ShipEntity) -> bool:
+    return str(getattr(getattr(ship.nav, "warp", None), "phase", "idle") or "idle") == "idle"
+
+
+def _valid_squad_leader_candidate(ship: ShipEntity | None, team: Team, squad_id: str, *, require_idle: bool) -> bool:
+    if ship is None or not ship.vital.alive or ship.team != team or ship.squad_id != squad_id:
+        return False
+    return (not require_idle) or _ship_warp_idle(ship)
+
+
+def _alive_squad_leader_candidates(world: WorldState, team: Team, squad_id: str, *, require_idle: bool) -> list[ShipEntity]:
+    return [
+        s
+        for s in world.ships.values()
+        if _valid_squad_leader_candidate(s, team, squad_id, require_idle=require_idle)
+    ]
+
+
+def _choose_squad_leader(world: WorldState, team: Team, squad_id: str, *, require_idle: bool = False) -> ShipEntity | None:
+    squad_key = f"{team.value}:{squad_id}"
+    mapped_id = str(world.squad_leaders.get(squad_key, "") or "")
+    mapped_ship = world.ships.get(mapped_id) if mapped_id else None
+    if _valid_squad_leader_candidate(mapped_ship, team, squad_id, require_idle=require_idle):
+        return mapped_ship
+
+    members = _alive_squad_leader_candidates(world, team, squad_id, require_idle=require_idle)
+    if not members:
+        return None
+
+    previous_group_id = str(getattr(mapped_ship, "ship_group_id", "") or "") if mapped_ship is not None else ""
+    if previous_group_id:
+        same_group_members = [
+            member
+            for member in members
+            if str(getattr(member, "ship_group_id", "") or "") == previous_group_id
+        ]
+        if same_group_members:
+            leader = random.choice(same_group_members)
+            world.squad_leaders[squad_key] = leader.ship_id
+            return leader
+
+    leader = random.choice(members)
+    world.squad_leaders[squad_key] = leader.ship_id
+    return leader
+
+
 @dataclass(slots=True)
 class BaseAgent:
     agent_id: str
@@ -65,32 +111,7 @@ class ShipAgent(BaseAgent):
 
     @staticmethod
     def _find_squad_leader(world: WorldState, ship: ShipEntity) -> ShipEntity | None:
-        squad_key = f"{ship.team.value}:{ship.squad_id}"
-        mapped_id = world.squad_leaders.get(squad_key)
-        if mapped_id:
-            mapped_ship = world.ships.get(mapped_id)
-            if (
-                mapped_ship is not None
-                and mapped_ship.vital.alive
-                and str(getattr(getattr(mapped_ship.nav, "warp", None), "phase", "idle") or "idle") == "idle"
-                and mapped_ship.team == ship.team
-                and mapped_ship.squad_id == ship.squad_id
-            ):
-                return mapped_ship
-
-        members = [
-            s
-            for s in world.ships.values()
-            if s.team == ship.team
-            and s.squad_id == ship.squad_id
-            and s.vital.alive
-            and str(getattr(getattr(s.nav, "warp", None), "phase", "idle") or "idle") == "idle"
-        ]
-        if not members:
-            return None
-        leader = random.choice(members)
-        world.squad_leaders[squad_key] = leader.ship_id
-        return leader
+        return _choose_squad_leader(world, ship.team, ship.squad_id, require_idle=True)
 
     def think(self, world: WorldState) -> None:
         ship = self._ship(world)
@@ -405,16 +426,8 @@ class CommanderAgent(BaseAgent):
 
     def _dispatch_intent(self, world: WorldState, intent: FleetIntent) -> None:
         members = self._alive_members(world, intent.squad_id, self.team)
-        leader_id = random.choice(members).ship_id if members else None
-        if members:
-            squad_key = f"{members[0].team.value}:{intent.squad_id}"
-            mapped = world.squad_leaders.get(squad_key)
-            if mapped:
-                mapped_ship = world.ships.get(mapped)
-                if mapped_ship is not None and mapped_ship.vital.alive and mapped_ship.squad_id == intent.squad_id:
-                    leader_id = mapped_ship.ship_id
-            if leader_id is not None:
-                world.squad_leaders[squad_key] = leader_id
+        leader = _choose_squad_leader(world, self.team, intent.squad_id)
+        leader_id = leader.ship_id if leader is not None else None
 
         if intent.focus_target:
             focus_key = self._focus_key(self.team, intent.squad_id)

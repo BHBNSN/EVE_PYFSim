@@ -139,15 +139,22 @@ class FleetLibraryDialog(QDialog):
         self.fleet_combo = QComboBox(self)
         self.btn_new = QPushButton(QCoreApplication.translate("eve_sim", 'New'))
         self.btn_delete = QPushButton(QCoreApplication.translate("eve_sim", 'Delete'))
-        self.btn_save = QPushButton(QCoreApplication.translate("eve_sim", 'Save'))
         top.addWidget(self.lbl_fleet)
         top.addWidget(self.fleet_combo, 1)
         top.addWidget(self.btn_new)
         top.addWidget(self.btn_delete)
-        top.addWidget(self.btn_save)
         layout.addLayout(top)
 
         body = QHBoxLayout()
+        table_column = QVBoxLayout()
+        self.ship_table_hint = QLabel(
+            QCoreApplication.translate(
+                "eve_sim",
+                "Ships with the same squad name share movement logic in simulation. In most cases the squad leader is the follow target for other members. Assign ships to different squads if they need different movement. If no squad leader is set, one ship is selected randomly. When a squad leader is destroyed, another member from the same ship group is preferred; if none remain, any squad member may be selected. Marking a ship group with count greater than 1 picks one member randomly as leader. Paste ship fits from the in-game fitting window using Copy to Clipboard.",
+            )
+        )
+        self.ship_table_hint.setWordWrap(True)
+        table_column.addWidget(self.ship_table_hint)
         self.table_model = FleetSetupTableModel([], lambda: self._lang)
         self.table = QTableView(self)
         self.table.setModel(self.table_model)
@@ -156,7 +163,8 @@ class FleetLibraryDialog(QDialog):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.table.setColumnHidden(0, True)
-        body.addWidget(self.table, 3)
+        table_column.addWidget(self.table, 1)
+        body.addLayout(table_column, 3)
 
         right = QVBoxLayout()
         self.btn_add_row = QPushButton(QCoreApplication.translate("eve_sim", 'Add Ship'))
@@ -179,7 +187,6 @@ class FleetLibraryDialog(QDialog):
         self.fleet_combo.currentTextChanged.connect(self._on_fleet_changed)
         self.btn_new.clicked.connect(self._new_fleet)
         self.btn_delete.clicked.connect(self._delete_fleet)
-        self.btn_save.clicked.connect(self._save_current)
         self.btn_add_row.clicked.connect(self._add_row)
         self.btn_remove_row.clicked.connect(self._remove_row)
         self.table.clicked.connect(self._on_table_clicked)
@@ -188,22 +195,25 @@ class FleetLibraryDialog(QDialog):
         actions.accepted.connect(self._on_accept)
         actions.rejected.connect(self.reject)
 
-        self._refresh_combo()
-        if self.fleet_combo.count() > 0:
-            self._on_fleet_changed(self.fleet_combo.currentText())
+        selected_name = self._refresh_combo()
+        self._load_fleet(selected_name)
 
     @property
     def templates(self) -> dict[str, list[dict]]:
         return self._templates
 
-    def _refresh_combo(self) -> None:
+    def _refresh_combo(self, select_name: str | None = None) -> str:
         names = sorted(self._templates.keys())
+        selected_name = ""
+        if names:
+            selected_name = select_name if select_name in self._templates else names[0]
         self.fleet_combo.blockSignals(True)
         self.fleet_combo.clear()
         self.fleet_combo.addItems(names)
+        if selected_name:
+            self.fleet_combo.setCurrentText(selected_name)
         self.fleet_combo.blockSignals(False)
-        if names:
-            self.fleet_combo.setCurrentText(names[0])
+        return selected_name
 
     def _rows_from_template(self, name: str) -> list[SetupRow]:
         out: list[SetupRow] = []
@@ -219,7 +229,7 @@ class FleetLibraryDialog(QDialog):
                 quality=quality,
                 quantity=max(1, int(float(item.get("quantity", 1)))),
                 fit_text=str(item.get("fit_text", "")),
-                is_leader=bool(item.get("is_leader", False)) and max(1, int(float(item.get("quantity", 1)))) == 1,
+                is_leader=bool(item.get("is_leader", False)),
             )
             try:
                 parsed = self._parser.parse(row.fit_text)
@@ -236,7 +246,7 @@ class FleetLibraryDialog(QDialog):
                 "quality": row.quality.value,
                 "quantity": int(max(1, row.quantity)),
                 "fit_text": row.fit_text,
-                "is_leader": bool(row.is_leader) and int(max(1, row.quantity)) == 1,
+                "is_leader": bool(row.is_leader),
             }
             for row in self.table_model.rows
         ]
@@ -253,20 +263,24 @@ class FleetLibraryDialog(QDialog):
             squad_to_indices.setdefault(squad, []).append(idx)
 
         for indices in squad_to_indices.values():
-            leader_indices = [
-                i
-                for i in indices
-                if bool(rows[i].get("is_leader", False)) and int(rows[i].get("quantity", 1) or 1) == 1
-            ]
-            single_indices = [i for i in indices if int(rows[i].get("quantity", 1) or 1) == 1]
-            chosen = leader_indices[0] if leader_indices else (single_indices[0] if single_indices else -1)
+            leader_indices = [i for i in indices if bool(rows[i].get("is_leader", False))]
+            chosen = leader_indices[0] if leader_indices else -1
             for i in indices:
-                rows[i]["is_leader"] = (i == chosen) and int(rows[i].get("quantity", 1) or 1) == 1
+                rows[i]["is_leader"] = i == chosen
         return rows
 
     def _on_fleet_changed(self, name: str) -> None:
+        selected_name = name.strip()
+        if selected_name == self._current_name:
+            return
+        self._cache_current()
+        self._load_fleet(selected_name)
+
+    def _cache_current(self) -> None:
         if self._current_name:
             self._templates[self._current_name] = self._template_from_rows()
+
+    def _load_fleet(self, name: str) -> None:
         self._current_name = name.strip()
         self.table_model.replace_rows(self._rows_from_template(self._current_name))
         if self.table_model.rowCount() > 0:
@@ -290,10 +304,10 @@ class FleetLibraryDialog(QDialog):
                 QCoreApplication.translate("eve_sim", "Fleet '{name}' already exists. Please use a different name.").format(name=fleet_name),
             )
             return
+        self._cache_current()
         self._templates[fleet_name] = []
-        self._refresh_combo()
-        self.fleet_combo.setCurrentText(fleet_name)
-        self._on_fleet_changed(fleet_name)
+        selected_name = self._refresh_combo(fleet_name)
+        self._load_fleet(selected_name)
 
     def _delete_fleet(self) -> None:
         name = self.fleet_combo.currentText().strip()
@@ -301,13 +315,8 @@ class FleetLibraryDialog(QDialog):
             return
         self._templates.pop(name, None)
         self._current_name = ""
-        self._refresh_combo()
-
-    def _save_current(self) -> None:
-        name = self.fleet_combo.currentText().strip()
-        if not name:
-            return
-        self._templates[name] = self._template_from_rows()
+        selected_name = self._refresh_combo()
+        self._load_fleet(selected_name)
 
     def _add_row(self) -> None:
         previous: SetupRow | None = None
@@ -369,7 +378,7 @@ class FleetLibraryDialog(QDialog):
         self.table_model.update_fit_meta(idx.row(), fit_name)
 
     def _on_accept(self) -> None:
-        self._save_current()
+        self._cache_current()
         self.accept()
 
 

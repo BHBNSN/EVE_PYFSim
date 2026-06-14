@@ -156,6 +156,7 @@ def _ship_from_snapshot(ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
         ship_id=str(ship_id),
         team=_team(data.get("team")),
         squad_id=str(data.get("squad_id") or ""),
+        ship_group_id=str(data.get("ship_group_id") or ""),
         fit=fit,
         profile=profile,
         nav=nav,

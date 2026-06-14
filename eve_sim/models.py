@@ -518,6 +518,7 @@ class ShipEntity:
     drone_bay: list[DroneBayEntry] = field(default_factory=list)
     fighter_bay: list[FighterBayEntry] = field(default_factory=list)
     deployable_control: DeployableControlState = field(default_factory=DeployableControlState)
+    ship_group_id: str = ""
 
 
 @dataclass(slots=True)

@@ -3820,7 +3820,8 @@ def build_world_from_manual_setup(
     parser = EftFitParser()
     factory = RuntimeFromEftFactory()
     counters: dict[tuple[Team, str], int] = {}
-    first_ship_per_squad: dict[str, str] = {}
+    ships_per_squad: dict[str, list[str]] = {}
+    leader_candidates_per_squad: dict[str, list[str]] = {}
     squad_centers: dict[tuple[Team, str], Vector2] = {}
     squad_system_ids: dict[tuple[Team, str], str] = {}
     claimed_anchor_counts: dict[str, int] = {}
@@ -3832,6 +3833,8 @@ def build_world_from_manual_setup(
         runtime = deepcopy(runtime_template)
         profile = factory.build_profile(parsed)
         drone_bay, fighter_bay, deployable_control = factory.build_deployable_manifest(parsed)
+        setup_group_id = str(getattr(setup, "ship_group_id", "") or "").strip()
+        ship_group_id = setup_group_id or f"{setup.team.value}:{setup.squad_id}:{setup.quality.value}:{parsed.fit_key}"
 
         key = (setup.team, setup.squad_id)
         if key not in squad_centers:
@@ -3882,18 +3885,19 @@ def build_world_from_manual_setup(
             drone_bay=list(drone_bay),
             fighter_bay=list(fighter_bay),
             deployable_control=deepcopy(deployable_control),
+            ship_group_id=ship_group_id,
         )
         world.ships[ship_id] = ship
 
         squad_key = f"{setup.team.value}:{setup.squad_id}"
-        if squad_key not in first_ship_per_squad:
-            first_ship_per_squad[squad_key] = ship_id
-        if setup.is_leader and squad_key not in world.squad_leaders:
-            world.squad_leaders[squad_key] = ship_id
+        ships_per_squad.setdefault(squad_key, []).append(ship_id)
+        if setup.is_leader:
+            leader_candidates_per_squad.setdefault(squad_key, []).append(ship_id)
 
-    for squad_key, first_ship_id in first_ship_per_squad.items():
-        if squad_key not in world.squad_leaders:
-            world.squad_leaders[squad_key] = first_ship_id
+    for squad_key, ship_ids in ships_per_squad.items():
+        leader_candidates = leader_candidates_per_squad.get(squad_key) or ship_ids
+        if leader_candidates:
+            world.squad_leaders[squad_key] = random.choice(leader_candidates)
 
     return world
 

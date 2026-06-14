@@ -134,8 +134,6 @@ class FleetSetupDialog(QDialog):
         lang_row.addStretch(1)
         layout.addLayout(lang_row)
 
-        self.hint = QLabel(QCoreApplication.translate("eve_sim", 'Each row is one ship. Paste EFT text below ([Ship, Fit]). Duplicate fits are cached.'))
-        layout.addWidget(self.hint)
         self.backend = QLabel(f"{QCoreApplication.translate("eve_sim", 'Backend')}: {get_fit_backend_status()}")
         layout.addWidget(self.backend)
 
@@ -331,10 +329,10 @@ class FleetSetupDialog(QDialog):
                             "quality": str(item.get("quality", "REGULAR")).strip() or "REGULAR",
                             "quantity": quantity,
                             "fit_text": str(item.get("fit_text", "")).strip(),
-                            "is_leader": bool(item.get("is_leader", False)) and quantity == 1,
+                            "is_leader": bool(item.get("is_leader", False)),
                         }
                     )
-                out[name] = cleaned
+                out[name] = FleetLibraryDialog._normalize_leaders(cleaned)
             return out
         except Exception:
             return self._default_fleet_templates()
@@ -396,7 +394,7 @@ class FleetSetupDialog(QDialog):
                 quality=quality,
                 quantity=max(1, int(float(item.get("quantity", 1)))),
                 fit_text=str(item.get("fit_text", "")),
-                is_leader=bool(item.get("is_leader", False)) and max(1, int(float(item.get("quantity", 1)))) == 1,
+                is_leader=bool(item.get("is_leader", False)),
             )
             try:
                 parsed = self._parser.parse(row.fit_text)
@@ -485,7 +483,6 @@ class FleetSetupDialog(QDialog):
         self.lbl_blue_preview.setText(QCoreApplication.translate("eve_sim", 'Blue Preview'))
         self.lbl_red_preview.setText(QCoreApplication.translate("eve_sim", 'Red Preview'))
         self.btn_open_fleet_library.setText(QCoreApplication.translate("eve_sim", 'Open Fleet Library'))
-        self.hint.setText(QCoreApplication.translate("eve_sim", 'Each row is one ship. Paste EFT text below ([Ship, Fit]). Duplicate fits are cached.'))
         self.backend.setText(f"{QCoreApplication.translate("eve_sim", 'Backend')}: {get_fit_backend_status()}")
         self.btn_add_blue.setText(QCoreApplication.translate("eve_sim", 'Add Blue Ship'))
         self.btn_add_red.setText(QCoreApplication.translate("eve_sim", 'Add Red Ship'))
@@ -712,8 +709,10 @@ class FleetSetupDialog(QDialog):
 
     def to_manual_setup(self) -> list[ManualShipSetup]:
         rows: list[ManualShipSetup] = []
-        for row in self.model.rows:
+        for row_index, row in enumerate(self.model.rows):
             quantity = max(1, int(row.quantity))
+            leader_member_index = random.randrange(quantity) if row.is_leader else -1
+            ship_group_id = f"{row.team.value}:{row.squad_id.strip().upper()}:{row_index}"
             for i in range(quantity):
                 rows.append(
                     ManualShipSetup(
@@ -722,7 +721,8 @@ class FleetSetupDialog(QDialog):
                         quality=row.quality,
                         position=Vector2(0.0, 0.0),
                         fit_text=row.fit_text,
-                        is_leader=bool(row.is_leader) and quantity == 1 and i == 0,
+                        is_leader=bool(row.is_leader) and i == leader_member_index,
+                        ship_group_id=ship_group_id,
                     )
                 )
         group_indices: dict[tuple[str, str], list[int]] = {}
@@ -731,7 +731,7 @@ class FleetSetupDialog(QDialog):
             group_indices.setdefault(key, []).append(idx)
         for indices in group_indices.values():
             flagged = [idx for idx in indices if rows[idx].is_leader]
-            chosen = flagged[0] if flagged else indices[0]
+            chosen = flagged[0] if flagged else random.choice(indices)
             for idx in indices:
                 rows[idx].is_leader = (idx == chosen)
         return rows

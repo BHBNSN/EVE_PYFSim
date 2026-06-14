@@ -4256,6 +4256,7 @@ class MainWindow(QMainWindow):
             ship_id=ship_id,
             team=team,
             squad_id=str(data.get("squad_id", "")),
+            ship_group_id=str(data.get("ship_group_id", "") or ""),
             fit=fit,
             profile=profile,
             nav=NavigationState(
@@ -4411,6 +4412,7 @@ class MainWindow(QMainWindow):
                     "ship_id": ship.ship_id,
                     "team": ship.team.value,
                     "squad_id": ship.squad_id,
+                    "ship_group_id": str(getattr(ship, "ship_group_id", "") or ""),
                     "ship_name": ship.fit.ship_name,
                     "fit_text": self._ship_fit_texts.get(ship.ship_id, ""),
                     "fit_role": ship.fit.role,
@@ -4530,6 +4532,7 @@ class MainWindow(QMainWindow):
                 continue
             ship = self._ensure_remote_ship(str(ship_id), raw)
             ship.squad_id = str(raw.get("squad_id", ship.squad_id))
+            ship.ship_group_id = str(raw.get("ship_group_id", getattr(ship, "ship_group_id", "")) or "")
             ship.team = Team.BLUE if str(raw.get("team", ship.team.value)) == "BLUE" else Team.RED
             pos = raw.get("position", {})
             vel = raw.get("velocity", {})

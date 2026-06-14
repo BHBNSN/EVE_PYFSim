@@ -141,6 +141,23 @@ class FleetSetupTableModel(QAbstractTableModel):
             flags |= Qt.ItemFlag.ItemIsEditable
         return flags
 
+    @staticmethod
+    def _leader_scope(row: SetupRow) -> tuple[str, str]:
+        return row.team.value, row.squad_id.strip().upper()
+
+    def _clear_other_leaders_in_scope(self, row_index: int) -> list[int]:
+        if not (0 <= row_index < len(self.rows)):
+            return []
+        scope = self._leader_scope(self.rows[row_index])
+        changed: list[int] = []
+        for idx, other in enumerate(self.rows):
+            if idx == row_index or not other.is_leader:
+                continue
+            if self._leader_scope(other) == scope:
+                other.is_leader = False
+                changed.append(idx)
+        return changed
+
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self.rows)):
             return None
@@ -178,16 +195,18 @@ class FleetSetupTableModel(QAbstractTableModel):
                 row.quality = QualityLevel(str(value).strip().upper())
             elif col == 3:
                 row.quantity = max(1, int(float(value)))
-                if row.quantity != 1:
-                    row.is_leader = False
             elif col == 4:
                 text = str(value).strip().upper()
-                row.is_leader = (row.quantity == 1) and (text in ("1", "Y", "YES", "TRUE", "T", "闃熼暱", "LEADER"))
+                row.is_leader = text in ("1", "Y", "YES", "TRUE", "T", "队长", "LEADER")
             else:
                 return False
         except Exception:
             return False
         self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
+        if row.is_leader and col in {0, 1, 4}:
+            for changed_row in self._clear_other_leaders_in_scope(index.row()):
+                leader_index = self.index(changed_row, 4)
+                self.dataChanged.emit(leader_index, leader_index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
         return True
 
     def add_row(self, row: SetupRow) -> None:

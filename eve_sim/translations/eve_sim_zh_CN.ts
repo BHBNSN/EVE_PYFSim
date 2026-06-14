@@ -1439,6 +1439,11 @@
         <translation>删除</translation>
     </message>
     <message>
+        <location filename="../gui/dialogs.py" line="151" />
+        <source>Ships with the same squad name share movement logic in simulation. In most cases the squad leader is the follow target for other members. Assign ships to different squads if they need different movement. If no squad leader is set, one ship is selected randomly. When a squad leader is destroyed, another member from the same ship group is preferred; if none remain, any squad member may be selected. Marking a ship group with count greater than 1 picks one member randomly as leader. Paste ship fits from the in-game fitting window using Copy to Clipboard.</source>
+        <translation>相同小队名会在模拟中使用相同走位逻辑。大部分情况下小队长是其他成员的跟随目标；如果需要不同走位，请分配至不同小队。未设置小队长时会随机选择一艘船作为小队长。小队长阵亡后会优先从同舰船组随机选择；若同组全灭，则从小队内完全随机选择。数量大于 1 的舰船组设为小队长时，会随机 1 个成员担任小队长。舰船配置粘贴应来源于游戏内舰船装配的“复制到剪贴板”。</translation>
+    </message>
+    <message>
         <location filename="../gui/dialogs.py" line="142" />
         <source>Save</source>
         <translation>保存</translation>

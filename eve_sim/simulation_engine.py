@@ -176,6 +176,7 @@ class SimulationEngine:
                 "ship_id": ship_id,
                 "team": ship.team.value,
                 "squad_id": ship.squad_id,
+                "ship_group_id": str(getattr(ship, "ship_group_id", "") or ""),
                 "ship_name": ship.fit.ship_name,
                 "alive": ship.vital.alive,
                 "position": {"x": ship.nav.position.x, "y": ship.nav.position.y},

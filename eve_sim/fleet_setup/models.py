@@ -60,6 +60,7 @@ class ManualShipSetup:
     position: Vector2
     fit_text: str
     is_leader: bool = False
+    ship_group_id: str = ""
 
 
 __all__ = [
