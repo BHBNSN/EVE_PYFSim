@@ -331,8 +331,8 @@ class FleetLibraryDialog(QDialog):
                 squad_id=previous.squad_id if previous else "ALPHA",
                 quality=QualityLevel.REGULAR,
                 quantity=1,
-                fit_text=previous.fit_text if previous else "",
-                fit_name=previous.fit_name if previous else "",
+                fit_text="",
+                fit_name="",
             )
         )
         self.table.selectRow(self.table_model.rowCount() - 1)
