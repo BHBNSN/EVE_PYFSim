@@ -57,7 +57,7 @@ from ..fleet_setup import (
     resolve_module_type_name,
     get_type_display_name,
 )
-from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
+from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine, FitRuntime
 from ..i18n import install_language, normalize_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
