@@ -2703,5 +2703,29 @@
         <source>No systems</source>
         <translation>没有星系</translation>
     </message>
+    <message>
+        <source>Implant not found in pyfa: {name}</source>
+        <translation>pyfa 中未找到植入体：{name}</translation>
+    </message>
+    <message>
+        <source>Booster not found in pyfa: {name}</source>
+        <translation>pyfa 中未找到增效剂：{name}</translation>
+    </message>
+    <message>
+        <source>Unknown error</source>
+        <translation>未知错误</translation>
+    </message>
+    <message>
+        <source>Row {row}: {error}</source>
+        <translation>第 {row} 行：{error}</translation>
+    </message>
+    <message>
+        <source>Unparseable fits:</source>
+        <translation>无法解析的装配：</translation>
+    </message>
+    <message>
+        <source>Mutation block contains non-English item names. This is a known old pyfa bug; export EFT from English pyfa/client or update pyfa to the latest version.</source>
+        <translation>变异属性块包含非英文物品名。这是旧版 pyfa 的已知问题；请使用英文 pyfa/客户端导出 EFT，或将 pyfa 更新到最新版本。</translation>
+    </message>
 </context>
 </TS>

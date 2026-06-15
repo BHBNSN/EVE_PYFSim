@@ -24,7 +24,7 @@ from .engine import (
     resolve_module_type_name,
     resolve_runtime_from_pyfa_runtime,
 )
-from .models import ManualShipSetup, ParsedCargoSpec, ParsedEftFit, ParsedModuleSpec, QUALITY_PRESETS
+from .models import ManualShipSetup, ParsedCargoSpec, ParsedEftFit, ParsedModuleSpec, ParsedMutationSpec, QUALITY_PRESETS
 
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "ParsedCargoSpec",
     "ParsedEftFit",
     "ParsedModuleSpec",
+    "ParsedMutationSpec",
     "QUALITY_PRESETS",
     "RuntimeFromEftFactory",
     "_PYFA_PRECALCULATED_LOCAL_BASE_FIT_CACHE",

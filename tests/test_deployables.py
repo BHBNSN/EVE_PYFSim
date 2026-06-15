@@ -178,6 +178,109 @@ def test_eft_parser_preserves_cargo_stack_quantities() -> None:
     ]
 
 
+def test_eft_parser_ignores_pyfa_mutation_detail_blocks() -> None:
+    fit_text = """[Typhoon Fleet Issue, Mutated]
+Heavy Gremlin Compact Energy Neutralizer [1]
+Hobgoblin II x5 [2]
+
+
+[1] Heavy Gremlin Compact Energy Neutralizer
+  Unstable Heavy Energy Neutralizer Mutaplasmid
+  capacitorNeed 500.0, cpu 32.0
+
+[2] Hobgoblin II
+  Decayed Drone Mutaplasmid
+  maxVelocity 5000.0
+"""
+
+    parsed = EftFitParser().parse(fit_text)
+
+    assert parsed.module_names == ["Heavy Gremlin Compact Energy Neutralizer"]
+    assert parsed.module_specs[0].module_name == "Heavy Gremlin Compact Energy Neutralizer"
+    assert parsed.module_specs[0].mutation_ref == 1
+    assert [(item.item_name, item.quantity) for item in parsed.cargo_specs or []] == [("Hobgoblin II", 5)]
+    assert parsed.mutation_specs is not None
+    assert parsed.mutation_specs[1].mutaplasmid_name == "Unstable Heavy Energy Neutralizer Mutaplasmid"
+    assert parsed.mutation_specs[1].attributes == {"capacitorNeed": 500.0, "cpu": 32.0}
+    assert all("Mutaplasmid" not in spec.module_name for spec in parsed.module_specs)
+
+
+def test_eft_parser_rejects_non_english_names_in_mutation_blocks() -> None:
+    parser = EftFitParser()
+    fit_text = (
+        "[Typhoon Fleet Issue, Localized Mutation]\n"
+        "Heavy Ghoul Compact Energy Nosferatu [1]\n\n"
+        "[1] 重型盗墓者紧凑型掠能器\n"
+        "  不稳定的重型掠能器突变质体\n"
+        "  cpu 40.0, maxRange 16000.0, power 1800.0, powerTransferAmount 110.0\n"
+    )
+
+    with pytest.raises(Exception) as ctx:
+        parser.parse(fit_text)
+
+    assert "Mutation block contains non-English item names" in str(ctx.value)
+
+
+def test_eft_parser_recognizes_pyfa_implant_and_booster_sections_when_db_available() -> None:
+    parser = EftFitParser()
+    if parser._classifier.kind_for("High-grade Amulet Alpha") is None:
+        pytest.skip("pyfa static database is unavailable")
+
+    parsed = parser.parse(
+        "[Vexor, Additions]\n"
+        "Drone Damage Amplifier II\n\n\n"
+        "High-grade Amulet Alpha\n"
+        "Synth Crash Booster\n\n\n"
+        "Nanite Repair Paste x10\n"
+    )
+
+    assert parsed.module_names == ["Drone Damage Amplifier II"]
+    assert parsed.implant_names == ["High-grade Amulet Alpha"]
+    assert parsed.booster_names == ["Synth Crash Booster"]
+    assert [(item.item_name, item.quantity) for item in parsed.cargo_specs or []] == [("Nanite Repair Paste", 10)]
+
+
+def test_pyfa_factory_builds_fit_with_pyfa_exported_implants_and_boosters() -> None:
+    factory = RuntimeFromEftFactory()
+    if not factory._pyfa.available or not factory._pyfa.fit_engine_ready:
+        pytest.skip(factory.backend_status)
+
+    parsed = EftFitParser().parse(
+        "[Vexor, Additions]\n"
+        "Drone Damage Amplifier II\n\n\n"
+        "High-grade Amulet Alpha\n"
+        "Synth Crash Booster\n"
+    )
+
+    runtime, fit = factory.build(parsed)
+
+    assert runtime.fit_key == parsed.fit_key
+    assert fit.ship_name == "Vexor"
+    assert runtime.diagnostics["pyfa_blueprint"]["implants"] == ["High-grade Amulet Alpha"]
+    assert runtime.diagnostics["pyfa_blueprint"]["boosters"] == ["Synth Crash Booster"]
+
+
+def test_pyfa_factory_applies_pyfa_exported_mutated_module_attributes() -> None:
+    factory = RuntimeFromEftFactory()
+    if not factory._pyfa.available or not factory._pyfa.fit_engine_ready:
+        pytest.skip(factory.backend_status)
+
+    parsed = EftFitParser().parse(
+        "[Typhoon Fleet Issue, Mutated]\n"
+        "Heavy Gremlin Compact Energy Neutralizer [1]\n\n"
+        "[1] Heavy Gremlin Compact Energy Neutralizer\n"
+        "  Unstable Heavy Energy Neutralizer Mutaplasmid\n"
+        "  capacitorNeed 500.0, cpu 32.0, energyNeutralizerAmount 550.0, maxRange 16000.0, power 1800.0\n"
+    )
+
+    runtime, _fit = factory.build(parsed)
+    effect = runtime.modules[0].effects[0]
+
+    assert effect.range_m == pytest.approx(16_000.0)
+    assert effect.projected_add["cap_drain"] == pytest.approx(550.0)
+    assert runtime.diagnostics["pyfa_blueprint"]["modules"][0]["mutation"]["attributes"]["maxRange"] == 16000.0
+
+
 def test_pyfa_deployable_manifest_extracts_drones_and_fighters() -> None:
     factory = RuntimeFromEftFactory()
     if not factory._pyfa.available or not factory._pyfa.fit_engine_ready:

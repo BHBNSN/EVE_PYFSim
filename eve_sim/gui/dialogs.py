@@ -155,6 +155,11 @@ class FleetLibraryDialog(QDialog):
         )
         self.ship_table_hint.setWordWrap(True)
         table_column.addWidget(self.ship_table_hint)
+        self.fit_error_label = QLabel(self)
+        self.fit_error_label.setWordWrap(True)
+        self.fit_error_label.setStyleSheet("color: #b00020; font-weight: 600;")
+        self.fit_error_label.hide()
+        table_column.addWidget(self.fit_error_label)
         self.table_model = FleetSetupTableModel([], lambda: self._lang)
         self.table = QTableView(self)
         self.table.setModel(self.table_model)
@@ -289,6 +294,7 @@ class FleetLibraryDialog(QDialog):
             self.fit_editor.blockSignals(True)
             self.fit_editor.setPlainText("")
             self.fit_editor.blockSignals(False)
+        self._refresh_fit_error_label()
 
     def _new_fleet(self) -> None:
         name, ok = QInputDialog.getText(self, QCoreApplication.translate("eve_sim", 'New'), QCoreApplication.translate("eve_sim", 'Fleet Name'))
@@ -336,6 +342,7 @@ class FleetLibraryDialog(QDialog):
             )
         )
         self.table.selectRow(self.table_model.rowCount() - 1)
+        self._refresh_fit_error_label()
 
     def _on_table_clicked(self, index: QModelIndex) -> None:
         if not index.isValid():
@@ -350,6 +357,7 @@ class FleetLibraryDialog(QDialog):
         self.table_model.remove_row(idx.row())
         if self.table_model.rowCount() > 0:
             self.table.selectRow(max(0, idx.row() - 1))
+        self._refresh_fit_error_label()
 
     def _on_row_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
         del previous
@@ -376,6 +384,33 @@ class FleetLibraryDialog(QDialog):
         except Exception:
             pass
         self.table_model.update_fit_meta(idx.row(), fit_name)
+        self._refresh_fit_error_label()
+
+    def _fit_error_for_row(self, row: SetupRow) -> str | None:
+        try:
+            parsed = self._parser.parse(row.fit_text)
+            self._factory.build(parsed)
+        except Exception as exc:
+            message = display_user_error(exc)
+            return message or QCoreApplication.translate("eve_sim", "Unknown error")
+        return None
+
+    def _refresh_fit_error_label(self) -> None:
+        errors: list[str] = []
+        for idx, row in enumerate(self.table_model.rows, start=1):
+            error = self._fit_error_for_row(row)
+            if error:
+                errors.append(
+                    QCoreApplication.translate("eve_sim", "Row {row}: {error}").format(row=idx, error=error)
+                )
+        if not errors:
+            self.fit_error_label.clear()
+            self.fit_error_label.hide()
+            return
+        self.fit_error_label.setText(
+            QCoreApplication.translate("eve_sim", "Unparseable fits:") + "\n" + "\n".join(errors)
+        )
+        self.fit_error_label.show()
 
     def _on_accept(self) -> None:
         self._cache_current()

@@ -35,6 +35,13 @@ class ParsedCargoSpec:
 
 
 @dataclass(slots=True)
+class ParsedMutationSpec:
+    base_item_name: str
+    mutaplasmid_name: str
+    attributes: dict[str, float]
+
+
+@dataclass(slots=True)
 class ParsedEftFit:
     ship_name: str
     fit_name: str
@@ -43,6 +50,9 @@ class ParsedEftFit:
     cargo_item_names: list[str]
     fit_key: str
     cargo_specs: list[ParsedCargoSpec] | None = None
+    implant_names: list[str] | None = None
+    booster_names: list[str] | None = None
+    mutation_specs: dict[int, ParsedMutationSpec] | None = None
 
 
 @dataclass(slots=True)
@@ -50,6 +60,7 @@ class ParsedModuleSpec:
     module_name: str
     charge_name: str | None = None
     offline: bool = False
+    mutation_ref: int | None = None
 
 
 @dataclass(slots=True)
@@ -68,5 +79,6 @@ __all__ = [
     "ParsedCargoSpec",
     "ParsedEftFit",
     "ParsedModuleSpec",
+    "ParsedMutationSpec",
     "QUALITY_PRESETS",
 ]

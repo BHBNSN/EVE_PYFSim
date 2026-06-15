@@ -52,7 +52,7 @@ from ..remote_snapshot_signatures import (
 from ..user_errors import UserFacingError
 from ..world import WorldState
 from .eft_parser import EftFitParser
-from .models import ManualShipSetup, ParsedEftFit, ParsedModuleSpec, QUALITY_PRESETS
+from .models import ManualShipSetup, ParsedEftFit, ParsedModuleSpec, ParsedMutationSpec, QUALITY_PRESETS
 
 class RuntimeFromEftFactory:
     def __init__(self) -> None:
@@ -1407,6 +1407,17 @@ class RuntimeFromEftFactory:
         online_state = self._pyfa._fitting_module_state_online
         offline_state = self._pyfa._fitting_module_state_offline
         overheated_state = self._pyfa._fitting_module_state_overheated
+        mutation_specs = getattr(parsed, "mutation_specs", None) or {}
+        get_dynamic_item = None
+        get_attribute_info = None
+        if mutation_specs:
+            try:
+                queries_mod = importlib.import_module("eos.db.gamedata.queries")
+                get_dynamic_item = getattr(queries_mod, "getDynamicItem")
+                get_attribute_info = getattr(queries_mod, "getAttributeInfo")
+            except Exception:
+                get_dynamic_item = None
+                get_attribute_info = None
         assert fit_cls is not None
         assert ship_cls is not None
         assert module_cls is not None
@@ -1426,6 +1437,34 @@ class RuntimeFromEftFactory:
         except Exception:
             pass
         fit.character = character_cls.getAll5()
+
+        implant_names = list(getattr(parsed, "implant_names", None) or [])
+        booster_names = list(getattr(parsed, "booster_names", None) or [])
+        if implant_names or booster_names:
+            try:
+                implant_cls = importlib.import_module("eos.saveddata.implant").Implant
+                booster_cls = importlib.import_module("eos.saveddata.booster").Booster
+            except Exception:
+                raise UserFacingError("pyfa Fit calculation chain is unavailable.")
+            for implant_name in implant_names:
+                canonical_name = self._pyfa.resolve_type_name(implant_name)
+                item = self._pyfa.get_item(canonical_name)
+                if item is None:
+                    raise UserFacingError("Implant not found in pyfa: {name}", name=implant_name)
+                try:
+                    fit.implants.append(implant_cls(item))
+                except Exception:
+                    raise UserFacingError("Implant not found in pyfa: {name}", name=implant_name)
+            for booster_name in booster_names:
+                canonical_name = self._pyfa.resolve_type_name(booster_name)
+                item = self._pyfa.get_item(canonical_name)
+                if item is None:
+                    raise UserFacingError("Booster not found in pyfa: {name}", name=booster_name)
+                try:
+                    fit.boosters.append(booster_cls(item))
+                except Exception:
+                    raise UserFacingError("Booster not found in pyfa: {name}", name=booster_name)
+
         fitted_modules: list[tuple[ParsedModuleSpec, Any, str | None]] = []
 
         for idx, spec in enumerate(parsed.module_specs, start=1):
@@ -1433,7 +1472,27 @@ class RuntimeFromEftFactory:
             module_item = self._pyfa.get_item(module_name)
             if module_item is None:
                 raise UserFacingError("Module not found in pyfa: {name}", name=spec.module_name)
-            module = module_cls(module_item)
+            module = None
+            mutation_spec = mutation_specs.get(spec.mutation_ref) if spec.mutation_ref is not None else None
+            if mutation_spec is not None and get_dynamic_item is not None and get_attribute_info is not None:
+                try:
+                    base_name = self._pyfa.resolve_type_name(mutation_spec.base_item_name or spec.module_name)
+                    base_item = self._pyfa.get_item(base_name)
+                    mutaplasmid_name = self._pyfa.resolve_type_name(mutation_spec.mutaplasmid_name)
+                    mutaplasmid_item = self._pyfa.get_item(mutaplasmid_name)
+                    mutaplasmid = get_dynamic_item(getattr(mutaplasmid_item, "ID", 0)) if mutaplasmid_item is not None else None
+                    if base_item is not None and mutaplasmid is not None:
+                        module = module_cls(getattr(mutaplasmid, "resultingItem"), base_item, mutaplasmid)
+                        mutators = getattr(module, "mutators", {}) or {}
+                        for attr_name, value in (mutation_spec.attributes or {}).items():
+                            attr_info = get_attribute_info(str(attr_name))
+                            attr_id = getattr(attr_info, "ID", None)
+                            if attr_id in mutators:
+                                mutators[attr_id].value = float(value)
+                except Exception:
+                    module = None
+            if module is None:
+                module = module_cls(module_item)
             module.owner = fit
             module_id = f"mod-{idx}"
 
@@ -1751,6 +1810,7 @@ class RuntimeFromEftFactory:
             modules: list[ModuleRuntime] = []
             pyfa_blueprint_modules: list[dict[str, Any]] = []
             pyfa_max_state_by_module_id: dict[str, str] = {}
+            parsed_mutation_specs = getattr(parsed, "mutation_specs", None) or {}
             for idx, (spec, fitted_module, effective_charge_name) in enumerate(fitted_modules, start=1):
                 module_id = f"mod-{idx}"
                 requested_state_name = (
@@ -1795,12 +1855,23 @@ class RuntimeFromEftFactory:
                         module.state = actual_state
                     pyfa_max_state_by_module_id[module_id] = max_allowed_state.value
                     modules.append(module)
+                    mutation_spec = parsed_mutation_specs.get(spec.mutation_ref) if spec.mutation_ref is not None else None
+                    mutation_blueprint = (
+                        {
+                            "base_item_name": mutation_spec.base_item_name,
+                            "mutaplasmid_name": mutation_spec.mutaplasmid_name,
+                            "attributes": dict(mutation_spec.attributes or {}),
+                        }
+                        if mutation_spec is not None
+                        else None
+                    )
                     pyfa_blueprint_modules.append(
                         {
                             "module_id": module.module_id,
                             "module_name": spec.module_name,
                             "charge_name": effective_charge_name,
                             "offline": bool(spec.offline),
+                            "mutation": mutation_blueprint,
                             "effect_names": sorted(self._module_effect_names(fitted_module)),
                         }
                     )
@@ -1932,6 +2003,8 @@ class RuntimeFromEftFactory:
             runtime.diagnostics["pyfa_blueprint"] = {
                 "ship_name": parsed.ship_name,
                 "fit_name": parsed.fit_name,
+                "implants": list(getattr(parsed, "implant_names", None) or []),
+                "boosters": list(getattr(parsed, "booster_names", None) or []),
                 "modules": pyfa_blueprint_modules,
             }
             runtime.diagnostics["pyfa_command_boosters"] = deepcopy(command_booster_snapshots or [])
@@ -2738,14 +2811,51 @@ def get_fit_backend_status() -> str:
     return RuntimeFromEftFactory().backend_status
 
 
+def _mutation_blueprint_signature(raw: Any) -> tuple[Any, ...]:
+    if not isinstance(raw, dict):
+        return tuple()
+    attributes = raw.get("attributes")
+    attr_items = (
+        tuple(sorted((str(name), round(float(value or 0.0), 6)) for name, value in attributes.items()))
+        if isinstance(attributes, dict)
+        else tuple()
+    )
+    return (
+        str(raw.get("base_item_name", "") or ""),
+        str(raw.get("mutaplasmid_name", "") or ""),
+        attr_items,
+    )
+
+
+def _parsed_mutation_signature(parsed: ParsedEftFit, spec: ParsedModuleSpec) -> tuple[Any, ...]:
+    raw_specs = getattr(parsed, "mutation_specs", None) or {}
+    mutation_spec = raw_specs.get(spec.mutation_ref) if spec.mutation_ref is not None else None
+    if mutation_spec is None:
+        return tuple()
+    return (
+        str(mutation_spec.base_item_name or ""),
+        str(mutation_spec.mutaplasmid_name or ""),
+        tuple(
+            sorted(
+                (str(attr_name), round(float(value or 0.0), 6))
+                for attr_name, value in (mutation_spec.attributes or {}).items()
+            )
+        ),
+    )
+
+
 def _runtime_blueprint_signature(blueprint: dict[str, Any]) -> tuple[Any, ...]:
     ship_name = str(blueprint.get("ship_name", "") or "").strip()
     modules = blueprint.get("modules")
     if not ship_name or not isinstance(modules, list):
         return tuple()
+    implants = blueprint.get("implants")
+    boosters = blueprint.get("boosters")
     return tuple(
         [
             ship_name,
+            tuple(str(name) for name in implants) if isinstance(implants, list) else tuple(),
+            tuple(str(name) for name in boosters) if isinstance(boosters, list) else tuple(),
             tuple(
                 sorted(
                     (
@@ -2753,6 +2863,7 @@ def _runtime_blueprint_signature(blueprint: dict[str, Any]) -> tuple[Any, ...]:
                         str(raw.get("module_name", "") or ""),
                         str(raw.get("charge_name", "") or ""),
                         bool(raw.get("offline", False)),
+                        _mutation_blueprint_signature(raw.get("mutation")),
                     )
                     for raw in modules
                     if isinstance(raw, dict)
@@ -2815,10 +2926,13 @@ def _copy_fitted_modules_from_template(
 def _parsed_neutral_fit_template_signature(parsed: ParsedEftFit) -> tuple[Any, ...]:
     return (
         str(parsed.ship_name or ""),
+        tuple(str(name or "") for name in (getattr(parsed, "implant_names", None) or [])),
+        tuple(str(name or "") for name in (getattr(parsed, "booster_names", None) or [])),
         tuple(
             (
                 str(spec.module_name or ""),
                 str(spec.charge_name or ""),
+                _parsed_mutation_signature(parsed, spec),
             )
             for spec in parsed.module_specs
         ),
@@ -3185,6 +3299,7 @@ def _parsed_fit_from_runtime_blueprint(runtime: FitRuntime) -> ParsedEftFit | No
 
     module_specs: list[ParsedModuleSpec] = []
     module_names: list[str] = []
+    mutation_specs: dict[int, ParsedMutationSpec] = {}
     for raw in raw_modules:
         if not isinstance(raw, dict):
             continue
@@ -3193,7 +3308,34 @@ def _parsed_fit_from_runtime_blueprint(runtime: FitRuntime) -> ParsedEftFit | No
             continue
         charge_name = str(raw.get("charge_name", "") or "").strip() or None
         offline = bool(raw.get("offline", False))
-        module_specs.append(ParsedModuleSpec(module_name=module_name, charge_name=charge_name, offline=offline))
+        mutation_ref: int | None = None
+        raw_mutation = raw.get("mutation")
+        if isinstance(raw_mutation, dict):
+            base_item_name = str(raw_mutation.get("base_item_name", "") or "").strip()
+            mutaplasmid_name = str(raw_mutation.get("mutaplasmid_name", "") or "").strip()
+            raw_attributes = raw_mutation.get("attributes")
+            attributes: dict[str, float] = {}
+            if isinstance(raw_attributes, dict):
+                for attr_name, value in raw_attributes.items():
+                    try:
+                        attributes[str(attr_name)] = float(value)
+                    except Exception:
+                        continue
+            if base_item_name and mutaplasmid_name:
+                mutation_ref = len(mutation_specs) + 1
+                mutation_specs[mutation_ref] = ParsedMutationSpec(
+                    base_item_name=base_item_name,
+                    mutaplasmid_name=mutaplasmid_name,
+                    attributes=attributes,
+                )
+        module_specs.append(
+            ParsedModuleSpec(
+                module_name=module_name,
+                charge_name=charge_name,
+                offline=offline,
+                mutation_ref=mutation_ref,
+            )
+        )
         module_names.append(module_name)
 
     return ParsedEftFit(
@@ -3203,6 +3345,17 @@ def _parsed_fit_from_runtime_blueprint(runtime: FitRuntime) -> ParsedEftFit | No
         module_specs=module_specs,
         cargo_item_names=[],
         fit_key=runtime.fit_key,
+        implant_names=[
+            str(name or "").strip()
+            for name in (blueprint.get("implants") if isinstance(blueprint.get("implants"), list) else [])
+            if str(name or "").strip()
+        ],
+        booster_names=[
+            str(name or "").strip()
+            for name in (blueprint.get("boosters") if isinstance(blueprint.get("boosters"), list) else [])
+            if str(name or "").strip()
+        ],
+        mutation_specs=mutation_specs,
     )
 
 
