@@ -29,7 +29,7 @@ class UiPreferences:
     sort_key: str = "Distance"
     sort_order: str = "ASC"
     zoom: float | None = None
-    language: str = "zh_CN"
+    language: str = "en_US"
     engine_tick_rate: int = 1
     engine_physics_substeps: int = 1
     engine_lockstep: bool = True

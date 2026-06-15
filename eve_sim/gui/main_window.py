@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication, QItemSelectionModel
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QCoreApplication, QItemSelectionModel
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -58,7 +58,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import install_language
+from ..i18n import install_language, normalize_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         controlled_team: Team = Team.BLUE,
         lan_server: HostLanSession | None = None,
         lan_client: ClientLanSession | None = None,
+        initial_language: str | None = None,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -176,6 +177,9 @@ class MainWindow(QMainWindow):
         self._seed_ship_initial_fit_keys()
         self.store = PreferencesStore()
         self.prefs = self.store.load()
+        if initial_language is not None:
+            self.prefs.language = normalize_language(initial_language, "en_US")
+            self.store.save(self.prefs)
         install_language(self.current_language())
         if self.prefs.filter_team in ("BLUE", "RED"):
             if self.prefs.filter_team == self.controlled_team.value:
@@ -1122,8 +1126,7 @@ class MainWindow(QMainWindow):
         return True, QCoreApplication.translate("eve_sim", 'Unlocked charge lock for {module}').format(module=module_label)
 
     def current_language(self) -> str:
-        lang = (self.prefs.language or "zh_CN").strip()
-        return lang if lang in ("zh_CN", "en_US") else "zh_CN"
+        return normalize_language(self.prefs.language, "en_US")
 
     def _ui_text(self, text: str) -> str:
         if not self.current_language().lower().startswith("zh"):
@@ -1147,35 +1150,6 @@ class MainWindow(QMainWindow):
 
     def _display_type_name(self, type_name: str) -> str:
         return get_type_display_name(str(type_name or ""), language=self.current_language())
-
-    @staticmethod
-    def _language_options() -> tuple[tuple[str, str], ...]:
-        return (
-            ("简体中文", "zh_CN"),
-            ("English", "en_US"),
-        )
-
-    def _refresh_language_combo(self, selected_lang: str | None = None) -> None:
-        options = self._language_options()
-        self.lang_combo.blockSignals(True)
-        self.lang_combo.clear()
-        for label, lang_code in options:
-            self.lang_combo.addItem(label, lang_code)
-        self.lang_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        widest_label = max(
-            (self.lang_combo.fontMetrics().horizontalAdvance(label) for label, _lang_code in options),
-            default=0,
-        )
-        combo_width = max(140, widest_label + 56)
-        self.lang_combo.setMinimumContentsLength(max((len(label) for label, _lang_code in options), default=10))
-        self.lang_combo.setMinimumWidth(combo_width)
-        view = self.lang_combo.view()
-        if view is not None:
-            view.setMinimumWidth(combo_width)
-        target_lang = selected_lang if selected_lang in {"zh_CN", "en_US"} else self.current_language()
-        idx = self.lang_combo.findData(target_lang)
-        self.lang_combo.setCurrentIndex(0 if idx < 0 else idx)
-        self.lang_combo.blockSignals(False)
 
     def _display_ship_type(self, ship_name: str, *, language: str) -> str:
         cache_key = (str(language or ""), str(ship_name or ""))
@@ -1416,7 +1390,6 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _create_menu(self) -> None:
-        lang = self.current_language()
         self.menu_overview = self.menuBar().addMenu(QCoreApplication.translate("eve_sim", 'Overview'))
         self.act_overview_filter = QAction(QCoreApplication.translate("eve_sim", 'Filters...'), self)
         self.act_overview_filter.triggered.connect(self.open_overview_options)
@@ -1458,12 +1431,6 @@ class MainWindow(QMainWindow):
         self.btn_switch_controlled_team = QPushButton("")
         self.btn_switch_controlled_team.clicked.connect(self.toggle_local_controlled_team)
         header.addWidget(self.btn_switch_controlled_team)
-        self.lbl_language = QLabel(QCoreApplication.translate("eve_sim", 'Language'))
-        header.addWidget(self.lbl_language)
-        self.lang_combo = QComboBox()
-        self._refresh_language_combo()
-        self.lang_combo.currentIndexChanged.connect(self.on_language_changed)
-        header.addWidget(self.lang_combo)
         side_layout.addLayout(header)
 
         system_row = QHBoxLayout()
@@ -1793,56 +1760,8 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def on_language_changed(self, _index: int) -> None:
-        lang = str(self.lang_combo.currentData() or "zh_CN")
-        self.prefs.language = lang
-        self.store.save(self.prefs)
-        install_language(lang)
-        self.retranslate_ui()
-        self._refresh_common_charge_modules()
-        self.request_overview_refresh(force=True)
-        if hasattr(self, "system_graph_window"):
-            self.system_graph_window.retranslate_ui()
-
-    def retranslate_ui(self) -> None:
-        lang = self.current_language()
-        self.setWindowTitle(QCoreApplication.translate("eve_sim", 'EVE SIM - Continuous Space Wargame'))
-        self.menu_overview.setTitle(QCoreApplication.translate("eve_sim", 'Overview'))
-        self.act_overview_filter.setText(QCoreApplication.translate("eve_sim", 'Filters...'))
-        self.act_overview_reset.setText(QCoreApplication.translate("eve_sim", 'Reset Filters'))
-        self.menu_battle.setTitle(QCoreApplication.translate("eve_sim", "Battle"))
-        self.act_end_battle.setText(QCoreApplication.translate("eve_sim", "End Battle and Save Recording"))
-        self.act_open_replay.setText(QCoreApplication.translate("eve_sim", "Open Recording Replay"))
-        self.act_open_report.setText(QCoreApplication.translate("eve_sim", "Battle Report from Recording"))
-        self.lbl_selected_squad.setText(QCoreApplication.translate("eve_sim", 'Selected Squad'))
-        self.lbl_language.setText(QCoreApplication.translate("eve_sim", 'Language'))
-        self._refresh_language_combo(self.lang_combo.currentData())
-        self.lbl_view_system.setText(QCoreApplication.translate("eve_sim", "View System"))
-        self.btn_view_system.setText(QCoreApplication.translate("eve_sim", "Center"))
-        self.btn_fit_map.setText(QCoreApplication.translate("eve_sim", "Fit Map"))
-        self.lbl_leader_speed_limit.setText(QCoreApplication.translate("eve_sim", 'Leader Max Speed (0=Unlimited):'))
-        self.btn_clear_focus.setText(QCoreApplication.translate("eve_sim", 'Clear Focus Targets'))
-        if hasattr(self, "lbl_fighter_abilities"):
-            self.lbl_fighter_abilities.setText(self._ui_text("Fighter Abilities"))
-        self.lbl_freq_charge_module.setText(QCoreApplication.translate("eve_sim", 'Common Charge-Loadable Modules (all, sorted by count):'))
-        self.lbl_ammo.setText(QCoreApplication.translate("eve_sim", 'Ammo:'))
-        self.apply_ammo_btn.setText(QCoreApplication.translate("eve_sim", 'Apply to Fleet'))
-        self.tabs.setTabText(0, QCoreApplication.translate("eve_sim", 'Overview'))
-        self.tabs.setTabText(1, QCoreApplication.translate("eve_sim", 'Fleet'))
-        self.lbl_fleet_tip.setText(QCoreApplication.translate("eve_sim", 'Multi-select ships to assign squad; edit name to create squad'))
-        self.lbl_target_squad.setText(QCoreApplication.translate("eve_sim", 'Target Squad'))
-        self.btn_assign.setText(QCoreApplication.translate("eve_sim", 'Assign Selected Ships'))
-        self.overview_model.notify_headers_changed()
-        self.blue_roster_model.notify_headers_changed()
-        self._refresh_propulsion_button_text()
-        self._refresh_fighter_ability_controls()
-        self._refresh_controlled_team_widgets()
-        if hasattr(self, "system_graph_window"):
-            self.system_graph_window.retranslate_ui()
-
     def _refresh_propulsion_button_text(self) -> None:
         active = self._get_squad_propulsion_state(self.ui_state.selected_squad)
-        lang = self.current_language()
         self.btn_propulsion_toggle.setText(QCoreApplication.translate("eve_sim", 'Click to Disable Prop') if active else QCoreApplication.translate("eve_sim", 'Click to Enable Prop'))
 
     @staticmethod

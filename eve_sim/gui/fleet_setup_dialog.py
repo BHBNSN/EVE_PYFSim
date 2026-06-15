@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,7 +55,7 @@ from ..fleet_setup import (
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-from ..i18n import install_language
+from ..i18n import detect_system_language, install_language, language_options, normalize_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..lan_commands import (
     CMD_INDUCE_FLEET_AT,
@@ -93,23 +93,23 @@ from ..user_errors import UserFacingError, display_user_error
 from .models import PreferencesStore, SetupRow
 from .table_models import FleetSetupTableModel
 from .dialogs import FleetLibraryDialog
+from .language_controls import language_icon_label
 from .map_editor_dialog import MapEditorDialog
 
 class FleetSetupDialog(QDialog):
     @staticmethod
     def _language_options() -> tuple[tuple[str, str], ...]:
-        return (
-            ("简体中文", "zh_CN"),
-            ("English", "en_US"),
-        )
+        return language_options()
 
-    def __init__(self, network_mode: str = "local", parent: QWidget | None = None) -> None:
+    def __init__(self, network_mode: str = "local", initial_language: str | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = PreferencesStore()
         self._pref = self._store.load()
         self._network_mode = network_mode
         self._engine_pref_loading = False
-        self._lang = self._detect_initial_language()
+        self._lang = normalize_language(initial_language, "en_US") if initial_language is not None else self._detect_initial_language()
+        self._pref.language = self._lang
+        self._store.save(self._pref)
         install_language(self._lang)
         self.setWindowTitle(QCoreApplication.translate("eve_sim", 'Pre-Battle Fleet Setup'))
         self.resize(1060, 680)
@@ -125,7 +125,8 @@ class FleetSetupDialog(QDialog):
         layout = QVBoxLayout(self)
 
         lang_row = QHBoxLayout()
-        self.lbl_lang = QLabel(QCoreApplication.translate("eve_sim", 'Language'))
+        lang_row.addWidget(language_icon_label(self))
+        self.lbl_lang = QLabel("Language")
         self.lang_combo = QComboBox(self)
         self._refresh_language_combo(self._lang)
         self.lang_combo.currentIndexChanged.connect(self._on_setup_language_changed)
@@ -433,23 +434,18 @@ class FleetSetupDialog(QDialog):
         self._rebuild_rows_from_selected_fleets()
 
     def _detect_initial_language(self) -> str:
-        system_name = (QLocale.system().name() or "").lower()
-        if system_name.startswith("zh"):
-            return "zh_CN"
-        if system_name.startswith("en"):
-            return "en_US"
-        lang = (self._pref.language or "").strip()
-        if lang in ("zh_CN", "en_US"):
-            return lang
-        return "zh_CN"
+        return detect_system_language()
 
     def _on_setup_language_changed(self, _index: int) -> None:
         lang = self.lang_combo.currentData()
-        self._lang = str(lang) if lang in ("zh_CN", "en_US") else "zh_CN"
+        self._lang = normalize_language(str(lang or ""), "en_US")
         self._pref.language = self._lang
         self._store.save(self._pref)
         install_language(self._lang)
         self._apply_setup_language()
+
+    def selected_language(self) -> str:
+        return normalize_language(self._lang, "en_US")
 
     def _refresh_language_combo(self, selected_lang: str | None = None) -> None:
         options = self._language_options()
@@ -476,7 +472,7 @@ class FleetSetupDialog(QDialog):
     def _apply_setup_language(self) -> None:
         lang = self._lang
         self.setWindowTitle(QCoreApplication.translate("eve_sim", 'Pre-Battle Fleet Setup'))
-        self.lbl_lang.setText(QCoreApplication.translate("eve_sim", 'Language'))
+        self.lbl_lang.setText("Language")
         self._refresh_language_combo(self.lang_combo.currentData())
         self.lbl_blue_fleet.setText(QCoreApplication.translate("eve_sim", 'Blue Fleet'))
         self.lbl_red_fleet.setText(QCoreApplication.translate("eve_sim", 'Red Fleet'))

@@ -348,7 +348,12 @@ class MapSystemTests(unittest.TestCase):
     @patch("eve_sim.gui.main_window.PreferencesStore.save", return_value=None)
     @patch(
         "eve_sim.gui.main_window.PreferencesStore.load",
-        return_value=UiPreferences(filter_team="FRIENDLY", selected_squad="BLUE-ALPHA", selected_map_id="dual_system_crossroads"),
+        return_value=UiPreferences(
+            filter_team="FRIENDLY",
+            selected_squad="BLUE-ALPHA",
+            selected_map_id="dual_system_crossroads",
+            language="zh_CN",
+        ),
     )
     def test_overview_double_click_centers_camera_on_ship(self, _load_mock, _save_mock) -> None:
         map_definition = load_map_definition("dual_system_crossroads")
@@ -542,11 +547,11 @@ class MapSystemTests(unittest.TestCase):
             blue_commander=commander,
             red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
             manual_setup=[],
+            initial_language="zh_CN",
         )
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window.lang_combo.setCurrentIndex(window.lang_combo.findData("zh_CN"))
             menu = window._build_structure_context_menu("alpha_gate_to_beta")
             self.assertIsNotNone(menu)
             texts = [action.text() for action in menu.actions()]

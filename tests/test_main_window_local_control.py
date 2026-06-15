@@ -188,7 +188,7 @@ class MainWindowLocalControlTests(unittest.TestCase):
         "eve_sim.gui.main_window.PreferencesStore.load",
         return_value=UiPreferences(filter_team="FRIENDLY", selected_squad="BLUE-ALPHA"),
     )
-    def test_language_combo_uses_native_labels_and_has_safe_min_width(
+    def test_main_window_does_not_show_language_selector(
         self,
         _load,
         _save,
@@ -217,11 +217,9 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            self.assertEqual(window.lang_combo.itemText(0), "简体中文")
-            self.assertEqual(window.lang_combo.itemText(1), "English")
-            self.assertGreaterEqual(window.lang_combo.minimumWidth(), 140)
-            window.retranslate_ui()
-            self.assertEqual(window.lang_combo.itemText(0), "简体中文")
+            self.assertFalse(hasattr(window, "lang_combo"))
+            self.assertFalse(hasattr(window, "lbl_language"))
+            self.assertFalse(hasattr(window, "retranslate_ui"))
         finally:
             window.close()
 

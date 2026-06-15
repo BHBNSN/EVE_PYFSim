@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QTranslator
+from PySide6.QtCore import QCoreApplication, QLocale, QTranslator
 from PySide6.QtWidgets import QApplication
 
 _INSTALLED_LANGUAGE = "en_US"
 _APP_TRANSLATOR: QTranslator | None = None
+_SUPPORTED_LANGUAGES = {"zh_CN", "en_US"}
 
 
 def _translations_dir() -> Path:
@@ -20,12 +21,33 @@ def _ensure_qt_application() -> QCoreApplication | None:
     return QCoreApplication.instance()
 
 
+def normalize_language(lang: str | None, fallback: str = "en_US") -> str:
+    normalized = str(lang or "").strip()
+    if normalized in _SUPPORTED_LANGUAGES:
+        return normalized
+    return fallback if fallback in _SUPPORTED_LANGUAGES else "en_US"
+
+
+def detect_system_language() -> str:
+    system_name = (QLocale.system().name() or "").lower()
+    if system_name.startswith("zh"):
+        return "zh_CN"
+    if system_name.startswith("en"):
+        return "en_US"
+    return "en_US"
+
+
+def language_options() -> tuple[tuple[str, str], ...]:
+    return (
+        ("简体中文", "zh_CN"),
+        ("English", "en_US"),
+    )
+
+
 def install_language(lang: str) -> str:
     global _APP_TRANSLATOR, _INSTALLED_LANGUAGE
 
-    normalized = str(lang or "en_US").strip() or "en_US"
-    if normalized not in {"zh_CN", "en_US"}:
-        normalized = "en_US"
+    normalized = normalize_language(lang, "en_US")
 
     app = _ensure_qt_application()
     if app is None:
@@ -53,4 +75,4 @@ def current_language() -> str:
     return _INSTALLED_LANGUAGE
 
 
-__all__ = ["current_language", "install_language"]
+__all__ = ["current_language", "detect_system_language", "install_language", "language_options", "normalize_language"]

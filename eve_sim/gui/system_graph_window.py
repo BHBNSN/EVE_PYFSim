@@ -36,9 +36,5 @@ class SystemGraphWindow(QWidget):
     def sync_from_world(self) -> None:
         self.canvas.sync_layout()
 
-    def retranslate_ui(self) -> None:
-        self.setWindowTitle(QCoreApplication.translate("eve_sim", "System Map"))
-        self.canvas.update()
-
 
 __all__ = ["SystemGraphWindow"]
