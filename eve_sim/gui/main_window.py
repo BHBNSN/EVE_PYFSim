@@ -1027,7 +1027,10 @@ class MainWindow(QMainWindow):
             return False, QCoreApplication.translate("eve_sim", 'Module slot not found')
 
         spec = parsed_old.module_specs[module_idx - 1]
-        ammo_entries = self._charge_selection_entries(spec.module_name, language=lang)
+        try:
+            ammo_entries = self._charge_selection_entries(spec.module_name, language=lang)
+        except Exception as exc:
+            return False, display_user_error(exc)
         if not ammo_entries:
             return False, QCoreApplication.translate("eve_sim", 'Module is not charge-loadable')
 
@@ -1961,7 +1964,15 @@ class MainWindow(QMainWindow):
         if not fit_texts:
             fit_texts = [r.fit_text for r in self.manual_setup if self._is_ammo_configurable_team(r.team)]
         current = self.charge_module_combo.currentText()
-        charge_modules = get_common_chargeable_modules(fit_texts, usage_threshold=0.0, language=self.current_language())
+        try:
+            charge_modules = get_common_chargeable_modules(fit_texts, usage_threshold=0.0, language=self.current_language())
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                QCoreApplication.translate("eve_sim", "Failed to resolve chargeable modules: {error}").format(error=display_user_error(exc)),
+            )
+            charge_modules = []
         self.charge_module_combo.blockSignals(True)
         self.charge_module_combo.clear()
         self.charge_module_combo.addItems(charge_modules)
@@ -1970,7 +1981,15 @@ class MainWindow(QMainWindow):
         self.charge_module_combo.blockSignals(False)
 
         for module_name in charge_modules:
-            ammo_entries = self._charge_selection_entries(module_name, language=self.current_language())
+            try:
+                ammo_entries = self._charge_selection_entries(module_name, language=self.current_language())
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                    QCoreApplication.translate("eve_sim", "Failed to resolve ammo options: {error}").format(error=display_user_error(exc)),
+                )
+                return
             if not ammo_entries:
                 continue
             selected = self._charge_module_ammo_selection.get(module_name)
@@ -1984,8 +2003,13 @@ class MainWindow(QMainWindow):
                     self._factory.set_charge_module_ammo_override(module_name, selected_value)
                 else:
                     self._factory.clear_charge_module_ammo_override(module_name)
-            except Exception:
-                continue
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                    QCoreApplication.translate("eve_sim", "Failed to apply ammo selection: {error}").format(error=display_user_error(exc)),
+                )
+                return
 
         self._on_charge_module_changed(self.charge_module_combo.currentText())
 
@@ -1995,7 +2019,16 @@ class MainWindow(QMainWindow):
         if not module_name:
             self.ammo_combo.blockSignals(False)
             return
-        ammo_entries = self._charge_selection_entries(module_name, language=self.current_language())
+        try:
+            ammo_entries = self._charge_selection_entries(module_name, language=self.current_language())
+        except Exception as exc:
+            self.ammo_combo.blockSignals(False)
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                QCoreApplication.translate("eve_sim", "Failed to resolve ammo options: {error}").format(error=display_user_error(exc)),
+            )
+            return
         for value, label in ammo_entries:
             self.ammo_combo.addItem(label, value)
         if not ammo_entries:
@@ -2011,8 +2044,14 @@ class MainWindow(QMainWindow):
                     self._factory.set_charge_module_ammo_override(module_name, selected)
                 else:
                     self._factory.clear_charge_module_ammo_override(module_name)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.ammo_combo.blockSignals(False)
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                    QCoreApplication.translate("eve_sim", "Failed to apply ammo selection: {error}").format(error=display_user_error(exc)),
+                )
+                return
         idx = self.ammo_combo.findData(selected)
         self.ammo_combo.setCurrentIndex(0 if idx < 0 else idx)
         self.ammo_combo.blockSignals(False)

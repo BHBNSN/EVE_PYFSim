@@ -268,7 +268,8 @@ class RuntimeProjectionMixin:
             if effect.effect_class == EffectClass.PROJECTED
         )
         has_projected = bool(projected_effects)
-        target_side = "ally" if "support" in tags and "hostile" not in tags else "enemy"
+        configured_target_side = str(getattr(module, "target_side", "") or "").strip().lower()
+        target_side = configured_target_side if configured_target_side in {"ally", "enemy"} else ("ally" if "support" in tags and "hostile" not in tags else "enemy")
         is_command_burst = "command_burst" in tags
         is_smart_bomb = "smart_bomb" in tags
         is_burst_jammer = "burst_jammer" in tags
@@ -317,7 +318,15 @@ class RuntimeProjectionMixin:
             and not supports_formula_projected_profile
         )
 
-        if is_command_burst:
+        configured_rule_id = str(getattr(module, "decision_rule_id", "") or "").strip()
+        if configured_rule_id:
+            decision_rule = ModuleDecisionRule(
+                rule_id=configured_rule_id,
+                activation_mode=str(getattr(module, "activation_mode", "") or "never"),
+                target_mode=str(getattr(module, "target_mode", "") or "none"),
+                cap_threshold=max(0.0, float(getattr(module, "cap_threshold", 0.0) or 0.0)),
+            )
+        elif is_command_burst:
             decision_rule = ModuleDecisionRule(
                 rule_id="area_command_burst",
                 activation_mode="always",
@@ -916,6 +925,14 @@ class RuntimeProjectionMixin:
                 charge_remaining=float(module.charge_remaining),
                 charge_reload_time=float(module.charge_reload_time),
                 tags=tuple(str(tag) for tag in getattr(module, "tags", ()) or ()),
+                classification_id=str(getattr(module, "classification_id", "") or "market_unknown"),
+                market_path=tuple(str(value) for value in getattr(module, "market_path", ()) or ()),
+                market_group_id=getattr(module, "market_group_id", None),
+                decision_rule_id=str(getattr(module, "decision_rule_id", "") or ""),
+                activation_mode=str(getattr(module, "activation_mode", "") or ""),
+                target_mode=str(getattr(module, "target_mode", "") or ""),
+                target_side=str(getattr(module, "target_side", "") or ""),
+                cap_threshold=float(getattr(module, "cap_threshold", 0.0) or 0.0),
             )
             for module in resolved_runtime.modules
         ]

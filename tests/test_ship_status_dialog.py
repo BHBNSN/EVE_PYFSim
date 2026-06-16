@@ -436,8 +436,8 @@ class ShipStatusDialogTests(unittest.TestCase):
             dialog.close()
 
     def test_battle_canvas_hides_burst_jammer_area_overlay_style(self) -> None:
-        burst_jammer = ModuleRuntime(module_id="jam-1", group="Burst Jammer", state=ModuleState.ACTIVE)
-        smart_bomb = ModuleRuntime(module_id="smart-1", group="Smart Bomb", state=ModuleState.ACTIVE)
+        burst_jammer = ModuleRuntime(module_id="jam-1", group="Burst Jammer", state=ModuleState.ACTIVE, tags=("area_effect", "burst_jammer"))
+        smart_bomb = ModuleRuntime(module_id="smart-1", group="Smart Bomb", state=ModuleState.ACTIVE, tags=("area_effect", "smart_bomb"))
 
         self.assertIsNone(BattleCanvas._module_area_style(burst_jammer))
         self.assertIsNotNone(BattleCanvas._module_area_style(smart_bomb))
@@ -647,6 +647,7 @@ class ShipStatusDialogTests(unittest.TestCase):
             module_id="burst-1",
             group="Command Burst",
             state=ModuleState.ACTIVE,
+            tags=("area_effect", "command_burst", "support"),
             effects=[
                 ModuleEffect(
                     name="burst-1-effect",

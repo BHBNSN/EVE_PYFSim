@@ -786,7 +786,15 @@ class ShipStatusDialog(QDialog):
         self._lock_module_specs = {}
         module_rows: list[tuple[str, str]] = []
         for idx, spec in enumerate(module_specs, start=1):
-            ammo_entries = self._charge_selection_entries(spec.module_name, lang)
+            try:
+                ammo_entries = self._charge_selection_entries(spec.module_name, lang)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                    QCoreApplication.translate("eve_sim", "Failed to resolve ammo options: {error}").format(error=display_user_error(exc)),
+                )
+                return
             if not ammo_entries:
                 continue
             module_id = f"mod-{idx}"
@@ -837,7 +845,18 @@ class ShipStatusDialog(QDialog):
             self.btn_lock_clear.setEnabled(False)
             return
 
-        ammo_entries = self._charge_selection_entries(spec.module_name, lang)
+        try:
+            ammo_entries = self._charge_selection_entries(spec.module_name, lang)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("eve_sim", "Ammo Configuration"),
+                QCoreApplication.translate("eve_sim", "Failed to resolve ammo options: {error}").format(error=display_user_error(exc)),
+            )
+            self.lock_ammo_combo.setEnabled(False)
+            self.btn_lock_apply.setEnabled(False)
+            self.btn_lock_clear.setEnabled(False)
+            return
         self.lock_ammo_combo.blockSignals(True)
         for charge_value, charge_label in ammo_entries:
             self.lock_ammo_combo.addItem(charge_label, charge_value)
@@ -906,18 +925,16 @@ class ShipStatusDialog(QDialog):
         return max(0.0, min(99.9, (1.0 - float(resonance)) * 100.0))
 
     @staticmethod
-    def _is_weapon_group(group_name: str) -> bool:
-        g = (group_name or "").lower()
-        return ("weapon" in g) or ("turret" in g) or ("launcher" in g)
+    def _module_has_tag(module: ModuleRuntime | None, tag: str) -> bool:
+        return module is not None and str(tag) in tuple(str(value) for value in getattr(module, "tags", ()) or ())
 
     @staticmethod
-    def _is_ecm_group(group_name: str) -> bool:
-        return "ecm" in (group_name or "").lower()
+    def _is_weapon_module(module: ModuleRuntime | None) -> bool:
+        return ShipStatusDialog._module_has_tag(module, "weapon")
 
     @staticmethod
-    def _is_area_effect_group(group_name: str) -> bool:
-        group = (group_name or "").strip().lower()
-        return group in {"command burst", "smart bomb", "structure area denial module", "burst jammer"}
+    def _is_area_effect_module(module: ModuleRuntime | None) -> bool:
+        return ShipStatusDialog._module_has_tag(module, "area_effect")
 
     @staticmethod
     def _module_has_projected_effects(module: ModuleRuntime) -> bool:
@@ -932,17 +949,17 @@ class ShipStatusDialog(QDialog):
         effective_state = normalized.value
         if effective_state == "ACTIVE":
             has_projected = ShipStatusDialog._module_has_projected_effects(module)
-            is_area_effect = ShipStatusDialog._is_area_effect_group(module.group)
+            is_area_effect = ShipStatusDialog._is_area_effect_module(module)
             target_required = ShipStatusDialog._module_requires_target(module)
-            if target_required and not current_target_id and (ShipStatusDialog._is_weapon_group(module.group) or (has_projected and not is_area_effect)):
+            if target_required and not current_target_id and (ShipStatusDialog._is_weapon_module(module) or (has_projected and not is_area_effect)):
                 effective_state = "ONLINE"
         return effective_state
 
     @staticmethod
     def _module_requires_target(module: ModuleRuntime) -> bool:
-        if ShipStatusDialog._is_weapon_group(module.group):
+        if ShipStatusDialog._is_weapon_module(module):
             return True
-        if ShipStatusDialog._is_area_effect_group(module.group):
+        if ShipStatusDialog._is_area_effect_module(module):
             return False
         return ShipStatusDialog._module_has_projected_effects(module)
 
@@ -1548,8 +1565,8 @@ class ShipStatusDialog(QDialog):
                 )
                 if runtime_module is not None:
                     has_projected = self._module_has_projected_effects(runtime_module)
-                    is_area_effect = self._is_area_effect_group(runtime_module.group)
-                    if self._is_weapon_group(runtime_module.group):
+                    is_area_effect = self._is_area_effect_module(runtime_module)
+                    if self._is_weapon_module(runtime_module):
                         current_target_id = ship.combat.current_target
                     elif has_projected and not is_area_effect:
                         current_target_id = projected_by_slot.get(idx)
@@ -1569,7 +1586,7 @@ class ShipStatusDialog(QDialog):
                     timer_label = self._module_timer_label(lang, ship, runtime_module, state_key, cooldown_left)
                     if has_projected and not is_area_effect:
                         target_label = str(projected_by_slot.get(idx) or QCoreApplication.translate("eve_sim", 'None'))
-                    elif self._is_weapon_group(runtime_module.group):
+                    elif self._is_weapon_module(runtime_module):
                         target_label = str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))
                 else:
                     state_label = self._module_state_label(state_key)
@@ -1613,8 +1630,8 @@ class ShipStatusDialog(QDialog):
         for module in ordered_modules:
             target_label = "-"
             has_projected = self._module_has_projected_effects(module)
-            is_area_effect = self._is_area_effect_group(module.group)
-            if self._is_weapon_group(module.group):
+            is_area_effect = self._is_area_effect_module(module)
+            if self._is_weapon_module(module):
                 current_target_id = ship.combat.current_target
             elif has_projected and not is_area_effect:
                 current_target_id = projected_by_module.get(module.module_id)
@@ -1628,7 +1645,7 @@ class ShipStatusDialog(QDialog):
                 state_label = self._module_state_label(effective_state)
             if has_projected and not is_area_effect:
                 target_label = str(projected_by_module.get(module.module_id) or QCoreApplication.translate("eve_sim", 'None'))
-            elif self._is_weapon_group(module.group):
+            elif self._is_weapon_module(module):
                 target_label = str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))
             can_mode_override = self._module_supports_manual_mode(module)
             target_mode_choices = self._module_target_mode_choices(module)

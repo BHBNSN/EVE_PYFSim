@@ -3150,6 +3150,56 @@ Small Auxiliary Thrusters II
                 0.0,
             )
 
+    def test_pyfa_energy_weapon_rig_is_not_weapon_or_chargeable(self) -> None:
+        factory = RuntimeFromEftFactory()
+        if not factory._pyfa.available or not factory._pyfa.fit_engine_ready:
+            self.skipTest(factory.backend_status)
+
+        parsed = EftFitParser().parse(
+            """[Ferox, Rig Classification]
+Medium Energy Locus Coordinator II
+"""
+        )
+        runtime, _fit = factory.build(parsed)
+
+        self.assertEqual(len(runtime.modules), 1)
+        rig = runtime.modules[0]
+        self.assertNotIn("weapon", rig.tags)
+        self.assertNotIn("turret_weapon", rig.tags)
+        self.assertEqual(rig.charge_capacity, 0)
+        self.assertEqual(rig.classification_id, "market_default")
+        self.assertIn("Rigs", rig.market_path)
+        self.assertIn("Energy Weapon Rigs", rig.market_path)
+        self.assertNotIn("Turrets & Launchers", rig.market_path)
+
+    def test_pyfa_nosferatu_and_neutralizer_are_split_by_market_subclass(self) -> None:
+        factory = RuntimeFromEftFactory()
+        if not factory._pyfa.available or not factory._pyfa.fit_engine_ready:
+            self.skipTest(factory.backend_status)
+
+        parsed = EftFitParser().parse(
+            """[Armageddon, Cap Warfare]
+Heavy Ghoul Compact Energy Nosferatu
+Heavy Gremlin Compact Energy Neutralizer
+"""
+        )
+        runtime, _fit = factory.build(parsed)
+
+        nos_modules = [module for module in runtime.modules if "energy_nosferatu" in module.tags]
+        neut_modules = [module for module in runtime.modules if "energy_neutralizer" in module.tags]
+        self.assertEqual(len(nos_modules), 1)
+        self.assertEqual(len(neut_modules), 1)
+
+        nos = nos_modules[0]
+        neut = neut_modules[0]
+        self.assertEqual(nos.classification_id, "projected_energy_nosferatu")
+        self.assertEqual(neut.classification_id, "projected_energy_neutralizer")
+        self.assertNotIn("energy_neutralizer", nos.tags)
+        self.assertNotIn("energy_nosferatu", neut.tags)
+        self.assertIn("Energy Nosferatu", nos.market_path)
+        self.assertIn("Energy Neutralizers", neut.market_path)
+        self.assertGreater(float(nos.effects[0].projected_add.get("cap_drain", 0.0) or 0.0), 0.0)
+
     def test_pyfa_ham_fit_focus_fire_spawns_projectiles_and_applies_damage(self) -> None:
         source = _make_pyfa_ship_from_fit_text(_CARACAL_NAVY_HAM_FIT, ship_id="ham-focus-source", team=Team.BLUE)
         target = _make_ship("ham-focus-target", [], team=Team.RED)

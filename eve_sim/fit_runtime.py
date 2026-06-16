@@ -87,6 +87,14 @@ class ModuleRuntime:
     charge_remaining: float = 0.0
     charge_reload_time: float = 0.0
     tags: tuple[str, ...] = field(default_factory=tuple)
+    classification_id: str = "market_unknown"
+    market_path: tuple[str, ...] = field(default_factory=tuple)
+    market_group_id: int | None = None
+    decision_rule_id: str = ""
+    activation_mode: str = ""
+    target_mode: str = ""
+    target_side: str = ""
+    cap_threshold: float = 0.0
 
     def is_active_for(self, required: ModuleState) -> bool:
         rank = {
@@ -550,6 +558,14 @@ class RuntimeStatEngine:
                 m.group,
                 m.state.value,
                 tuple(sorted(str(tag) for tag in m.tags)),
+                str(m.classification_id),
+                tuple(str(value) for value in m.market_path),
+                m.market_group_id,
+                str(m.decision_rule_id),
+                str(m.activation_mode),
+                str(m.target_mode),
+                str(m.target_side),
+                float(m.cap_threshold),
                 tuple(
                     (
                         e.name,

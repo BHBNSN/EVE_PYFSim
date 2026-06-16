@@ -52,6 +52,7 @@ from ..remote_snapshot_signatures import (
 from ..user_errors import UserFacingError
 from ..world import WorldState
 from .eft_parser import EftFitParser
+from .module_classification import MarketDecisionProfile, MarketModuleClassification, MarketTreeClassifier
 from .models import ManualShipSetup, ParsedEftFit, ParsedModuleSpec, ParsedMutationSpec, QUALITY_PRESETS
 
 class RuntimeFromEftFactory:
@@ -107,61 +108,43 @@ class RuntimeFromEftFactory:
     def _is_script_charge_name(self, charge_name: str | None) -> bool:
         return bool(self._pyfa.is_script_charge_name(charge_name))
 
+    def _classification_item_for_fitted_module(
+        self,
+        fitted_module: Any,
+        spec: ParsedModuleSpec | None = None,
+    ) -> Any | None:
+        try:
+            base_item = getattr(fitted_module, "baseItem", None)
+        except Exception:
+            base_item = None
+        if base_item is not None:
+            return base_item
+
+        if spec is not None:
+            base_name = self._pyfa.resolve_type_name(spec.module_name)
+            if base_name:
+                base_item = self._pyfa.get_item(base_name)
+                if base_item is not None:
+                    return base_item
+
+        try:
+            return getattr(fitted_module, "item", None)
+        except Exception:
+            return None
+
+    def _market_classification_for_fitted_module(
+        self,
+        fitted_module: Any,
+        spec: ParsedModuleSpec | None = None,
+    ) -> MarketModuleClassification:
+        item = self._classification_item_for_fitted_module(fitted_module, spec)
+        if item is None:
+            return self._pyfa.market_classification_for_type("")
+        return self._pyfa.market_classification_for_item(item)
+
     @staticmethod
     def _skills_default() -> SkillProfile:
         return SkillProfile(levels={})
-
-    @staticmethod
-    def _is_weapon_like_group(group_name: str) -> bool:
-        g = group_name.lower()
-        if "disruptor" in g or "interdiction sphere launcher" in g:
-            return False
-        return ("launcher" in g) or ("turret" in g) or ("weapon" in g)
-
-    @staticmethod
-    def _is_charge_compatible(module_item, charge_item) -> bool:
-        if module_item is None or charge_item is None:
-            return False
-        module_capacity = module_item.getAttribute("capacity", None)
-        charge_volume = charge_item.getAttribute("volume", None)
-        if module_capacity is not None and charge_volume is not None:
-            try:
-                if float(charge_volume) > float(module_capacity):
-                    return False
-            except Exception:
-                pass
-
-        module_size = module_item.getAttribute("chargeSize", None)
-        charge_size = charge_item.getAttribute("chargeSize", None)
-        if module_size is not None and charge_size is not None:
-            try:
-                ws = int(float(module_size))
-                cs = int(float(charge_size))
-                if ws > 0 and ws != cs:
-                    return False
-            except Exception:
-                pass
-
-        charge_group = getattr(charge_item, "groupID", None)
-        if charge_group is None:
-            charge_group = getattr(getattr(charge_item, "group", None), "ID", None)
-        try:
-            charge_group_id = int(float(charge_group)) if charge_group is not None else 0
-        except Exception:
-            charge_group_id = 0
-        if charge_group_id <= 0:
-            return False
-
-        for idx in range(0, 5):
-            value = module_item.getAttribute(f"chargeGroup{idx}", None)
-            if value is None:
-                continue
-            try:
-                if int(float(value)) == charge_group_id:
-                    return True
-            except Exception:
-                continue
-        return False
 
     @staticmethod
     def _normalize_effect_name(name: str) -> str:
@@ -685,7 +668,12 @@ class RuntimeFromEftFactory:
         if item is None:
             return None
 
-        group_name = (item.group.name or "").lower()
+        module_spec: ParsedModuleSpec | None = None
+        module_specs = getattr(parsed, "module_specs", None) or []
+        if 0 <= idx - 1 < len(module_specs):
+            module_spec = module_specs[idx - 1]
+        classification = self._market_classification_for_fitted_module(fitted_module, module_spec)
+        market_tags = set(classification.tags)
         suffix = f"-{idx}"
         loaded_charge = getattr(fitted_module, "charge", None)
         def attr_opt(name: str) -> float | None:
@@ -791,20 +779,15 @@ class RuntimeFromEftFactory:
         projected_mult: dict[str, float] = {}
         projected_add: dict[str, float] = {}
 
-        is_command_burst = "command burst" in group_name
-        is_burst_jammer = "burst jammer" in group_name
-        is_smart_bomb = ("smart bomb" in group_name) or ("structure area denial module" in group_name)
-        is_interdiction_sphere_launcher = group_name == "interdiction sphere launcher"
-        is_warp_disruption_field_generator = group_name == "warp disrupt field generator"
-        is_bomb_launcher = ("bomb launcher" in group_name)
-        if not is_bomb_launcher and loaded_charge is not None:
-            try:
-                is_bomb_launcher = bool(loaded_charge.requiresSkill("Bomb Deployment"))
-            except Exception:
-                is_bomb_launcher = False
+        is_command_burst = "command_burst" in market_tags
+        is_burst_jammer = "burst_jammer" in market_tags
+        is_smart_bomb = "smart_bomb" in market_tags
+        is_interdiction_sphere_launcher = "interdiction_sphere_launcher" in market_tags
+        is_warp_disruption_field_generator = "warp_disruption_field_generator" in market_tags
+        is_bomb_launcher = classification.is_bomb_launcher
         has_script_charge = loaded_charge is not None and self._is_script_charge_name(getattr(loaded_charge, "typeName", None))
         is_unscripted_hic_bubble = is_warp_disruption_field_generator and (not has_script_charge)
-        is_weapon_like = self._is_weapon_like_group(group_name)
+        is_market_weapon = classification.is_weapon
 
         speed_factor = attr_opt("speedFactor")
         if speed_factor is not None and abs(float(speed_factor) - 1.0) > 1e-6 and range_m <= 0.0 and speed_factor > 0:
@@ -854,7 +837,7 @@ class RuntimeFromEftFactory:
                 projected_add["armor_rep"] = armor_rep
             if cap_drain > 0.0:
                 projected_add["cap_drain"] = cap_drain
-            if nos_drain > 0.0 and "nosferatu" in group_name:
+            if nos_drain > 0.0 and "energy_nosferatu" in market_tags:
                 projected_add["cap_drain"] = max(projected_add.get("cap_drain", 0.0), nos_drain)
         else:
             local_rep = abs(attr("shieldBonus", 0.0)) + abs(attr("armorDamageAmount", 0.0))
@@ -875,7 +858,7 @@ class RuntimeFromEftFactory:
                     projected_add["damage_kinetic"] = kinetic_dps * damage_cycle
                     projected_add["damage_explosive"] = explosive_dps * damage_cycle
 
-        if is_weapon_like:
+        if is_market_weapon:
             damage_components = self._module_damage_components(
                 fitted_module,
                 read_active=True,
@@ -889,7 +872,7 @@ class RuntimeFromEftFactory:
                     projected_add["damage_kinetic"] = kinetic_dps * damage_cycle
                     projected_add["damage_explosive"] = explosive_dps * damage_cycle
 
-                    if "launcher" in group_name:
+                    if classification.is_missile_weapon:
                         if is_bomb_launcher:
                             projected_add["weapon_is_bomb"] = 1.0
                             projected_add["weapon_blast_radius"] = max(0.0, charge_attr("explosionRange", 0.0))
@@ -990,11 +973,11 @@ class RuntimeFromEftFactory:
             and not is_smart_bomb
             and not is_interdiction_sphere_launcher
             and not is_unscripted_hic_bubble
-            and not is_weapon_like
+            and not is_market_weapon
             and shield_rep <= 0.0
             and armor_rep <= 0.0
             and cap_drain <= 0.0
-            and not (nos_drain > 0.0 and "nosferatu" in group_name)
+            and not (nos_drain > 0.0 and "energy_nosferatu" in market_tags)
         )
         if should_record_projected_profile:
             recorded_mult, recorded_add, recorded_groups, recorded_signature = self._projected_effects_from_pyfa_handler(
@@ -1013,7 +996,7 @@ class RuntimeFromEftFactory:
         if cap_recharge_mult is not None and cap_recharge_mult > 0 and abs(cap_recharge_mult - 1.0) > 1e-6:
             local_mult["cap_recharge"] = max(0.01, cap_recharge_mult)
 
-        if not is_weapon_like:
+        if not is_market_weapon:
             damage_scale = 1.0
             damage_multiplier_bonus = attr_opt("damageMultiplierBonus")
             if damage_multiplier_bonus is not None and abs(damage_multiplier_bonus) > 1e-9:
@@ -1037,7 +1020,7 @@ class RuntimeFromEftFactory:
             if abs(damage_scale - 1.0) > 1e-6:
                 local_mult["dps"] = max(0.01, damage_scale)
 
-        if is_weapon_like and range_m <= 0.0:
+        if is_market_weapon and range_m <= 0.0:
             range_m = max(
                 range_m,
                 float(projected_add.get("weapon_projectile_speed", 0.0) or 0.0)
@@ -1047,23 +1030,15 @@ class RuntimeFromEftFactory:
             cycle_sec = max(0.1, pyfa_cycle_sec)
 
         has_projected_damage = any(str(key).startswith("damage_") for key in projected_add.keys())
-        is_weapon = is_weapon_like and has_projected_damage
-        has_projected_rep = shield_rep > 0.0 or armor_rep > 0.0
-        is_cap_warfare = cap_drain > 0.0 or (nos_drain > 0.0 and "nosferatu" in group_name)
-        is_offensive_ewar = any(token in group_name for token in ("weapon disruptor", "sensor damp", "warp scrambler"))
-        is_target_ewar = any(token in group_name for token in ("target painter", "stasis web", "stasis grappler"))
-        is_cap_booster = "capacitor booster" in group_name
-        is_propulsion = "propulsion module" in group_name
-        is_damage_control = group_name == "damage control"
-        is_hardener = any(
-            token in group_name
-            for token in (
-                "shield hardener",
-                "armor hardener",
-                "energized",
-                "armor resistance shift hardener",
-            )
-        )
+        is_weapon = is_market_weapon and has_projected_damage
+        has_projected_rep = "remote_repair" in market_tags and (shield_rep > 0.0 or armor_rep > 0.0)
+        is_cap_warfare = "cap_warfare" in market_tags and (cap_drain > 0.0 or nos_drain > 0.0)
+        is_offensive_ewar = "offensive_ewar" in market_tags
+        is_target_ewar = "target_ewar" in market_tags
+        is_cap_booster = "cap_booster" in market_tags
+        is_propulsion = "propulsion" in market_tags
+        is_damage_control = "damage_control" in market_tags
+        is_hardener = "hardener" in market_tags
 
         spawns_static_bubble = False
         bubble_affects_local_profile = False
@@ -1115,6 +1090,18 @@ class RuntimeFromEftFactory:
             local_add["bubble_hic"] = 1.0
             bubble_affects_local_profile = True
 
+        runtime_market_tags = set(market_tags)
+        decision_profile = classification.decision
+        if spawns_static_bubble or bubble_affects_local_profile:
+            runtime_market_tags.update(("area_effect", "bubble", "hostile"))
+            decision_profile = MarketDecisionProfile(
+                "market_hic_bubble" if bubble_affects_local_profile else "market_interdiction_sphere",
+                "enemy_in_area",
+                "none",
+                "enemy",
+                0.15,
+            )
+
         has_projected = (
             range_m > 0.0
             and (
@@ -1130,7 +1117,7 @@ class RuntimeFromEftFactory:
             )
         )
         is_active_module = supports_active_state and ((cap_need > 0.0) or (cycle_ms > 0.0) or has_projected)
-        if self._is_weapon_like_group(group_name) and cycle_ms > 0.0:
+        if is_market_weapon and cycle_ms > 0.0:
             is_active_module = True
 
         state_required = ModuleState.ACTIVE if is_active_module else ModuleState.ONLINE
@@ -1141,7 +1128,7 @@ class RuntimeFromEftFactory:
             or is_command_burst
             or ((not has_projected) and state_required == ModuleState.ACTIVE and not spawns_static_bubble)
         )
-        module_tags = self._module_tags(
+        module_tags = tuple(sorted(set(self._module_tags(
             item=item,
             has_projected=has_projected,
             is_active_module=is_active_module,
@@ -1159,7 +1146,7 @@ class RuntimeFromEftFactory:
             is_damage_control=is_damage_control,
             is_hardener=is_hardener,
             is_cap_booster=is_cap_booster,
-        )
+        )) | runtime_market_tags))
 
         charge_capacity = 0
         item_modified_attrs = getattr(fitted_module, "itemModifiedAttributes", None)
@@ -1241,10 +1228,17 @@ class RuntimeFromEftFactory:
             charge_remaining=charge_remaining,
             charge_reload_time=charge_reload_time,
             tags=module_tags,
+            classification_id=classification.classification_id,
+            market_path=classification.market_path_names,
+            market_group_id=classification.market_group_id,
+            decision_rule_id=decision_profile.rule_id,
+            activation_mode=decision_profile.activation_mode,
+            target_mode=decision_profile.target_mode,
+            target_side=decision_profile.target_side,
+            cap_threshold=decision_profile.cap_threshold,
         )
 
-    @staticmethod
-    def _collect_pyfa_weapon_stats(modules: list[Any], ship: Any, *, require_volley: bool) -> dict[str, float]:
+    def _collect_pyfa_weapon_stats(self, modules: list[Any], ship: Any, *, require_volley: bool) -> dict[str, float]:
         turret_dps = 0.0
         missile_dps = 0.0
         turret_volley = 0.0
@@ -1268,16 +1262,10 @@ class RuntimeFromEftFactory:
         missile_drf = 0.5
 
         for module in modules:
-            try:
-                item = module.item
-            except Exception:
-                item = None
-            if item is None:
-                continue
-            group_name = str(getattr(getattr(item, "group", None), "name", "") or "").lower()
-            is_launcher = "launcher" in group_name
-            is_turret = ("weapon" in group_name or "turret" in group_name) and not is_launcher
-            if not (is_turret or is_launcher):
+            classification = self._market_classification_for_fitted_module(module)
+            is_launcher = classification.is_missile_weapon
+            is_turret = classification.is_turret_weapon
+            if not classification.is_weapon:
                 continue
 
             try:
@@ -1496,17 +1484,27 @@ class RuntimeFromEftFactory:
             module.owner = fit
             module_id = f"mod-{idx}"
 
-            group_name = (module_item.group.name or "").lower()
+            classification = self._pyfa.market_classification_for_item(module_item)
             charge_name = self._resolve_module_charge_name(module_item, spec.charge_name)
-            if self._is_weapon_like_group(group_name) and not charge_name:
+            valid_charge_names = self._pyfa.list_charge_options_for_module(module_name)
+            valid_charge_keys = {name.lower() for name in valid_charge_names}
+            requires_charge = bool(valid_charge_names) and not self._pyfa.supports_unloaded_charge_state(module_name)
+            if classification.is_weapon and requires_charge and not charge_name:
                 raise UserFacingError("Weapon has no resolvable ammo: {name}", name=spec.module_name)
             if charge_name:
+                canonical_charge_name = self._pyfa.resolve_type_name(charge_name)
+                if canonical_charge_name.lower() not in valid_charge_keys:
+                    raise UserFacingError(
+                        "Charge is not compatible with module: {charge} -> {module}",
+                        charge=charge_name,
+                        module=spec.module_name,
+                    )
                 charge_item = self._pyfa.get_item(self._pyfa.resolve_type_name(charge_name))
                 if charge_item is None:
                     raise UserFacingError("Charge not found in pyfa: {name}", name=charge_name)
                 module.charge = charge_item
 
-            default_runtime_state = "ONLINE" if default_online else ("ACTIVE" if self._is_weapon_like_group(group_name) else "ONLINE")
+            default_runtime_state = "ONLINE" if default_online else ("ACTIVE" if classification.is_weapon else "ONLINE")
             runtime_state = str((state_by_module_id or {}).get(module_id, default_runtime_state) or default_runtime_state).upper()
             if spec.offline and not ignore_offline_specs:
                 runtime_state = "OFFLINE"
@@ -1691,13 +1689,10 @@ class RuntimeFromEftFactory:
         }
 
         for module in getattr(fit_ctx, "modules", []) or []:
-            item = getattr(module, "item", None)
-            if item is None:
-                continue
-            group_name = str(getattr(getattr(item, "group", None), "name", "") or "").lower()
-            is_launcher = "launcher" in group_name
-            is_turret = ("weapon" in group_name or "turret" in group_name) and not is_launcher
-            if not (is_turret or is_launcher):
+            classification = self._market_classification_for_fitted_module(module)
+            is_launcher = classification.is_missile_weapon
+            is_turret = classification.is_turret_weapon
+            if not classification.is_weapon:
                 continue
 
             try:
@@ -1786,8 +1781,7 @@ class RuntimeFromEftFactory:
             requested_state = str((state_by_module_id or {}).get(module_id, "ONLINE") or "ONLINE").upper()
             if requested_state == "OFFLINE":
                 continue
-            group_name = str(getattr(getattr(fitted_module, "item", None), "group", None).name or "")
-            if not self._is_weapon_like_group(group_name):
+            if not self._market_classification_for_fitted_module(fitted_module, spec).is_weapon:
                 continue
             active_state = _pyfa_module_state_from_runtime_state(self, fitted_module, "ACTIVE")
             if active_state is None or active_state == fitted_module.state:
@@ -2462,6 +2456,7 @@ class _PyfaStaticBackend:
         self._resolve_cache: dict[str, str] = {}
         self._has_type_name_zh = False
         self._db_path = resolve_pyfa_source_dir() / "eve.db"
+        self._market_classifier = MarketTreeClassifier(self._db_path)
         self._init_db_meta()
         self._init_backend()
 
@@ -2549,6 +2544,15 @@ class _PyfaStaticBackend:
         except Exception:
             return None
 
+    def market_classification_for_item(self, item: Any) -> MarketModuleClassification:
+        return self._market_classifier.classify_item(item)
+
+    def market_classification_for_type(self, type_name: str) -> MarketModuleClassification:
+        item = self.get_item(self.resolve_type_name(type_name))
+        if item is None:
+            return self._market_classifier._unknown(str(type_name or ""), "", "")
+        return self.market_classification_for_item(item)
+
     @property
     def fit_engine_ready(self) -> bool:
         return all(
@@ -2568,84 +2572,22 @@ class _PyfaStaticBackend:
         module = self.get_item(module_name)
         if module is None:
             return []
+        if self._module_cls is None:
+            raise UserFacingError("Pyfa module engine is unavailable while resolving charges for: {name}", name=module_name)
 
-        if self._module_cls is not None:
-            try:
-                module_obj = self._module_cls(module)
-                charges = module_obj.getValidCharges()
-                names = sorted(
-                    {
-                        str(charge.typeName)
-                        for charge in charges
-                        if charge is not None and getattr(charge, "typeName", None)
-                    }
-                )
-                return names
-            except Exception:
-                pass
+        try:
+            module_obj = self._module_cls(module)
+            charges = module_obj.getValidCharges()
+        except Exception as exc:
+            raise UserFacingError("Failed to resolve valid charges for module: {name}", name=module_name) from exc
 
-        if self._get_group is None:
-            return []
-
-        module_size_attr = module.getAttribute("chargeSize", None)
-        module_size = 0
-        if module_size_attr is not None:
-            try:
-                module_size = int(float(module_size_attr))
-            except Exception:
-                module_size = 0
-
-        module_capacity_attr = module.getAttribute("capacity", None)
-        module_capacity: float | None = None
-        if module_capacity_attr is not None:
-            try:
-                module_capacity = float(module_capacity_attr)
-            except Exception:
-                module_capacity = None
-
-        group_ids: list[int] = []
-        for i in range(0, 5):
-            value = module.getAttribute(f"chargeGroup{i}", None)
-            if value is None:
-                continue
-            try:
-                gid = int(float(value))
-            except Exception:
-                continue
-            if gid > 0 and gid not in group_ids:
-                group_ids.append(gid)
-
-        ammo_names: list[str] = []
-        for gid in group_ids:
-            try:
-                group = self._get_group(gid)
-                if group is None:
-                    continue
-                for item in group.items:
-                    if not bool(getattr(item, "published", True)):
-                        continue
-
-                    charge_volume_attr = item.getAttribute("volume", None)
-                    if module_capacity is not None and charge_volume_attr is not None:
-                        try:
-                            if float(charge_volume_attr) > module_capacity:
-                                continue
-                        except Exception:
-                            pass
-
-                    charge_size_attr = item.getAttribute("chargeSize", None)
-                    charge_size = 0
-                    if charge_size_attr is not None:
-                        try:
-                            charge_size = int(float(charge_size_attr))
-                        except Exception:
-                            charge_size = 0
-                    if module_size > 0 and charge_size > 0 and charge_size != module_size:
-                        continue
-                    ammo_names.append(item.typeName)
-            except Exception:
-                continue
-        return sorted(set(ammo_names))
+        return sorted(
+            {
+                str(charge.typeName)
+                for charge in charges
+                if charge is not None and getattr(charge, "typeName", None)
+            }
+        )
 
     def is_script_charge_name(self, charge_name: str | None) -> bool:
         canonical = self.resolve_type_name(charge_name or "")
@@ -2679,28 +2621,7 @@ class _PyfaStaticBackend:
         module = self.get_item(module_name)
         if module is None:
             return "none"
-        group_name = (module.group.name or "").lower()
-        if "launcher" in group_name:
-            return "launcher"
-        if ("weapon" in group_name) or ("turret" in group_name):
-            return "turret"
-        return "none"
-
-    def is_charge_loadable_module(self, module_name: str) -> bool:
-        canonical = self.resolve_type_name(module_name)
-        item = self.get_item(canonical)
-        if item is None:
-            return False
-        for i in range(0, 5):
-            value = item.getAttribute(f"chargeGroup{i}", None)
-            if value is None:
-                continue
-            try:
-                if int(float(value)) > 0:
-                    return True
-            except Exception:
-                continue
-        return False
+        return self.market_classification_for_item(module).reload_channel
 
     def resolve_type_name(self, type_name: str) -> str:
         name = (type_name or "").strip()
@@ -3678,10 +3599,7 @@ def get_common_chargeable_modules(fit_texts: list[str], usage_threshold: float =
     counts: Counter[str] = Counter()
     chargeable_cache: dict[str, bool] = {}
     for text in fit_texts:
-        try:
-            parsed = parser.parse(text)
-        except Exception:
-            continue
+        parsed = parser.parse(text)
         for spec in parsed.module_specs:
             module_name = backend.resolve_type_name(spec.module_name)
             if not module_name:

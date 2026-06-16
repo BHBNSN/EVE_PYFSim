@@ -934,26 +934,28 @@ class BattleCanvas(QWidget):
 
     @staticmethod
     def _module_area_style(module: ModuleRuntime) -> tuple[QColor, QColor] | None:
-        group = str(getattr(module, "group", "") or "").strip().lower()
-        if group == "command burst":
+        tags = {str(value) for value in getattr(module, "tags", ()) or ()}
+        if "command_burst" in tags:
             return QColor(88, 214, 141, 13), QColor(88, 214, 141, 13)
-        if group in {"smart bomb", "structure area denial module"}:
+        if "smart_bomb" in tags:
             return QColor(255, 145, 77, 13), QColor(255, 165, 96, 13)
+        if "bubble" in tags:
+            return QColor(77, 171, 247, 13), QColor(116, 192, 252, 13)
         return None
 
     @staticmethod
     def _module_area_radius(module: ModuleRuntime) -> float:
         radius_m = 0.0
         for effect in module.effects:
-            if effect.effect_class != EffectClass.PROJECTED:
-                continue
-            radius_m = max(radius_m, max(0.0, float(effect.range_m or 0.0)))
+            if effect.effect_class == EffectClass.PROJECTED:
+                radius_m = max(radius_m, max(0.0, float(effect.range_m or 0.0)))
+            radius_m = max(radius_m, max(0.0, float(effect.local_add.get("bubble_radius_m", 0.0) or 0.0)))
         return radius_m
 
     @staticmethod
     def _module_area_expand_duration(module: ModuleRuntime) -> float:
-        group = str(getattr(module, "group", "") or "").strip().lower()
-        if group == "command burst":
+        tags = {str(value) for value in getattr(module, "tags", ()) or ()}
+        if "command_burst" in tags:
             return 0.35
         return 0.0
 

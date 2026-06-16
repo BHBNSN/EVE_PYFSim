@@ -846,6 +846,20 @@ class ModuleCyclesMixin:
             for candidate in self._iter_area_targets_in_range(world, source, module, effect):
                 if candidate.team != source.team:
                     return True
+        source_system_id = self._ship_system_id(source)
+        for effect in self._module_bubble_effects(module):
+            radius_m = max(0.0, float(effect.local_add.get("bubble_radius_m", 0.0) or 0.0))
+            if radius_m <= 0.0:
+                continue
+            for candidate in world.ships.values():
+                if candidate.ship_id == source.ship_id or candidate.team == source.team:
+                    continue
+                if not candidate.vital.alive or self._ship_in_warp(candidate):
+                    continue
+                if source_system_id and self._ship_system_id(candidate) != source_system_id:
+                    continue
+                if source.nav.position.distance_to(candidate.nav.position) <= radius_m:
+                    return True
         return False
 
     @staticmethod
