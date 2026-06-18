@@ -71,6 +71,13 @@ class MovementSystem:
         return True
 
     @staticmethod
+    def _entity_system_id(entity) -> str:
+        nav = getattr(entity, "nav", None)
+        if nav is not None:
+            return str(getattr(nav, "system_id", "") or "")
+        return str(getattr(entity, "system_id", "") or "")
+
+    @staticmethod
     def _clear_gate_cloak(ship) -> None:
         cloak = getattr(ship.nav, "cloak", None)
         if cloak is None:
@@ -187,7 +194,10 @@ class MovementSystem:
     def _capture_warp_interdiction_snapshots(cls, world: WorldState, ship) -> tuple[WarpInterdictionSnapshot, ...]:
         snapshots: list[WarpInterdictionSnapshot] = []
         now = float(world.now)
+        ship_system_id = cls._entity_system_id(ship)
         for field in world.bubble_fields.values():
+            if str(getattr(field, "system_id", "") or "") != ship_system_id:
+                continue
             if not field.alive or not field.blocks_warp:
                 continue
             if field.anchor_ship_id is None and float(field.expires_at) <= now:
@@ -207,7 +217,10 @@ class MovementSystem:
     @classmethod
     def _ship_inside_current_warp_disruption(cls, world: WorldState, ship, bubble_immune_snapshot: bool) -> bool:
         now = float(world.now)
+        ship_system_id = cls._entity_system_id(ship)
         for field in world.bubble_fields.values():
+            if str(getattr(field, "system_id", "") or "") != ship_system_id:
+                continue
             if not field.alive or not field.blocks_warp:
                 continue
             if field.anchor_ship_id is None and float(field.expires_at) <= now:
@@ -262,7 +275,10 @@ class MovementSystem:
     def _bubble_speed_multiplier(cls, world: WorldState, ship) -> float:
         multiplier = 1.0
         now = float(world.now)
+        ship_system_id = cls._entity_system_id(ship)
         for field in world.bubble_fields.values():
+            if str(getattr(field, "system_id", "") or "") != ship_system_id:
+                continue
             if not field.alive:
                 continue
             if field.anchor_ship_id is None and float(field.expires_at) <= now:

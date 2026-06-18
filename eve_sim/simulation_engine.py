@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
+from copy import deepcopy
 from dataclasses import asdict
 import logging
 import time
@@ -7,8 +9,21 @@ import time
 from .agents import CommanderAgent, ShipAgent
 from .config import EngineConfig
 from .fleet_setup import prewarm_runtime_base_cache, prewarm_world_base_cache
+from .pyfa_bridge import PyfaBridge
 from .sim_logging import get_sim_logger, log_sim_event
 from .systems import CombatSystem, DeployableSystem, LogisticsSystem, MovementSystem, PerceptionSystem
+from .system_isolation import (
+    SystemExecutionPlan,
+    SystemTransferIn,
+    build_system_shard,
+    log_group_hotspot,
+    has_unassigned_active_entities,
+    merge_system_results,
+    plan_system_execution,
+    replace_task_combat,
+    run_system_group,
+    sanitize_combat_for_worker,
+)
 from .world import WorldState
 
 
@@ -36,7 +51,26 @@ class SimulationEngine:
         self.last_step_ms: float = 0.0
         self.last_step_budget_ms: float = self.nominal_tick_interval_ms()
         self._dt = 1.0 / float(self._configured_tick_rate())
+        self._system_combats: dict[str, CombatSystem] = {}
+        self._system_executor: ProcessPoolExecutor | None = None
+        self._system_executor_workers: int = 0
+        self.last_system_execution_plan: SystemExecutionPlan = SystemExecutionPlan()
+        self.last_system_parallel_error: str | None = None
+        self.last_system_transfers: list[SystemTransferIn] = []
         prewarm_world_base_cache(world)
+
+    def shutdown_parallel_workers(self) -> None:
+        if self._system_executor is None:
+            return
+        self._system_executor.shutdown(wait=False, cancel_futures=True)
+        self._system_executor = None
+        self._system_executor_workers = 0
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown_parallel_workers()
+        except Exception:
+            pass
 
     def _configured_tick_rate(self) -> int:
         try:
@@ -107,6 +141,18 @@ class SimulationEngine:
         step_end = step_start + self._dt
         self.world.now = step_end
 
+        if self._should_run_isolated_systems():
+            self._step_isolated_systems(step_start, step_end, step_perf_started)
+            return
+
+        self.last_system_execution_plan = SystemExecutionPlan()
+
+        self._step_global_systems(step_start, step_end, step_perf_started)
+
+    def _step_global_systems(self, step_start: float, step_end: float, step_perf_started: float) -> None:
+        self.shutdown_parallel_workers()
+        self.last_system_transfers = []
+
         perf_started = time.perf_counter()
         self.perception.run(self.world)
         self._log_hotspot("engine.perception", perf_started, tick=self.world.tick)
@@ -162,6 +208,139 @@ class SimulationEngine:
         self._log_hotspot("engine.logistics", perf_started, tick=self.world.tick, dt=self._dt)
 
         self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=substep_count)
+
+    def _should_run_isolated_systems(self) -> bool:
+        if not bool(getattr(self.config, "isolate_systems", True)):
+            return False
+        if not isinstance(self.combat, CombatSystem):
+            return False
+        plan = plan_system_execution(self.world, self.config)
+        if has_unassigned_active_entities(self.world):
+            self.last_system_execution_plan = plan
+            return False
+        if len(plan.active_systems) <= 1:
+            self.last_system_execution_plan = plan
+            return False
+        self.last_system_execution_plan = plan
+        return True
+
+    def _clone_base_combat(self) -> CombatSystem:
+        sink = getattr(self.combat, "_combat_event_sink", None)
+        logger = getattr(self.combat, "logger", None)
+        try:
+            self.combat.attach_event_sink(None)
+            self.combat.logger = None
+            cloned = deepcopy(self.combat)
+        except Exception:
+            cloned = CombatSystem(PyfaBridge())
+        finally:
+            self.combat.attach_event_sink(sink)
+            self.combat.logger = logger
+        cloned.attach_event_sink(None)
+        cloned.logger = None
+        return cloned
+
+    def _combat_for_system(self, system_id: str) -> CombatSystem:
+        combat = self._system_combats.get(system_id)
+        if combat is not None:
+            return combat
+        combat = self._clone_base_combat() if not self._system_combats else CombatSystem(PyfaBridge())
+        self._system_combats[system_id] = combat
+        return combat
+
+    def _executor_for_plan(self, plan: SystemExecutionPlan) -> ProcessPoolExecutor:
+        workers = max(1, int(plan.worker_count or len(plan.groups) or 1))
+        if self._system_executor is not None and self._system_executor_workers == workers:
+            return self._system_executor
+        self.shutdown_parallel_workers()
+        self._system_executor = ProcessPoolExecutor(max_workers=workers)
+        self._system_executor_workers = workers
+        return self._system_executor
+
+    def _emit_isolated_events(self, events) -> None:
+        sink = getattr(self.combat, "_combat_event_sink", None)
+        if sink is None:
+            return
+        for event in events:
+            sink(event)
+
+    def _step_isolated_systems(self, step_start: float, step_end: float, step_perf_started: float) -> None:
+        plan = self.last_system_execution_plan
+        if not plan.groups:
+            self._step_global_systems(step_start, step_end, step_perf_started)
+            return
+
+        started = time.perf_counter()
+        tasks_by_system = {}
+        for group in plan.groups:
+            for system_id in group.system_ids:
+                task = build_system_shard(self.world, system_id, self.commanders, self.ship_agents)
+                tasks_by_system[system_id] = replace_task_combat(
+                    task,
+                    sanitize_combat_for_worker(self._combat_for_system(system_id)),
+                )
+
+        group_tasks = [
+            [tasks_by_system[system_id] for system_id in group.system_ids if system_id in tasks_by_system]
+            for group in plan.groups
+        ]
+        group_tasks = [tasks for tasks in group_tasks if tasks]
+
+        group_results = []
+        if plan.use_processes:
+            executor = self._executor_for_plan(plan)
+            futures = [
+                executor.submit(run_system_group, tasks, self.config, step_start, step_end, self._dt)
+                for tasks in group_tasks
+            ]
+            try:
+                group_results = [future.result() for future in futures]
+                self.last_system_parallel_error = None
+            except Exception as exc:
+                self.last_system_parallel_error = str(exc) or exc.__class__.__name__
+                self._logger.exception("system parallel execution failed; falling back to serial shard execution")
+                for future in futures:
+                    future.cancel()
+                self.shutdown_parallel_workers()
+                group_results = [
+                    run_system_group(tasks, self.config, step_start, step_end, self._dt)
+                    for tasks in group_tasks
+                ]
+                plan = SystemExecutionPlan(
+                    active_systems=plan.active_systems,
+                    groups=plan.groups,
+                    worker_count=1,
+                    use_processes=False,
+                )
+                self.last_system_execution_plan = plan
+        else:
+            self.shutdown_parallel_workers()
+            self.last_system_parallel_error = None
+            group_results = [
+                run_system_group(tasks, self.config, step_start, step_end, self._dt)
+                for tasks in group_tasks
+            ]
+
+        shard_results = [result for group_result in group_results for result in group_result.results]
+        for result in shard_results:
+            self._system_combats[result.system_id] = result.combat
+
+        transfer_ins: list[SystemTransferIn] = []
+        events = merge_system_results(self.world, shard_results, self.ship_agents, transfer_sink=transfer_ins)
+        self.last_system_transfers = transfer_ins
+        self._emit_isolated_events(events)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        log_group_hotspot(self.config, plan, elapsed_ms)
+        self._log_hotspot(
+            "engine.step_total",
+            step_perf_started,
+            tick=self.world.tick,
+            external_dt=self._dt,
+            slices=max(1, int(self.config.physics_substeps)),
+            systems=len(plan.active_systems),
+            groups=len(plan.groups),
+            processes=bool(plan.use_processes),
+        )
 
     def snapshot(self) -> dict:
         ships = {}

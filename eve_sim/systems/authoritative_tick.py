@@ -404,12 +404,14 @@ class AuthoritativeTickMixin:
                             center=Vector2(source.nav.position.x, source.nav.position.y),
                             radius_m=max(0.0, float(effect.range_m or 0.0)),
                             damage=self._effect_damage_tuple(effect),
+                            system_id=str(getattr(source.nav, "system_id", "") or ""),
                         )
                         self._destroy_bubbles_in_area(
                             world,
                             center=Vector2(source.nav.position.x, source.nav.position.y),
                             radius_m=max(0.0, float(effect.range_m or 0.0)),
                             damage=self._effect_damage_tuple(effect),
+                            system_id=str(getattr(source.nav, "system_id", "") or ""),
                         )
 
         self._advance_projectiles(world, dt)

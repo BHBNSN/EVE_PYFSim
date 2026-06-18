@@ -5,6 +5,17 @@ from .combat_common import *  # noqa: F403
 
 class ProjectilesMixin:
     @staticmethod
+    def _projectile_entity_system_id(entity: Any) -> str:
+        nav = getattr(entity, "nav", None)
+        if nav is not None:
+            return str(getattr(nav, "system_id", "") or "")
+        return str(getattr(entity, "system_id", "") or "")
+
+    @classmethod
+    def _same_projectile_system(cls, projectile: ProjectileEntity, entity: Any) -> bool:
+        return str(getattr(projectile, "system_id", "") or "") == cls._projectile_entity_system_id(entity)
+
+    @staticmethod
     def _vector_from_facing_deg(facing_deg: float) -> Vector2:
         radians = math.radians(float(facing_deg or 0.0))
         return Vector2(math.cos(radians), math.sin(radians))
@@ -197,14 +208,18 @@ class ProjectilesMixin:
         exclude_ids: set[str] | None = None,
         damage: DamageTuple | None = None,
         damage_factor: float = 1.0,
+        system_id: str = "",
     ) -> None:
         radius = max(0.0, float(radius_m or 0.0))
         if radius <= 0.0:
             return
         excluded = exclude_ids or set()
+        source_system_id = str(system_id or "")
         hit_radius = radius + 25.0
         for projectile_id, projectile in list(world.projectiles.items()):
             if projectile_id in excluded:
+                continue
+            if source_system_id and str(getattr(projectile, "system_id", "") or "") != source_system_id:
                 continue
             if not projectile.alive:
                 world.projectiles.pop(projectile_id, None)
@@ -331,7 +346,13 @@ class ProjectilesMixin:
         if max_range <= 0.0 and max_speed <= 0.0:
             return
 
+        source_system_id = self._projectile_entity_system_id(source)
         target = world.combat_entity(target_id) if target_id else None
+        if target is not None and (
+            not target.vital.alive or self._projectile_entity_system_id(target) != source_system_id
+        ):
+            target = None
+            target_id = None
         if target is not None and target.vital.alive:
             direction = (target.nav.position - source.nav.position).normalized()
         else:
@@ -430,7 +451,12 @@ class ProjectilesMixin:
         target = world.combat_entity(projectile.target_ship_id or "")
         if target is None or not target.vital.alive:
             return
+        if not self._same_projectile_system(projectile, target):
+            projectile.target_ship_id = None
+            return
         source = world.combat_entity(projectile.source_ship_id)
+        if source is not None and not self._same_projectile_system(projectile, source):
+            return
         damage_factor = self._missile_damage_factor(projectile, target, target.profile)
         self._apply_direct_damage(
             world,
@@ -444,18 +470,23 @@ class ProjectilesMixin:
 
     def _resolve_bomb_explosion(self, world: WorldState, projectile: ProjectileEntity) -> None:
         source = world.combat_entity(projectile.source_ship_id)
+        if source is not None and not self._same_projectile_system(projectile, source):
+            source = None
         blast_radius = max(0.0, float(projectile.blast_radius or 0.0))
         if blast_radius <= 0.0:
             return
+        projectile_system_id = str(getattr(projectile, "system_id", "") or "")
         self._create_projectile_blast(
             world,
             kind="bomb",
             position=projectile.position,
             radius_m=blast_radius,
-            system_id=str(getattr(projectile, "system_id", "") or ""),
+            system_id=projectile_system_id,
         )
         for target in world.iter_combat_entities():
             if not target.vital.alive:
+                continue
+            if self._projectile_entity_system_id(target) != projectile_system_id:
                 continue
             if projectile.position.distance_to(target.nav.position) > (blast_radius + max(0.0, float(target.nav.radius or 0.0))):
                 continue
@@ -475,12 +506,14 @@ class ProjectilesMixin:
             radius_m=blast_radius,
             exclude_ids={projectile.projectile_id},
             damage=self._projectile_damage_tuple(projectile),
+            system_id=projectile_system_id,
         )
         self._destroy_bubbles_in_area(
             world,
             center=projectile.position,
             radius_m=blast_radius,
             damage=self._projectile_damage_tuple(projectile),
+            system_id=projectile_system_id,
         )
 
     def _advance_projectiles(self, world: WorldState, dt: float) -> None:
@@ -496,6 +529,9 @@ class ProjectilesMixin:
                 continue
 
             target = world.combat_entity(projectile.target_ship_id or "")
+            if target is not None and not self._same_projectile_system(projectile, target):
+                projectile.target_ship_id = None
+                target = None
             if projectile.kind == "missile" and target is not None and target.vital.alive:
                 direction = (target.nav.position - projectile.position).normalized()
                 if direction.length() > 1e-9:

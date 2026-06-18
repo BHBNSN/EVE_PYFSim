@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .models import BubbleField, DroneEntity, FighterEntity, FleetIntent, ProjectileBlast, ProjectileEntity, ShipEntity, StructureEntity, Team
+from .models import BubbleField, DroneEntity, FighterEntity, FleetIntent, ProjectileBlast, ProjectileEntity, ShipEntity, StructureEntity
 
 if TYPE_CHECKING:
     from .maps import MapDefinition
@@ -35,12 +35,6 @@ class WorldState:
     @property
     def beacons(self) -> dict[str, StructureEntity]:
         return self.structures
-
-    def by_team(self, team: Team) -> list[ShipEntity]:
-        return [s for s in self.ships.values() if s.team == team and s.vital.alive]
-
-    def enemies_of(self, team: Team) -> list[ShipEntity]:
-        return [s for s in self.ships.values() if s.team != team and s.vital.alive]
 
     def combat_entity(self, entity_id: str | None):
         key = str(entity_id or "").strip()

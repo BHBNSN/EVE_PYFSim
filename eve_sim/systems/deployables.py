@@ -39,6 +39,13 @@ class DeployableSystem:
     def _focus_key(team: Team, squad_id: str) -> str:
         return f"{team.value}:{squad_id}"
 
+    @staticmethod
+    def _entity_system_id(entity) -> str:
+        nav = getattr(entity, "nav", None)
+        if nav is not None:
+            return str(getattr(nav, "system_id", "") or "")
+        return str(getattr(entity, "system_id", "") or "")
+
     @classmethod
     def fighter_squad_id(cls, owner_squad_id: str) -> str:
         squad = str(owner_squad_id or "").strip()
@@ -483,20 +490,25 @@ class DeployableSystem:
         if mode not in {"approach", "keep_range", "orbit"} or kind not in {"ship", "structure"} or not target_key:
             return 0
         target_position: Vector2 | None = None
+        target_system_id = ""
         if kind == "ship":
             target = world.combat_entity(target_key)
             if target is None or not target.vital.alive:
                 return 0
             target_position = Vector2(target.nav.position.x, target.nav.position.y)
+            target_system_id = self._entity_system_id(target)
         else:
             structure = world.structures.get(target_key)
             if structure is None:
                 return 0
             target_position = Vector2(structure.position.x, structure.position.y)
+            target_system_id = self._entity_system_id(structure)
 
         changed = 0
         for fighter in self._fighter_squad_members(world, team, squad_id):
             if not getattr(fighter, "connected", True) or fighter.state == "recalling":
+                continue
+            if self._entity_system_id(fighter) != target_system_id:
                 continue
             fighter.nav.command_mode = mode
             fighter.nav.command_target = Vector2(target_position.x, target_position.y)
@@ -518,8 +530,18 @@ class DeployableSystem:
         target_beacon_id: str | None = None,
     ) -> int:
         changed = 0
+        target_ship = world.combat_entity(target_ship_id) if target_ship_id else None
+        target_beacon = world.structures.get(str(target_beacon_id)) if target_beacon_id else None
+        if target_ship_id and (target_ship is None or not target_ship.vital.alive):
+            return 0
+        if target_beacon_id and target_beacon is None:
+            return 0
         for fighter in self._fighter_squad_members(world, team, squad_id):
             if not getattr(fighter, "connected", True) or fighter.state == "recalling":
+                continue
+            if target_ship is not None and not self._same_system(fighter, target_ship):
+                continue
+            if target_beacon is not None and self._entity_system_id(fighter) != self._entity_system_id(target_beacon):
                 continue
             distance = fighter.nav.position.distance_to(target_position)
             if distance < self.movement.MIN_WARP_DISTANCE_M or self.movement._ship_is_scrammed(fighter):
@@ -556,12 +578,18 @@ class DeployableSystem:
         command_at = float(world.now)
         for owner in self._squad_members(world, team, squad_id):
             control = owner.deployable_control
-            control.pending_drone_attack_target_id = target_key or None
-            control.pending_drone_attack_command_at = command_at
             if not target_key:
+                control.pending_drone_attack_target_id = None
+                control.pending_drone_attack_command_at = 0.0
                 self._accept_owner_drone_command(world, owner, None, command_at)
                 changed = True
             elif target is not None:
+                if not self._same_system(owner, target):
+                    control.pending_drone_attack_target_id = None
+                    control.pending_drone_attack_command_at = 0.0
+                    continue
+                control.pending_drone_attack_target_id = target_key
+                control.pending_drone_attack_command_at = command_at
                 accepted = self._try_accept_owner_drone_command(world, owner, target, command_at)
                 changed = changed or accepted or self._pending_lock_still_active(owner, target.ship_id)
         return changed
@@ -575,12 +603,18 @@ class DeployableSystem:
         command_at = float(world.now)
         for owner in self._squad_members(world, team, squad_id):
             control = owner.deployable_control
-            control.pending_fighter_attack_target_id = target_key or None
-            control.pending_fighter_attack_command_at = command_at
             if not target_key:
+                control.pending_fighter_attack_target_id = None
+                control.pending_fighter_attack_command_at = 0.0
                 self._accept_owner_fighter_command(world, owner, None, command_at)
                 changed = True
             elif target is not None:
+                if not self._same_system(owner, target):
+                    control.pending_fighter_attack_target_id = None
+                    control.pending_fighter_attack_command_at = 0.0
+                    continue
+                control.pending_fighter_attack_target_id = target_key
+                control.pending_fighter_attack_command_at = command_at
                 accepted = self._try_accept_owner_fighter_command(world, owner, target, command_at)
                 changed = changed or accepted or self._pending_lock_still_active(owner, target.ship_id)
         return changed
@@ -651,17 +685,21 @@ class DeployableSystem:
             owner.deployable_control.pending_fighter_attack_command_at = 0.0
         return changed
 
-    def _candidate_target(self, world: WorldState, team: Team, target_id: str | None):
+    def _candidate_target(self, world: WorldState, team: Team, target_id: str | None, source=None):
         target_key = str(target_id or "").strip()
         if not target_key:
             return None
         target = world.combat_entity(target_key)
         if target is None or not target.vital.alive or target.team == team:
             return None
+        if source is not None and not self._same_system(source, target):
+            return None
         return target
 
     def _owner_lock_ready_for_command(self, world: WorldState, owner, target) -> bool:
         if owner is None or target is None or not owner.vital.alive or not target.vital.alive or target.team == owner.team:
+            return False
+        if not self._same_system(owner, target):
             return False
         return bool(
             self.combat._ensure_target_lock(
@@ -682,6 +720,7 @@ class DeployableSystem:
 
     def _accept_owner_drone_command(self, world: WorldState, owner, target_id: str | None, command_at: float) -> None:
         target_key = str(target_id or "").strip() or None
+        target = world.combat_entity(target_key) if target_key else None
         control = owner.deployable_control
         control.drone_attack_target_id = target_key
         control.drone_attack_command_at = float(command_at)
@@ -689,6 +728,10 @@ class DeployableSystem:
         control.pending_drone_attack_command_at = 0.0
         for drone in world.drones.values():
             if drone.owner_ship_id == owner.ship_id and drone.vital.alive and drone.connected:
+                if not self._same_system(drone, owner):
+                    continue
+                if target is not None and not self._same_system(drone, target):
+                    continue
                 drone.target_id = target_key
                 drone.target_command_at = float(command_at) if target_key else 0.0
                 if target_key:
@@ -698,14 +741,20 @@ class DeployableSystem:
         target_key = str(target_id or "").strip()
         if not target_key:
             return
+        target = world.combat_entity(target_key)
+        if target is None or not self._same_system(owner, target):
+            return
         for drone in world.drones.values():
             if drone.owner_ship_id == owner.ship_id and drone.vital.alive and drone.connected:
+                if not self._same_system(drone, owner) or not self._same_system(drone, target):
+                    continue
                 drone.target_id = target_key
                 drone.target_command_at = float(command_at)
                 drone.state = "engaging"
 
     def _accept_owner_fighter_command(self, world: WorldState, owner, target_id: str | None, command_at: float) -> None:
         target_key = str(target_id or "").strip() or None
+        target = world.combat_entity(target_key) if target_key else None
         control = owner.deployable_control
         control.fighter_attack_target_id = target_key
         control.fighter_attack_command_at = float(command_at)
@@ -713,6 +762,10 @@ class DeployableSystem:
         control.pending_fighter_attack_command_at = 0.0
         for fighter in world.fighters.values():
             if fighter.owner_ship_id == owner.ship_id and fighter.vital.alive and fighter.connected:
+                if not self._same_system(fighter, owner):
+                    continue
+                if target is not None and not self._same_system(fighter, target):
+                    continue
                 fighter.target_id = target_key
                 fighter.target_command_at = float(command_at) if target_key else 0.0
                 if target_key:
@@ -722,13 +775,23 @@ class DeployableSystem:
         target_key = str(target_id or "").strip()
         if not target_key:
             return
+        target = world.combat_entity(target_key)
+        if target is None or not self._same_system(owner, target):
+            return
         for fighter in world.fighters.values():
             if fighter.owner_ship_id == owner.ship_id and fighter.vital.alive and fighter.connected:
+                if not self._same_system(fighter, owner) or not self._same_system(fighter, target):
+                    continue
                 fighter.target_id = target_key
                 fighter.target_command_at = float(command_at)
                 fighter.state = "engaging"
 
     def _try_accept_owner_drone_command(self, world: WorldState, owner, target, command_at: float) -> bool:
+        if not self._same_system(owner, target):
+            owner.deployable_control.pending_drone_attack_target_id = None
+            owner.deployable_control.pending_drone_attack_command_at = 0.0
+            self.combat._drop_lock_target(owner, target.ship_id)
+            return False
         if self._owner_lock_ready_for_command(world, owner, target):
             self._accept_owner_drone_command(world, owner, target.ship_id, command_at)
             return True
@@ -738,6 +801,11 @@ class DeployableSystem:
         return False
 
     def _try_accept_owner_fighter_command(self, world: WorldState, owner, target, command_at: float) -> bool:
+        if not self._same_system(owner, target):
+            owner.deployable_control.pending_fighter_attack_target_id = None
+            owner.deployable_control.pending_fighter_attack_command_at = 0.0
+            self.combat._drop_lock_target(owner, target.ship_id)
+            return False
         if self._owner_lock_ready_for_command(world, owner, target):
             self._accept_owner_fighter_command(world, owner, target.ship_id, command_at)
             return True
@@ -750,7 +818,7 @@ class DeployableSystem:
         control = owner.deployable_control
         pending_drone = str(control.pending_drone_attack_target_id or "").strip()
         if pending_drone:
-            target = self._candidate_target(world, owner.team, pending_drone)
+            target = self._candidate_target(world, owner.team, pending_drone, source=owner)
             if target is None:
                 control.pending_drone_attack_target_id = None
                 control.pending_drone_attack_command_at = 0.0
@@ -759,17 +827,17 @@ class DeployableSystem:
 
         pending_fighter = str(control.pending_fighter_attack_target_id or "").strip()
         if pending_fighter:
-            target = self._candidate_target(world, owner.team, pending_fighter)
+            target = self._candidate_target(world, owner.team, pending_fighter, source=owner)
             if target is None:
                 control.pending_fighter_attack_target_id = None
                 control.pending_fighter_attack_command_at = 0.0
             else:
                 self._try_accept_owner_fighter_command(world, owner, target, control.pending_fighter_attack_command_at)
 
-    def _first_valid_queue_target(self, world: WorldState, team: Team, queue: list[str] | tuple[str, ...] | None) -> str | None:
+    def _first_valid_queue_target(self, world: WorldState, team: Team, queue: list[str] | tuple[str, ...] | None, source=None) -> str | None:
         for target_id in queue or []:
             target_key = str(target_id or "").strip()
-            target = self._candidate_target(world, team, target_key)
+            target = self._candidate_target(world, team, target_key, source=source)
             if target is not None:
                 return target_key
         return None
@@ -777,7 +845,7 @@ class DeployableSystem:
     def _resolve_owner_drone_focus(self, world: WorldState, owner) -> None:
         explicit_id = str(getattr(owner.deployable_control, "drone_attack_target_id", "") or "").strip()
         if explicit_id:
-            explicit = self._candidate_target(world, owner.team, explicit_id)
+            explicit = self._candidate_target(world, owner.team, explicit_id, source=owner)
             if explicit is not None:
                 return
             owner.deployable_control.drone_attack_target_id = None
@@ -785,7 +853,7 @@ class DeployableSystem:
         if str(getattr(owner.deployable_control, "pending_drone_attack_target_id", "") or "").strip():
             return
         focus_key = self._focus_key(owner.team, owner.squad_id)
-        target_id = self._first_valid_queue_target(world, owner.team, world.squad_focus_queues.get(focus_key, []))
+        target_id = self._first_valid_queue_target(world, owner.team, world.squad_focus_queues.get(focus_key, []), source=owner)
         if not target_id:
             return
         target = world.combat_entity(target_id)
@@ -796,12 +864,12 @@ class DeployableSystem:
     def _latest_fighter_command_candidate(self, world: WorldState, fighter: FighterEntity, owner) -> tuple[str | None, float, str]:
         candidates: list[tuple[str, float, str]] = []
         control = owner.deployable_control
-        explicit = self._candidate_target(world, owner.team, control.fighter_attack_target_id)
+        explicit = self._candidate_target(world, owner.team, control.fighter_attack_target_id, source=owner)
         if explicit is not None:
             candidates.append((explicit.ship_id, float(control.fighter_attack_command_at or 0.0), "command"))
 
         fighter_focus_key = self._focus_key(fighter.team, fighter.squad_id)
-        fighter_focus = self._first_valid_queue_target(world, fighter.team, world.squad_focus_queues.get(fighter_focus_key, []))
+        fighter_focus = self._first_valid_queue_target(world, fighter.team, world.squad_focus_queues.get(fighter_focus_key, []), source=fighter)
         if fighter_focus:
             candidates.append((fighter_focus, float(world.squad_focus_updated_at.get(fighter_focus_key, world.now) or world.now), "command"))
 
@@ -809,7 +877,7 @@ class DeployableSystem:
             return max(candidates, key=lambda item: item[1])
 
         mother_focus_key = self._focus_key(owner.team, getattr(fighter, "owner_squad_id", "") or owner.squad_id)
-        mother_focus = self._first_valid_queue_target(world, owner.team, world.squad_focus_queues.get(mother_focus_key, []))
+        mother_focus = self._first_valid_queue_target(world, owner.team, world.squad_focus_queues.get(mother_focus_key, []), source=owner)
         if mother_focus:
             return mother_focus, float(world.squad_focus_updated_at.get(mother_focus_key, world.now) or world.now), "mother_focus"
         return None, 0.0, ""
@@ -822,6 +890,8 @@ class DeployableSystem:
             return
         target = world.combat_entity(target_id)
         if target is None:
+            return
+        if not self._same_system(fighter, target):
             return
         if source == "mother_focus":
             if self._owner_lock_ready_for_command(world, owner, target):
@@ -836,6 +906,7 @@ class DeployableSystem:
             target is not None
             and target.vital.alive
             and target.team != asset.team
+            and self._same_system(asset, target)
             and self.combat._can_target_under_ecm(asset, target.ship_id, float(world.now))
         ):
             return target
@@ -845,6 +916,8 @@ class DeployableSystem:
     def _fighter_target_lock_ready(self, world: WorldState, fighter: FighterEntity, target) -> bool:
         target_id = str(getattr(target, "ship_id", "") or "").strip()
         if not target_id:
+            return False
+        if not self._same_system(fighter, target):
             return False
         return bool(
             self.combat._ensure_target_lock(
@@ -859,7 +932,7 @@ class DeployableSystem:
 
     @staticmethod
     def _same_system(a, b) -> bool:
-        return str(getattr(a.nav, "system_id", "") or "") == str(getattr(b.nav, "system_id", "") or "")
+        return DeployableSystem._entity_system_id(a) == DeployableSystem._entity_system_id(b)
 
     def _asset_attack_orbit_range(self, asset) -> float:
         if isinstance(asset, DroneEntity):
@@ -929,6 +1002,10 @@ class DeployableSystem:
             self.movement._clear_navigation_command(asset)
             asset.nav.velocity = Vector2(0.0, 0.0)
             return
+        if not self._same_system(asset, owner):
+            self.movement._clear_navigation_command(asset)
+            asset.nav.velocity = Vector2(0.0, 0.0)
+            return
         distance = asset.nav.position.distance_to(owner.nav.position)
         if isinstance(asset, FighterEntity) and distance >= self.movement.MIN_WARP_DISTANCE_M:
             if str(asset.nav.warp.phase or "idle") == "idle" and not self.movement._ship_is_scrammed(asset):
@@ -945,8 +1022,6 @@ class DeployableSystem:
                 asset.nav.warp.bubble_immune_snapshot = False
                 asset.nav.warp.interdiction_snapshots_captured = False
                 asset.nav.warp.interdiction_snapshots = tuple()
-        if not self._same_system(asset, owner):
-            return
         asset.nav.command_mode = "approach"
         asset.nav.command_target_ship_id = owner.ship_id
         asset.nav.command_target_structure_id = None
@@ -983,14 +1058,9 @@ class DeployableSystem:
             self.movement._clear_navigation_command(asset)
             return False
         if not self._same_system(asset, owner):
-            if isinstance(asset, FighterEntity) and str(asset.nav.warp.phase or "idle") == "idle":
-                asset.nav.warp.phase = "align"
-                asset.nav.warp.target_ship_id = owner.ship_id
-                asset.nav.warp.target_position = Vector2(owner.nav.position.x, owner.nav.position.y)
-            else:
-                asset.state = "idle"
-                self.movement._clear_navigation_command(asset)
-                return False
+            asset.state = "idle"
+            self.movement._clear_navigation_command(asset)
+            return False
         if self._asset_recovery_ready(asset, owner):
             return True
         if isinstance(asset, DroneEntity) and asset.definition.is_sentry:
@@ -1085,6 +1155,8 @@ class DeployableSystem:
     def _apply_ewar(self, world: WorldState, source, target, ewar: DeployableEwarProfile, source_id: str) -> None:
         if not ewar.has_effect:
             return
+        if not self._same_system(source, target):
+            return
         distance = source.nav.position.distance_to(target.nav.position)
         if ewar.optimal_range_m > 0.0 or ewar.falloff_m > 0.0:
             if distance > ewar.optimal_range_m + max(0.0, ewar.falloff_m) * 3.0:
@@ -1161,6 +1233,9 @@ class DeployableSystem:
         )
 
     def _drone_attack(self, world: WorldState, drone: DroneEntity, target, dt: float) -> None:
+        if not self._same_system(drone, target):
+            drone.target_id = None
+            return
         if drone.definition.damage.total <= 0.0 and not drone.definition.ewar.has_effect:
             return
         drone.cycle_timer = max(0.0, float(drone.cycle_timer or 0.0) - max(0.0, dt))
@@ -1243,6 +1318,9 @@ class DeployableSystem:
         fighter.nav.max_speed = fighter.profile.max_speed
 
     def _fighter_attack(self, world: WorldState, fighter: FighterEntity, target) -> None:
+        if not self._same_system(fighter, target):
+            fighter.target_id = None
+            return
         for ability in fighter.definition.abilities:
             if ability.kind == "mwd":
                 continue

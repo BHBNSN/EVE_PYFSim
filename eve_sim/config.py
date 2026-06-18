@@ -10,6 +10,10 @@ class EngineConfig:
     tick_rate: int = 1
     physics_substeps: int = 1
     lockstep: bool = True
+    isolate_systems: bool = True
+    parallel_systems: bool = False
+    parallel_system_workers: int = 0
+    parallel_system_target_pressure: float = 96.0
     tidi_min_factor: float = 0.1
     detailed_logging: bool = False
     hotspot_logging: bool = False

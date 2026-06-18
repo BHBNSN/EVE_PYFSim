@@ -237,12 +237,16 @@ class BubblesMixin:
         radius_m: float,
         damage: DamageTuple | None = None,
         damage_factor: float = 1.0,
+        system_id: str = "",
     ) -> None:
         radius = max(0.0, float(radius_m or 0.0))
         if radius <= 0.0:
             return
+        source_system_id = str(system_id or "")
         hit_radius = radius + 25.0
         for field_id, field in list(world.bubble_fields.items()):
+            if source_system_id and str(getattr(field, "system_id", "") or "") != source_system_id:
+                continue
             if not field.destructible:
                 continue
             if not field.alive:
