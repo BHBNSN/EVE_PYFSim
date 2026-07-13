@@ -1810,99 +1810,60 @@ class ModuleCyclesMixin:
         return changed
 
     def _update_squad_prelocks(self, world: WorldState, dt: float, effective_profiles: dict[str, ShipProfile]) -> None:
-        squads: dict[str, list] = {}
         for ship in world.ships.values():
             if not ship.vital.alive or self._ship_hidden_from_targeting(ship):
+                ship.combat.prelocked_targets.clear()
+                ship.combat.prelock_timers.clear()
                 continue
-            squads.setdefault(self._focus_key(ship.team, ship.squad_id), []).append(ship)
-
-        for focus_key, queue in list(world.squad_focus_queues.items()):
-            members = squads.get(focus_key, [])
-            if not members:
-                world.squad_prelocked_targets.pop(focus_key, None)
-                world.squad_prelock_timers.pop(focus_key, None)
-                continue
-
-            members.sort(key=lambda s: s.ship_id)
-            own_team = members[0].team
-
+            focus_key = self._focus_key(ship.team, ship.squad_id)
+            queue = world.squad_focus_queues.get(focus_key, [])
             seen: set[str] = set()
             cleaned: list[str] = []
             for target_id in queue:
                 if target_id in seen:
                     continue
                 target = world.combat_entity(target_id)
-                if target is None or (not target.vital.alive) or self._ship_hidden_from_targeting(target) or target.team == own_team:
+                if (
+                    target is None
+                    or not target.vital.alive
+                    or self._ship_hidden_from_targeting(target)
+                    or target.team == ship.team
+                    or self._ship_system_id(target) != self._ship_system_id(ship)
+                ):
                     continue
                 seen.add(target_id)
                 cleaned.append(target_id)
-            world.squad_focus_queues[focus_key] = cleaned
 
             pre_targets = cleaned[1:] if len(cleaned) > 1 else []
             valid_pre = set(pre_targets)
+            ship_prelocked = ship.combat.prelocked_targets
+            ship_timers = ship.combat.prelock_timers
+            ship_prelocked.intersection_update(valid_pre)
+            for target_id in list(ship_timers):
+                if target_id not in valid_pre:
+                    ship_timers.pop(target_id, None)
 
-            prelocked_by_ship = world.squad_prelocked_targets.setdefault(focus_key, {})
-            timers_by_ship = world.squad_prelock_timers.setdefault(focus_key, {})
-            member_ids = {ship.ship_id for ship in members}
-            for ship_id in list(prelocked_by_ship.keys()):
-                if ship_id not in member_ids:
-                    prelocked_by_ship.pop(ship_id, None)
-            for ship_id in list(timers_by_ship.keys()):
-                if ship_id not in member_ids:
-                    timers_by_ship.pop(ship_id, None)
+            if not pre_targets:
+                continue
 
-            for ship in members:
-                ship_prelocked = prelocked_by_ship.setdefault(ship.ship_id, set())
-                ship_timers = timers_by_ship.setdefault(ship.ship_id, {})
-                for target_id in list(ship_prelocked):
-                    if target_id not in valid_pre:
-                        ship_prelocked.discard(target_id)
-                for target_id in list(ship_timers.keys()):
-                    if target_id not in valid_pre:
-                        ship_timers.pop(target_id, None)
-
-                if not pre_targets:
-                    if not ship_prelocked:
-                        prelocked_by_ship.pop(ship.ship_id, None)
-                    if not ship_timers:
-                        timers_by_ship.pop(ship.ship_id, None)
+            attacker_profile = effective_profiles.get(ship.ship_id) or ship.profile
+            for target_id in pre_targets:
+                if target_id in ship_prelocked:
                     continue
-
-                attacker_profile = effective_profiles.get(ship.ship_id) or ship.profile
-                for target_id in pre_targets:
-                    if target_id in ship_prelocked:
-                        continue
-                    target = world.combat_entity(target_id)
-                    if target is None or not target.vital.alive:
-                        continue
-                    if not self._target_within_lock_range(ship, target, source_profile=attacker_profile):
-                        ship_timers.pop(target_id, None)
-                        continue
-                    target_profile = effective_profiles.get(target_id) or target.profile
-                    left = ship_timers.get(target_id)
-                    if left is None:
-                        ship_timers[target_id] = self._cached_lock_time(attacker_profile, target_profile)
-                        continue
-                    left -= dt
-                    if left <= 0:
-                        ship_prelocked.add(target_id)
-                        ship_timers.pop(target_id, None)
-                    else:
-                        ship_timers[target_id] = left
-
-                if not ship_prelocked:
-                    prelocked_by_ship.pop(ship.ship_id, None)
-                if not ship_timers:
-                    timers_by_ship.pop(ship.ship_id, None)
-
-            if not prelocked_by_ship:
-                world.squad_prelocked_targets.pop(focus_key, None)
-            if not timers_by_ship:
-                world.squad_prelock_timers.pop(focus_key, None)
-
-        for focus_key in list(world.squad_prelocked_targets.keys()):
-            if focus_key not in world.squad_focus_queues:
-                world.squad_prelocked_targets.pop(focus_key, None)
-        for focus_key in list(world.squad_prelock_timers.keys()):
-            if focus_key not in world.squad_focus_queues:
-                world.squad_prelock_timers.pop(focus_key, None)
+                target = world.combat_entity(target_id)
+                if target is None or not target.vital.alive:
+                    continue
+                if not self._target_within_lock_range(ship, target, source_profile=attacker_profile):
+                    ship_timers.pop(target_id, None)
+                    continue
+                target_profile = effective_profiles.get(target_id) or target.profile
+                left = ship_timers.get(target_id)
+                if left is None:
+                    ship_timers[target_id] = self._cached_lock_time(attacker_profile, target_profile)
+                    continue
+                left -= dt
+                if left <= 0:
+                    ship_prelocked.add(target_id)
+                    ship_timers.pop(target_id, None)
+                else:
+                    ship_timers[target_id] = left

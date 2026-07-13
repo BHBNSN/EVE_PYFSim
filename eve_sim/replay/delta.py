@@ -8,7 +8,15 @@ from .schema import ReplayFrame, ReplaySnapshot
 
 
 COLLECTION_FIELDS = ("ships", "drones", "fighters", "projectiles", "projectile_blasts", "bubble_fields")
-REPLACE_FIELDS = ("intents", "squad_focus_queues", "squad_focus_updated_at")
+REPLACE_FIELDS = (
+    "intents",
+    "squad_leaders",
+    "squad_leader_location_versions",
+    "squad_propulsion_commands",
+    "squad_leader_speed_limits",
+    "squad_focus_queues",
+    "squad_focus_updated_at",
+)
 TIMELINE_FIELDS = {"tick", "now", "at"}
 FLOAT_EPSILON = 1e-3
 

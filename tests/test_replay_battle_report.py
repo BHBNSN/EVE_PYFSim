@@ -138,7 +138,7 @@ def test_replay_recorder_round_trips_events(tmp_path) -> None:
     assert '"schema_version"' not in raw_saved
     assert '"source_id"' not in raw_saved
     assert '"ship_name"' not in raw_saved
-    assert '"v":4' in raw_saved
+    assert '"v":5' in raw_saved
     assert '"si":"blue-1"' in raw_saved
     assert '"sn":"Rifter"' in raw_saved
     assert loaded.to_dict()["frames"][0]["kind"] == "keyframe"

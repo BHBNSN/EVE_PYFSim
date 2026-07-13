@@ -478,7 +478,7 @@ class MainWindowLocalControlTests(unittest.TestCase):
             window.canvas.selected_squad = "BLUE-ALPHA"
             focus_key = f"{Team.BLUE.value}:BLUE-ALPHA"
             window.engine.world.squad_focus_queues[focus_key] = [red_ship.ship_id]
-            window.engine.world.squad_prelocked_targets[focus_key] = {"blue-1": {red_ship.ship_id}}
+            blue_ship.combat.prelocked_targets.add(red_ship.ship_id)
 
             friendly_menu = window._build_ship_context_menu(blue_ship.ship_id)
             enemy_menu = window._build_ship_context_menu(red_ship.ship_id)

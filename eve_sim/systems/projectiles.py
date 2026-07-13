@@ -108,8 +108,9 @@ class ProjectilesMixin:
         radius = max(0.0, float(radius_m or 0.0))
         if radius <= 0.0:
             return
+        namespace = normalize_system_namespace(system_id or self._system_id or "legacy")
         self._projectile_blast_seq += 1
-        blast_id = f"blast:{self._projectile_blast_seq}"
+        blast_id = f"blast:{namespace}:{self._projectile_blast_seq}"
         world.projectile_blasts[blast_id] = ProjectileBlast(
             blast_id=blast_id,
             kind=str(kind),
@@ -366,8 +367,9 @@ class ProjectilesMixin:
             age=0.0,
         )
         kind = "bomb" if metadata.is_bomb_launcher else "missile"
+        namespace = normalize_system_namespace(source_system_id or self._system_id or "legacy")
         self._projectile_seq += 1
-        projectile_id = f"proj:{self._projectile_seq}"
+        projectile_id = f"proj:{namespace}:{self._projectile_seq}"
         shield_max = max(0.0, float(effect.projected_add.get("weapon_projectile_shield_hp", 0.0) or 0.0))
         armor_max = max(0.0, float(effect.projected_add.get("weapon_projectile_armor_hp", 0.0) or 0.0))
         structure_max = max(0.0, float(effect.projected_add.get("weapon_projectile_structure_hp", 0.0) or 0.0))

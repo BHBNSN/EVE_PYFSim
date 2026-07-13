@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from ..agents import refresh_global_squad_leaders
 from ..math2d import Vector2
 from ..models import (
     BubbleField,
@@ -132,11 +133,16 @@ def _ship_from_snapshot(ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
     nav.cloak.active = _bool(data.get("gate_cloak_active"))
     nav.cloak.expires_at = _float(data.get("gate_cloak_expires_at"))
     nav.cloak.source = str(data.get("gate_cloak_source") or "")
-    nav.follow_hold_active = _bool(data.get("follow_hold_active"))
-    nav.follow_hold_leader_id = str(data.get("follow_hold_leader_id") or "") or None
+    nav.squad_follow_state = str(data.get("squad_follow_state") or "FORMATION_FOLLOW")
+    nav.squad_follow_leader_id = str(data.get("squad_follow_leader_id") or "") or None
+    nav.squad_follow_leader_location_version = int(data.get("squad_follow_leader_location_version") or 0)
+    nav.squad_follow_warp_ready = _bool(data.get("squad_follow_warp_ready"), True)
 
     combat = CombatState(current_target=str(data.get("target") or "") or None)
     combat.projected_targets = _str_dict(data.get("projected_targets"))
+    raw_prelocked = data.get("prelocked_targets")
+    combat.prelocked_targets = {str(value) for value in raw_prelocked} if isinstance(raw_prelocked, list) else set()
+    combat.prelock_timers = _float_dict(data.get("prelock_timers"))
     combat.module_cycle_timers = _float_dict(data.get("module_cycle_timers"))
     combat.ecm_jam_sources = _float_dict(data.get("ecm_jam_sources"))
     combat.ecm_last_attempt_target = str(data.get("ecm_last_attempt_target") or "") or None
@@ -157,6 +163,7 @@ def _ship_from_snapshot(ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
         team=_team(data.get("team")),
         squad_id=str(data.get("squad_id") or ""),
         ship_group_id=str(data.get("ship_group_id") or ""),
+        command_priority=int(data.get("command_priority") or 0),
         fit=fit,
         profile=profile,
         nav=nav,
@@ -454,4 +461,14 @@ def apply_snapshot_to_world(world: WorldState, snapshot: Mapping[str, Any]) -> W
         str(key): _float(value)
         for key, value in (raw_focus_updated.items() if isinstance(raw_focus_updated, Mapping) else ())
     }
+    raw_leaders = snapshot.get("squad_leaders")
+    world.squad_leaders = _str_dict(raw_leaders)
+    raw_versions = snapshot.get("squad_leader_location_versions")
+    world.squad_leader_location_versions = {
+        str(key): int(value)
+        for key, value in (raw_versions.items() if isinstance(raw_versions, Mapping) else ())
+    }
+    world.squad_propulsion_commands = _bool_dict(snapshot.get("squad_propulsion_commands"))
+    world.squad_leader_speed_limits = _float_dict(snapshot.get("squad_leader_speed_limits"))
+    refresh_global_squad_leaders(world)
     return world

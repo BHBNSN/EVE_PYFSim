@@ -333,8 +333,10 @@ class NavigationState:
     warp: WarpState = field(default_factory=WarpState)
     gate: GateTransitState = field(default_factory=GateTransitState)
     cloak: CloakState = field(default_factory=CloakState)
-    follow_hold_active: bool = False
-    follow_hold_leader_id: str | None = None
+    squad_follow_state: str = "FORMATION_FOLLOW"
+    squad_follow_leader_id: str | None = None
+    squad_follow_leader_location_version: int = 0
+    squad_follow_warp_ready: bool = True
 
 
 @dataclass(slots=True)
@@ -345,6 +347,8 @@ class CombatState:
     lock_started_at: dict[str, float] = field(default_factory=dict)
     lock_timers: dict[str, float] = field(default_factory=dict)
     lock_deadlines: dict[str, float] = field(default_factory=dict)
+    prelocked_targets: set[str] = field(default_factory=set)
+    prelock_timers: dict[str, float] = field(default_factory=dict)
     module_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
     module_ammo_reload_deadlines: dict[str, float] = field(default_factory=dict)
     module_pending_ammo_reload_timers: dict[str, float] = field(default_factory=dict)
@@ -519,6 +523,14 @@ class ShipEntity:
     fighter_bay: list[FighterBayEntry] = field(default_factory=list)
     deployable_control: DeployableControlState = field(default_factory=DeployableControlState)
     ship_group_id: str = ""
+    command_priority: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SquadLeaderLocation:
+    leader_id: str
+    system_id: str
+    location_version: int
 
 
 @dataclass(slots=True)

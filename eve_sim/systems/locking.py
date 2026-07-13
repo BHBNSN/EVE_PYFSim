@@ -22,7 +22,12 @@ class LockingMixin:
 
     @classmethod
     def _ship_combat_suppressed(cls, ship, now: float | None = None) -> bool:
-        return cls._ship_in_warp(ship) or cls._ship_is_gate_cloaked(ship, now)
+        follow_state = str(getattr(getattr(ship, "nav", None), "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW")
+        return (
+            follow_state in {"FOLLOW_LEADER_SYSTEM", "WARP_TO_LEADER"}
+            or cls._ship_in_warp(ship)
+            or cls._ship_is_gate_cloaked(ship, now)
+        )
 
     @classmethod
     def _ship_hidden_from_targeting(cls, ship, now: float | None = None) -> bool:

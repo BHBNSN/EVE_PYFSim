@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
+from ..system_identity import normalize_system_namespace
 from .authoritative_tick import AuthoritativeTickMixin
 from .bubbles import BubblesMixin
 from .command_bursts import CommandBurstsMixin
@@ -12,6 +15,10 @@ from .logistics import CombatLogisticsMixin
 from .module_cycles import ModuleCyclesMixin
 from .projectiles import ProjectilesMixin
 from .runtime_projection import RuntimeProjectionMixin
+
+
+class CombatStateCloneError(RuntimeError):
+    pass
 
 class CombatSystem(
     AuthoritativeTickMixin,
@@ -64,6 +71,8 @@ class CombatSystem(
         self._event_rng_counter: int = 0
         self._current_event_tick: int = 0
         self._current_event_at: float = 0.0
+        self._system_id: str = ""
+        self._system_namespace: str = ""
 
     def attach_logger(
         self,
@@ -90,3 +99,42 @@ class CombatSystem(
     def set_event_rng_context(self, rng_seed: int, rng_counter: int = 0) -> None:
         self._event_rng_seed = int(rng_seed)
         self._event_rng_counter = int(rng_counter)
+
+    def clone_for_system(self, system_id: str) -> "CombatSystem":
+        """Clone authoritative combat state without copying external resources."""
+        namespace = normalize_system_namespace(system_id)
+        excluded = {"logger", "_combat_event_sink", "_module_static_metadata_by_object_id"}
+        try:
+            cloned = object.__new__(type(self))
+            for name, value in self.__dict__.items():
+                if name in excluded:
+                    continue
+                setattr(cloned, name, deepcopy(value))
+            cloned.logger = None
+            cloned._combat_event_sink = None
+            cloned._module_static_metadata_by_object_id = {}
+            cloned._system_id = str(system_id).strip()
+            cloned._system_namespace = namespace
+            return cloned
+        except Exception as exc:
+            raise CombatStateCloneError(
+                f"failed to clone CombatSystem for system {system_id!r}: {exc}"
+            ) from exc
+
+    def adopt_authoritative_state(self, completed: "CombatSystem") -> None:
+        """Commit a completed shard while preserving this authority object's identity."""
+        if not isinstance(completed, CombatSystem) or completed._system_id != self._system_id:
+            raise CombatStateCloneError("cannot adopt combat state from a different system")
+        preserved = {
+            "logger": self.logger,
+            "_combat_event_sink": self._combat_event_sink,
+            "detailed_logging": self.detailed_logging,
+            "hotspot_logging_enabled": self.hotspot_logging_enabled,
+            "event_logging_enabled": self.event_logging_enabled,
+        }
+        for name, value in completed.__dict__.items():
+            if name in preserved:
+                continue
+            setattr(self, name, value)
+        for name, value in preserved.items():
+            setattr(self, name, value)

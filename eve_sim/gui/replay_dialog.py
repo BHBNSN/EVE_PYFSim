@@ -196,4 +196,6 @@ class ReplayPlaybackDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
+        if hasattr(self.engine, "close"):
+            self.engine.close()
         super().closeEvent(event)

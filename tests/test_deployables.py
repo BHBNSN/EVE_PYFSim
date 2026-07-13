@@ -500,7 +500,11 @@ def test_recall_recovers_deployables_at_edge_range_with_physics_substeps() -> No
     )
     world.ships[owner.ship_id] = owner
     combat = CombatSystem(PyfaBridge())
-    engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4), combat)
+    engine = SimulationEngine(
+        world,
+        EngineConfig(tick_rate=1, physics_substeps=4, isolate_systems=False),
+        combat,
+    )
 
     engine.deployables.launch_squad_drones(world, Team.BLUE, "A", "Test Drone")
     engine.deployables.launch_squad_fighters(world, Team.BLUE, "A", "Test Fighter")

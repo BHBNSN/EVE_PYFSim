@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 import sys
 import textwrap
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+import eve_sim.simulation_engine as simulation_engine_module
 
 from eve_sim.config import EngineConfig
+from eve_sim.agents import (
+    FOLLOW_LEADER_SYSTEM,
+    FORMATION_FOLLOW,
+    WARP_TO_LEADER,
+    ShipAgent,
+    refresh_global_squad_leaders,
+)
 from eve_sim.math2d import Vector2
 from eve_sim.models import (
     BubbleField,
@@ -17,7 +30,6 @@ from eve_sim.models import (
     FighterAbilityProfile,
     FighterBayEntry,
     FighterEntity,
-    FleetIntent,
     ProjectileBlast,
     NavigationState,
     ProjectileEntity,
@@ -30,9 +42,24 @@ from eve_sim.models import (
 )
 from eve_sim.pyfa_bridge import PyfaBridge
 from eve_sim.simulation_engine import SimulationEngine
-from eve_sim.system_isolation import SystemShardResult, SystemTransferOut, active_system_pressures, merge_system_results, plan_system_execution
-from eve_sim.systems import CombatSystem, DeployableSystem, MovementSystem
+from eve_sim.system_isolation import (
+    DuplicateEntityIdError,
+    SystemExecutionMode,
+    SystemShardResult,
+    SystemTransferOut,
+    active_system_pressures,
+    build_system_shard,
+    merge_system_results,
+    plan_system_execution,
+    stable_system_seed,
+)
+from eve_sim.systems import CombatStateCloneError, CombatSystem, DeployableSystem, MovementSystem
 from eve_sim.world import WorldState
+
+
+class _RandomConsumingAgent(ShipAgent):
+    def think(self, world: WorldState) -> None:
+        world.ships[self.ship_id].nav.position.x += random.random()
 
 
 def _ship(
@@ -380,7 +407,7 @@ def test_isolated_step_ticks_projectile_only_system() -> None:
     assert any(blast.system_id == "gamma" for blast in world.projectile_blasts.values())
 
 
-def test_unassigned_active_entity_uses_global_fallback_instead_of_being_dropped_from_isolated_plan() -> None:
+def test_unassigned_active_entity_is_rejected_without_switching_to_global_execution() -> None:
     alpha = _ship("alpha", "alpha")
     beta = _ship("beta", "beta")
     bomb = _projectile("blank_bomb", "", kind="bomb")
@@ -397,9 +424,31 @@ def test_unassigned_active_entity_uses_global_fallback_instead_of_being_dropped_
     engine.register_ship(alpha.ship_id)
     engine.register_ship(beta.ship_id)
 
-    engine.step()
+    with pytest.raises(ValueError, match="system_id"):
+        engine.step()
 
-    assert "blank_bomb" not in world.projectiles
+    assert "blank_bomb" in world.projectiles
+    assert world.tick == 0
+    assert world.now == 0.0
+    assert engine.system_execution_mode is SystemExecutionMode.SHARD_SERIAL
+
+
+def test_legacy_world_requires_explicit_global_mode() -> None:
+    world = WorldState(ships={"legacy": _ship("legacy", "")})
+    strict_engine = SimulationEngine(world, EngineConfig(), CombatSystem(PyfaBridge()))
+
+    with pytest.raises(ValueError, match="system_id"):
+        strict_engine.step()
+
+    legacy_world = WorldState(ships={"legacy": _ship("legacy", "")})
+    legacy_engine = SimulationEngine(
+        legacy_world,
+        EngineConfig(isolate_systems=False),
+        CombatSystem(PyfaBridge()),
+    )
+    legacy_engine.step()
+    assert legacy_engine.system_execution_mode is SystemExecutionMode.GLOBAL_LEGACY
+    assert legacy_world.tick == 1
 
 
 def test_bomb_explosion_ignores_targets_in_other_systems() -> None:
@@ -568,21 +617,513 @@ def test_stargate_jump_emits_transfer_out_and_transfer_in() -> None:
     assert transfer.destination_system_id == "beta"
 
 
-def test_intent_merge_only_clears_consumed_intents() -> None:
-    consumed = FleetIntent(squad_id="A", target_position=Vector2(1.0, 0.0))
-    persistent = FleetIntent(squad_id="B", target_position=Vector2(2.0, 0.0))
-    world = WorldState(intents={"BLUE:A": consumed, "BLUE:B": persistent})
-    result = SystemShardResult(
-        system_id="alpha",
-        world=WorldState(),
-        combat=CombatSystem(PyfaBridge()),
-        consumed_intent_keys={"BLUE:A"},
+def test_single_active_system_stays_on_shard_path_and_preserves_combat_state() -> None:
+    alpha = _ship("alpha", "alpha")
+    beta = _ship("beta", "beta")
+    world = WorldState(ships={"alpha": alpha, "beta": beta})
+    engine = SimulationEngine(world, EngineConfig(parallel_systems=False), CombatSystem(PyfaBridge()))
+    engine.register_ship("alpha")
+    engine.register_ship("beta")
+
+    engine.step()
+    alpha_combat = engine._system_combats["alpha"]
+    alpha_combat._projectile_seq = 17
+    beta.vital.alive = False
+    world.ships["beta"].vital.alive = False
+    engine.step()
+
+    assert engine.system_execution_mode is SystemExecutionMode.SHARD_SERIAL
+    assert tuple(item.system_id for item in engine.last_system_execution_plan.active_systems) == ("alpha",)
+    assert engine._system_combats["alpha"]._projectile_seq == 17
+
+
+def test_empty_world_advances_without_switching_execution_mode() -> None:
+    engine = SimulationEngine(WorldState(), EngineConfig(), CombatSystem(PyfaBridge()))
+
+    engine.step()
+
+    assert engine.world.tick == 1
+    assert engine.world.now == pytest.approx(1.0)
+    assert engine.system_execution_mode is SystemExecutionMode.SHARD_SERIAL
+    assert engine._system_combats == {}
+
+
+def test_process_configuration_reports_single_group_effective_serial_mode() -> None:
+    world = WorldState(ships={"alpha": _ship("alpha", "alpha")})
+    engine = SimulationEngine(
+        world,
+        EngineConfig(parallel_systems=True, parallel_system_workers=2),
+        CombatSystem(PyfaBridge()),
     )
 
-    merge_system_results(world, [result], {})
+    engine.step()
 
-    assert "BLUE:A" not in world.intents
-    assert world.intents["BLUE:B"] == persistent
+    assert engine.system_execution_mode is SystemExecutionMode.SHARD_PROCESS
+    assert engine.last_effective_system_execution_mode == "shard_serial_single_group"
+    engine.close()
+
+
+def test_combat_clone_preserves_authority_state_and_is_independent() -> None:
+    combat = CombatSystem(PyfaBridge())
+    combat._projectile_seq = 9
+    combat._projectile_blast_seq = 8
+    combat._bubble_seq = 7
+    combat._event_rng_counter = 6
+    combat._merged_event_buckets[("probe",)] = {"count": 1}
+
+    cloned = combat.clone_for_system("alpha")
+    cloned._projectile_seq += 1
+    cloned._merged_event_buckets[("probe",)]["count"] = 2
+
+    assert cloned._projectile_blast_seq == 8
+    assert cloned._bubble_seq == 7
+    assert cloned._event_rng_counter == 6
+    assert combat._projectile_seq == 9
+    assert combat._merged_event_buckets[("probe",)]["count"] == 1
+    assert cloned.logger is None
+    assert cloned._combat_event_sink is None
+
+
+def test_shard_worker_does_not_commit_temporary_logging_configuration(tmp_path) -> None:
+    world = WorldState(ships={"alpha": _ship("alpha", "alpha")})
+    engine = SimulationEngine(
+        world,
+        EngineConfig(
+            detailed_logging=True,
+            hotspot_logging=True,
+            detail_log_file=str(tmp_path / "detail.log"),
+            hotspot_log_file=str(tmp_path / "hotspot.log"),
+        ),
+        CombatSystem(PyfaBridge()),
+    )
+
+    engine.step()
+    combat = engine._system_combats["alpha"]
+
+    assert combat.detailed_logging is True
+    assert combat.hotspot_logging_enabled is True
+    assert combat.event_logging_enabled is True
+
+
+def test_system_seed_is_stable_and_namespaced() -> None:
+    assert stable_system_seed(42, "alpha") == stable_system_seed(42, "alpha")
+    assert stable_system_seed(42, "alpha") != stable_system_seed(42, "beta")
+    assert stable_system_seed(42, "alpha") != stable_system_seed(43, "alpha")
+
+
+def test_two_system_blast_ids_do_not_collide() -> None:
+    alpha_bomb = _projectile("alpha-bomb", "alpha", kind="bomb")
+    beta_bomb = _projectile("beta-bomb", "beta", kind="bomb")
+    alpha_bomb.flight_time = 0.01
+    beta_bomb.flight_time = 0.01
+    world = WorldState(projectiles={alpha_bomb.projectile_id: alpha_bomb, beta_bomb.projectile_id: beta_bomb})
+    engine = SimulationEngine(world, EngineConfig(parallel_systems=False), CombatSystem(PyfaBridge()))
+
+    engine.step()
+
+    assert set(world.projectile_blasts) == {"blast:alpha:1", "blast:beta:1"}
+
+
+def test_two_system_projectile_and_static_bubble_ids_do_not_collide() -> None:
+    world = WorldState()
+    projectile_effect = SimpleNamespace(
+        range_m=1_000.0,
+        projected_add={"weapon_projectile_speed": 1_000.0, "weapon_projectile_flight_time": 1.0},
+    )
+    bubble_effect = SimpleNamespace(
+        local_add={"bubble_radius_m": 1_000.0, "bubble_duration_sec": 5.0}
+    )
+    module = SimpleNamespace(module_id="module")
+    metadata = SimpleNamespace(is_bomb_launcher=False)
+
+    for system_id in ("alpha", "beta"):
+        source = _ship(f"{system_id}-source", system_id)
+        combat = CombatSystem(PyfaBridge()).clone_for_system(system_id)
+        combat._spawn_projectile(
+            world,
+            source=source,
+            module=module,
+            metadata=metadata,
+            effect=projectile_effect,
+            target_id=None,
+        )
+        combat._spawn_static_bubble_field(
+            world,
+            source=source,
+            module=module,
+            effect=bubble_effect,
+        )
+
+    assert set(world.projectiles) == {"proj:alpha:1", "proj:beta:1"}
+    assert set(world.bubble_fields) == {"bubble:alpha:1", "bubble:beta:1"}
+
+
+def test_duplicate_entity_id_aborts_atomic_merge() -> None:
+    original = _ship("duplicate", "alpha")
+    world = WorldState(ships={"duplicate": original})
+    before = deepcopy(world)
+    result = SystemShardResult(
+        system_id="beta",
+        world=WorldState(ships={"duplicate": _ship("duplicate", "beta")}),
+        combat=CombatSystem(PyfaBridge()),
+        owned_entity_ids={"ships": set()},
+    )
+
+    with pytest.raises(DuplicateEntityIdError):
+        merge_system_results(world, [result], {})
+
+    assert world == before
+    assert world.ships["duplicate"] is original
+
+
+def test_same_squad_shards_read_one_global_leader() -> None:
+    alpha = _ship("alpha-leader", "alpha", squad_id="A")
+    beta = _ship("beta-member", "beta", squad_id="A")
+    target = _ship("alpha-target", "alpha", team=Team.RED, squad_id="B")
+    world = WorldState(
+        ships={alpha.ship_id: alpha, beta.ship_id: beta, target.ship_id: target},
+        squad_leaders={"BLUE:A": alpha.ship_id},
+        squad_focus_queues={"BLUE:A": [target.ship_id]},
+    )
+    refresh_global_squad_leaders(world)
+
+    alpha_task = build_system_shard(world, "alpha", {})
+    beta_task = build_system_shard(world, "beta", {})
+
+    assert alpha_task.world.squad_leaders["BLUE:A"] == alpha.ship_id
+    assert beta_task.world.squad_leaders["BLUE:A"] == alpha.ship_id
+    assert alpha_task.world.squad_leader_locations["BLUE:A"].system_id == "alpha"
+    assert beta_task.world.squad_leader_locations["BLUE:A"].system_id == "alpha"
+    assert alpha_task.world.squad_focus_queues["BLUE:A"] == [target.ship_id]
+    assert beta_task.world.squad_focus_queues["BLUE:A"] == []
+
+
+def test_parallel_failure_circuit_breaks_and_falls_back_once(monkeypatch) -> None:
+    world = WorldState(ships={"alpha": _ship("alpha", "alpha"), "beta": _ship("beta", "beta")})
+    engine = SimulationEngine(
+        world,
+        EngineConfig(parallel_systems=True, parallel_system_workers=2, parallel_system_target_pressure=1.0),
+        CombatSystem(PyfaBridge()),
+    )
+    attempts = {"count": 0}
+
+    def fail_parallel(*_args, **_kwargs):
+        attempts["count"] += 1
+        raise TimeoutError("worker timed out")
+
+    monkeypatch.setattr(engine, "_run_parallel_groups", fail_parallel)
+    engine.step()
+    engine.step()
+
+    assert attempts["count"] == 1
+    assert world.tick == 2
+    assert engine.system_execution_mode is SystemExecutionMode.SHARD_SERIAL_DEGRADED
+    assert engine.parallel_failure_count == 1
+    assert engine.parallel_disabled_at_tick == 1
+    assert "timed out" in str(engine.parallel_disabled_reason)
+
+
+def test_shard_rng_is_continuous_and_does_not_mutate_process_rng() -> None:
+    world = WorldState(ships={"alpha": _ship("alpha", "alpha")})
+    engine = SimulationEngine(world, EngineConfig(simulation_seed=1234), CombatSystem(PyfaBridge()))
+    engine.ship_agents["alpha"] = _RandomConsumingAgent(agent_id="random:alpha", ship_id="alpha")
+    process_state = random.getstate()
+    initial_state = engine._random_state_for_system("alpha")
+
+    engine.step()
+    first_state = engine._system_random_states["alpha"]
+    engine.step()
+
+    assert random.getstate() == process_state
+    assert first_state != initial_state
+    assert engine._system_random_states["alpha"] != first_state
+
+
+def test_invalid_combat_commit_is_rejected_before_world_commit(monkeypatch) -> None:
+    world = WorldState(ships={"alpha": _ship("alpha", "alpha"), "beta": _ship("beta", "beta")})
+    before = deepcopy(world)
+    engine = SimulationEngine(world, EngineConfig(parallel_systems=False), CombatSystem(PyfaBridge()))
+    original_run = simulation_engine_module.run_system_group
+
+    def corrupt_second_combat(*args, **kwargs):
+        group_result = original_run(*args, **kwargs)
+        if len(group_result.results) > 1:
+            group_result.results[1].combat._system_id = "wrong-system"
+        return group_result
+
+    monkeypatch.setattr(simulation_engine_module, "run_system_group", corrupt_second_combat)
+
+    with pytest.raises(CombatStateCloneError):
+        engine.step()
+
+    assert world == before
+    assert world.tick == 0
+    assert world.now == 0.0
+
+
+def test_event_sink_failure_does_not_rollback_committed_tick(monkeypatch) -> None:
+    world = WorldState(ships={"alpha": _ship("alpha", "alpha")})
+    engine = SimulationEngine(world, EngineConfig(), CombatSystem(PyfaBridge()))
+
+    def fail_delivery(_events):
+        raise RuntimeError("recorder unavailable")
+
+    monkeypatch.setattr(engine, "_emit_isolated_events", fail_delivery)
+    engine.step()
+
+    assert world.tick == 1
+    assert world.now == pytest.approx(1.0)
+    assert engine._isolated_commit_completed
+
+
+def test_leader_system_change_increments_version_and_clears_focus() -> None:
+    leader = _ship("leader", "alpha")
+    target = _ship("target", "alpha", team=Team.RED, squad_id="B")
+    world = WorldState(
+        ships={leader.ship_id: leader, target.ship_id: target},
+        squad_leaders={"BLUE:A": leader.ship_id},
+        squad_focus_queues={"BLUE:A": [target.ship_id]},
+        squad_focus_updated_at={"BLUE:A": 1.0},
+    )
+    refresh_global_squad_leaders(world)
+    initial_version = world.squad_leader_location_versions["BLUE:A"]
+
+    leader.nav.system_id = "beta"
+    refresh_global_squad_leaders(world)
+
+    assert world.squad_leader_location_versions["BLUE:A"] == initial_version + 1
+    assert "BLUE:A" not in world.squad_focus_queues
+    assert "BLUE:A" not in world.squad_focus_updated_at
+
+
+def test_dead_leader_is_replaced_deterministically_by_local_same_group() -> None:
+    dead = _ship("leader", "alpha")
+    dead.ship_group_id = "command"
+    dead.vital.alive = False
+    local_other = _ship("local-other", "alpha")
+    remote_same = _ship("remote-same", "beta")
+    remote_same.ship_group_id = "command"
+    local_same = _ship("local-same", "alpha")
+    local_same.ship_group_id = "command"
+    world = WorldState(
+        ships={ship.ship_id: ship for ship in (dead, local_other, remote_same, local_same)},
+        squad_leaders={"BLUE:A": dead.ship_id},
+    )
+
+    refresh_global_squad_leaders(world)
+
+    assert world.squad_leaders["BLUE:A"] == local_same.ship_id
+
+
+def test_cross_system_member_routes_to_global_leader_and_drops_combat() -> None:
+    follower = _ship("follower", "alpha")
+    leader = _ship("leader", "gamma")
+    enemy = _ship("enemy", "alpha", team=Team.RED, squad_id="B")
+    follower.combat.current_target = enemy.ship_id
+    world = WorldState(
+        ships={ship.ship_id: ship for ship in (follower, leader, enemy)},
+        structures={
+            "alpha-beta": _gate("alpha-beta", "alpha", "beta-alpha", Vector2(100_000.0, 0.0)),
+            "beta-alpha": _gate("beta-alpha", "beta", "alpha-beta"),
+            "beta-gamma": _gate("beta-gamma", "beta", "gamma-beta"),
+            "gamma-beta": _gate("gamma-beta", "gamma", "beta-gamma"),
+        },
+        squad_leaders={"BLUE:A": leader.ship_id},
+        squad_focus_queues={"BLUE:A": [enemy.ship_id]},
+    )
+    refresh_global_squad_leaders(world)
+    agent = ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id)
+
+    agent.think(world)
+
+    assert follower.nav.squad_follow_state == FOLLOW_LEADER_SYSTEM
+    assert follower.nav.gate.target_structure_id == "alpha-beta"
+    assert follower.nav.squad_follow_leader_id == leader.ship_id
+    assert follower.combat.current_target is None
+    assert not any(order.kind == "ATTACK" for order in follower.order_queue)
+
+
+def test_same_system_follow_warp_uses_170_150_km_hysteresis() -> None:
+    leader = _ship("leader", "alpha")
+    follower = _ship("follower", "alpha")
+    leader.nav.position = Vector2(200_000.0, 0.0)
+    world = WorldState(
+        ships={leader.ship_id: leader, follower.ship_id: follower},
+        squad_leaders={"BLUE:A": leader.ship_id},
+    )
+    refresh_global_squad_leaders(world)
+    agent = ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id)
+
+    agent.think(world)
+    assert follower.nav.squad_follow_state == WARP_TO_LEADER
+    assert follower.nav.warp.phase == "align"
+    assert follower.nav.warp.target_ship_id == leader.ship_id
+    assert not follower.nav.squad_follow_warp_ready
+
+    follower.nav.position = Vector2(40_000.0, 0.0)
+    agent.think(world)
+    assert follower.nav.squad_follow_state == WARP_TO_LEADER
+
+    follower.nav.position = Vector2(51_000.0, 0.0)
+    agent.think(world)
+    assert follower.nav.squad_follow_state == FORMATION_FOLLOW
+    assert follower.nav.warp.phase == "idle"
+    assert follower.nav.squad_follow_warp_ready
+
+
+def test_same_system_follow_waits_for_existing_warp_to_finish() -> None:
+    leader = _ship("leader", "alpha")
+    follower = _ship("follower", "alpha")
+    leader.nav.position = Vector2(200_000.0, 0.0)
+    follower.nav.warp.phase = "warp"
+    follower.nav.warp.target_position = Vector2(-200_000.0, 0.0)
+    world = WorldState(
+        ships={leader.ship_id: leader, follower.ship_id: follower},
+        squad_leaders={"BLUE:A": leader.ship_id},
+    )
+    refresh_global_squad_leaders(world)
+
+    ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id).think(world)
+
+    assert follower.nav.warp.phase == "warp"
+    assert follower.nav.warp.target_ship_id is None
+    assert follower.nav.squad_follow_state == WARP_TO_LEADER
+
+
+def test_leader_system_change_cancels_old_local_warp_and_replans_gate() -> None:
+    leader = _ship("leader", "alpha")
+    follower = _ship("follower", "alpha")
+    leader.nav.position = Vector2(200_000.0, 0.0)
+    world = WorldState(
+        ships={leader.ship_id: leader, follower.ship_id: follower},
+        structures={
+            "alpha-beta": _gate("alpha-beta", "alpha", "beta-alpha", Vector2(100_000.0, 0.0)),
+            "beta-alpha": _gate("beta-alpha", "beta", "alpha-beta"),
+        },
+        squad_leaders={"BLUE:A": leader.ship_id},
+    )
+    refresh_global_squad_leaders(world)
+    agent = ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id)
+    agent.think(world)
+    old_version = follower.nav.squad_follow_leader_location_version
+    assert follower.nav.warp.target_ship_id == leader.ship_id
+
+    leader.nav.system_id = "beta"
+    refresh_global_squad_leaders(world)
+    agent.think(world)
+
+    assert follower.nav.squad_follow_state == FOLLOW_LEADER_SYSTEM
+    assert follower.nav.squad_follow_leader_location_version == old_version + 1
+    assert follower.nav.warp.target_ship_id is None
+    assert follower.nav.gate.target_structure_id == "alpha-beta"
+
+
+def test_shards_cannot_overwrite_global_squad_authority() -> None:
+    world = WorldState(
+        squad_leaders={"BLUE:A": "leader"},
+        squad_propulsion_commands={"BLUE:A": True},
+        squad_leader_speed_limits={"BLUE:A": 321.0},
+        squad_focus_queues={"BLUE:A": ["target"]},
+        squad_focus_updated_at={"BLUE:A": 12.0},
+    )
+    alpha_result = SystemShardResult(
+        system_id="alpha",
+        world=WorldState(
+            squad_leaders={"BLUE:A": "alpha-local"},
+            squad_propulsion_commands={"BLUE:A": False},
+            squad_leader_speed_limits={"BLUE:A": 1.0},
+            squad_focus_queues={"BLUE:A": ["alpha-target"]},
+            squad_focus_updated_at={"BLUE:A": 1.0},
+        ),
+        combat=CombatSystem(PyfaBridge()),
+    )
+    beta_result = SystemShardResult(
+        system_id="beta",
+        world=WorldState(
+            squad_leaders={"BLUE:A": "beta-local"},
+            squad_propulsion_commands={"BLUE:A": False},
+            squad_leader_speed_limits={"BLUE:A": 2.0},
+            squad_focus_queues={"BLUE:A": ["beta-target"]},
+            squad_focus_updated_at={"BLUE:A": 2.0},
+        ),
+        combat=CombatSystem(PyfaBridge()),
+    )
+
+    merge_system_results(world, [alpha_result, beta_result], {})
+
+    assert world.squad_propulsion_commands["BLUE:A"] is True
+    assert world.squad_leaders["BLUE:A"] == "leader"
+    assert world.squad_leader_speed_limits["BLUE:A"] == pytest.approx(321.0)
+    assert world.squad_focus_queues["BLUE:A"] == ["target"]
+    assert world.squad_focus_updated_at["BLUE:A"] == pytest.approx(12.0)
+
+
+def test_close_is_idempotent_and_shuts_down_executor() -> None:
+    class FakeExecutor:
+        _processes = {}
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def shutdown(self, **_kwargs) -> None:
+            self.calls += 1
+
+    engine = SimulationEngine(WorldState(), EngineConfig(), CombatSystem(PyfaBridge()))
+    executor = FakeExecutor()
+    engine._system_executor = executor  # type: ignore[assignment]
+    engine._system_executor_workers = 2
+
+    engine.close()
+    engine.close()
+
+    assert executor.calls == 1
+    assert engine.system_executor_workers == 0
+
+
+def test_close_terminates_worker_that_does_not_join() -> None:
+    class HungProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.terminated = False
+
+        def join(self, timeout=None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+    class FakeExecutor:
+        def __init__(self, process) -> None:
+            self._processes = {1: process}
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    process = HungProcess()
+    engine = SimulationEngine(WorldState(), EngineConfig(), CombatSystem(PyfaBridge()))
+    engine._system_executor = FakeExecutor(process)  # type: ignore[assignment]
+
+    engine.close(timeout_sec=0.01)
+
+    assert process.terminated
+    assert engine.system_executor_workers == 0
+
+
+def test_executor_worker_capacity_is_fixed_after_first_creation() -> None:
+    engine = SimulationEngine(WorldState(), EngineConfig(parallel_systems=True), CombatSystem(PyfaBridge()))
+    first_plan = SimpleNamespace(worker_count=2, groups=(object(), object()))
+    second_plan = SimpleNamespace(worker_count=3, groups=(object(), object(), object()))
+
+    first_executor = engine._executor_for_plan(first_plan)  # type: ignore[arg-type]
+    second_executor = engine._executor_for_plan(second_plan)  # type: ignore[arg-type]
+
+    assert second_executor is first_executor
+    assert engine.system_executor_workers == 2
+    engine.close()
 
 
 def test_parallel_systems_true_runs_real_process_pool(tmp_path) -> None:
@@ -591,12 +1132,29 @@ def test_parallel_systems_true_runs_real_process_pool(tmp_path) -> None:
         textwrap.dedent(
             """
             from eve_sim.config import EngineConfig
+            from eve_sim.agents import ShipAgent
             from eve_sim.math2d import Vector2
             from eve_sim.models import CombatState, FitDescriptor, NavigationState, QualityLevel, QualityState, ShipEntity, Team, VitalState
             from eve_sim.pyfa_bridge import PyfaBridge
             from eve_sim.simulation_engine import SimulationEngine
+            from eve_sim.system_isolation import SystemExecutionMode
             from eve_sim.systems import CombatSystem
             from eve_sim.world import WorldState
+
+            class SlowAgent(ShipAgent):
+                def think(self, world):
+                    import time
+                    time.sleep(0.5)
+
+            class RandomAgent(ShipAgent):
+                def think(self, world):
+                    import random
+                    world.ships[self.ship_id].nav.position.x += random.random()
+
+            def hang_forever():
+                import time
+                while True:
+                    time.sleep(10.0)
 
             def ship(ship_id, system_id):
                 fit = FitDescriptor(fit_key=ship_id, ship_name="Test Hull", role="test", base_dps=0.0, volley=0.0, optimal_range=0.0, falloff=0.0, tracking=0.0, max_target_range=100000.0, max_cap=100.0, shield_hp=100.0, armor_hp=100.0, structure_hp=100.0)
@@ -615,6 +1173,7 @@ def test_parallel_systems_true_runs_real_process_pool(tmp_path) -> None:
 
             def main():
                 world = WorldState(ships={"alpha": ship("alpha", "alpha"), "beta": ship("beta", "beta")})
+                serial_world = WorldState(ships={"alpha": ship("alpha", "alpha"), "beta": ship("beta", "beta")})
                 engine = SimulationEngine(
                     world,
                     EngineConfig(parallel_systems=True, parallel_system_workers=2, parallel_system_target_pressure=1.0),
@@ -622,10 +1181,64 @@ def test_parallel_systems_true_runs_real_process_pool(tmp_path) -> None:
                 )
                 engine.register_ship("alpha")
                 engine.register_ship("beta")
-                engine.step()
+                engine.ship_agents["alpha"] = RandomAgent(agent_id="random:alpha", ship_id="alpha")
+                engine.ship_agents["beta"] = RandomAgent(agent_id="random:beta", ship_id="beta")
+                serial_engine = SimulationEngine(
+                    serial_world,
+                    EngineConfig(parallel_systems=False, parallel_system_target_pressure=1.0),
+                    CombatSystem(PyfaBridge()),
+                )
+                serial_engine.register_ship("alpha")
+                serial_engine.register_ship("beta")
+                serial_engine.ship_agents["alpha"] = RandomAgent(agent_id="random:alpha", ship_id="alpha")
+                serial_engine.ship_agents["beta"] = RandomAgent(agent_id="random:beta", ship_id="beta")
+                for _ in range(100):
+                    engine.step()
+                    serial_engine.step()
                 assert engine.last_system_execution_plan.use_processes
                 assert engine.last_system_parallel_error is None
-                engine.shutdown_parallel_workers()
+                parallel_snapshot = engine.snapshot()
+                serial_snapshot = serial_engine.snapshot()
+                for key in (
+                        "ships", "drones", "fighters", "projectiles", "projectile_blasts",
+                        "bubble_fields", "intents", "squad_leaders",
+                        "squad_leader_location_versions", "squad_propulsion_commands",
+                        "squad_leader_speed_limits", "squad_focus_queues",
+                        "squad_focus_updated_at",
+                    ):
+                    assert parallel_snapshot[key] == serial_snapshot[key], key
+                assert engine._system_random_states == serial_engine._system_random_states
+                assert {
+                    key: (value._projectile_seq, value._projectile_blast_seq, value._bubble_seq, value._event_rng_counter)
+                    for key, value in engine._system_combats.items()
+                } == {
+                    key: (value._projectile_seq, value._projectile_blast_seq, value._bubble_seq, value._event_rng_counter)
+                    for key, value in serial_engine._system_combats.items()
+                }
+                serial_engine.close()
+                engine.config.parallel_system_timeout_sec = 0.05
+                engine.ship_agents["alpha"] = SlowAgent(agent_id="slow:alpha", ship_id="alpha")
+                engine.step()
+                assert engine.system_execution_mode is SystemExecutionMode.SHARD_SERIAL_DEGRADED
+                assert engine.parallel_failure_count == 1
+                assert engine.parallel_disabled_at_tick == 101
+                engine.close()
+                assert engine.system_executor_workers == 0
+
+                import multiprocessing
+                import time
+                from concurrent.futures import ProcessPoolExecutor
+                hung_engine = SimulationEngine(WorldState(), EngineConfig(), CombatSystem(PyfaBridge()))
+                hung_executor = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+                hung_engine._system_executor = hung_executor
+                hung_engine._system_executor_workers = 1
+                hung_executor.submit(hang_forever)
+                deadline = time.monotonic() + 5.0
+                while not getattr(hung_executor, "_processes", {}) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                started = time.monotonic()
+                hung_engine.close(timeout_sec=0.1)
+                assert time.monotonic() - started < 3.0
 
             if __name__ == "__main__":
                 main()

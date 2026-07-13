@@ -3,7 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .models import BubbleField, DroneEntity, FighterEntity, FleetIntent, ProjectileBlast, ProjectileEntity, ShipEntity, StructureEntity
+from .models import (
+    BubbleField,
+    DroneEntity,
+    FighterEntity,
+    FleetIntent,
+    ProjectileBlast,
+    ProjectileEntity,
+    ShipEntity,
+    SquadLeaderLocation,
+    StructureEntity,
+)
 
 if TYPE_CHECKING:
     from .maps import MapDefinition
@@ -20,12 +30,12 @@ class WorldState:
     structures: dict[str, StructureEntity] = field(default_factory=dict)
     intents: dict[str, FleetIntent] = field(default_factory=dict)
     squad_leaders: dict[str, str] = field(default_factory=dict)
+    squad_leader_locations: dict[str, SquadLeaderLocation] = field(default_factory=dict)
+    squad_leader_location_versions: dict[str, int] = field(default_factory=dict)
     squad_propulsion_commands: dict[str, bool] = field(default_factory=dict)
     squad_leader_speed_limits: dict[str, float] = field(default_factory=dict)
     squad_focus_queues: dict[str, list[str]] = field(default_factory=dict)
     squad_focus_updated_at: dict[str, float] = field(default_factory=dict)
-    squad_prelocked_targets: dict[str, dict[str, set[str]]] = field(default_factory=dict)
-    squad_prelock_timers: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     drones: dict[str, DroneEntity] = field(default_factory=dict)
     fighters: dict[str, FighterEntity] = field(default_factory=dict)
     projectiles: dict[str, ProjectileEntity] = field(default_factory=dict)

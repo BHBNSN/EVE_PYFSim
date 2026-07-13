@@ -1,21 +1,48 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from enum import Enum
 import math
 import os
+import pickle
+import random
+import sys
 import time
 from typing import Any
 
-from .agents import CommanderAgent, ShipAgent
+from .agents import ShipAgent
 from .config import EngineConfig
 from .models import Team
 from .pyfa_bridge import PyfaBridge
 from .replay.schema import CombatEvent
 from .sim_logging import get_sim_logger, log_sim_event
+from .system_identity import normalize_system_namespace, stable_system_seed
 from .systems import CombatSystem, DeployableSystem, LogisticsSystem, MovementSystem, PerceptionSystem
 from .timing_wheel import TimingWheel
 from .world import WorldState
+
+
+SYSTEM_SHARD_PROTOCOL_VERSION = 2
+
+
+class SystemExecutionMode(Enum):
+    GLOBAL_LEGACY = "global_legacy"
+    SHARD_SERIAL = "shard_serial"
+    SHARD_PROCESS = "shard_process"
+    SHARD_SERIAL_DEGRADED = "shard_serial_degraded"
+
+
+class DuplicateEntityIdError(RuntimeError):
+    pass
+
+
+class ShardResultValidationError(RuntimeError):
+    pass
+
+
+class ParallelCapabilityError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -67,11 +94,11 @@ class SystemShardTask:
     system_id: str
     world: WorldState
     combat: CombatSystem
-    commanders: list[CommanderAgent]
     ship_agents: dict[str, ShipAgent]
     owned_entity_ids: dict[str, set[str]] = field(default_factory=dict)
-    intent_keys: set[str] = field(default_factory=set)
-    squad_keys: set[str] = field(default_factory=set)
+    tick: int = 0
+    protocol_version: int = SYSTEM_SHARD_PROTOCOL_VERSION
+    random_state: object | None = None
 
 
 @dataclass(slots=True)
@@ -83,16 +110,24 @@ class SystemShardResult:
     events: list[CombatEvent] = field(default_factory=list)
     elapsed_ms: float = 0.0
     owned_entity_ids: dict[str, set[str]] = field(default_factory=dict)
-    intent_keys: set[str] = field(default_factory=set)
-    consumed_intent_keys: set[str] = field(default_factory=set)
-    squad_keys: set[str] = field(default_factory=set)
     transfer_outs: list[SystemTransferOut] = field(default_factory=list)
+    tick: int = 0
+    protocol_version: int = SYSTEM_SHARD_PROTOCOL_VERSION
+    random_state: object | None = None
 
 
 @dataclass(slots=True)
 class SystemGroupResult:
     results: list[SystemShardResult] = field(default_factory=list)
     elapsed_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class SystemMergePlan:
+    world: WorldState
+    ship_agents: dict[str, ShipAgent]
+    events: list[CombatEvent] = field(default_factory=list)
+    transfer_ins: list[SystemTransferIn] = field(default_factory=list)
 
 
 def entity_system_id(entity: Any) -> str:
@@ -231,14 +266,9 @@ def _system_structure_ids(world: WorldState, system_id: str) -> set[str]:
         structure_id
         for structure_id, structure in world.structures.items()
         if str(getattr(structure, "system_id", "") or "") == system_id
+        or str(getattr(structure, "kind", "") or "").upper() == "STARGATE"
     }
-    linked_ids: set[str] = set()
-    for structure_id in list(structure_ids):
-        structure = world.structures.get(structure_id)
-        linked_id = str(getattr(structure, "linked_structure_id", "") or "").strip() if structure is not None else ""
-        if linked_id and linked_id in world.structures:
-            linked_ids.add(linked_id)
-    return structure_ids | linked_ids
+    return structure_ids
 
 
 def _filter_focus_queue(world: WorldState, queue: list[str] | tuple[str, ...], local_entity_ids: set[str]) -> list[str]:
@@ -259,7 +289,6 @@ def _filter_focus_queue(world: WorldState, queue: list[str] | tuple[str, ...], l
 def build_system_shard(
     world: WorldState,
     system_id: str,
-    commanders: list[CommanderAgent],
     ship_agents: dict[str, ShipAgent],
 ) -> SystemShardTask:
     # Correctness-first snapshot runner; high-throughput workers should exchange deltas and own CombatSystem state.
@@ -276,22 +305,10 @@ def build_system_shard(
         if entity_system_id(entity) == system_id
     )
 
-    local_squad_keys = {
+    shard_squad_keys = {
         _focus_key(ship.team, ship.squad_id)
         for ship_id, ship in world.ships.items()
         if ship_id in all_local_ship_ids
-    }
-    local_squad_ids_by_team: dict[Team, set[str]] = {}
-    for ship_id, ship in world.ships.items():
-        if ship_id not in all_local_ship_ids:
-            continue
-        local_squad_ids_by_team.setdefault(ship.team, set()).add(str(ship.squad_id))
-    shard_intents = {
-        intent_key: deepcopy(intent)
-        for intent_key, intent in world.intents.items()
-        if intent.squad_id in local_squad_ids_by_team.get(Team.BLUE, set())
-        or intent.squad_id in local_squad_ids_by_team.get(Team.RED, set())
-        or str(intent_key) in local_squad_keys
     }
     owned_entity_ids = {
         "ships": set(all_local_ship_ids),
@@ -338,53 +355,41 @@ def build_system_shard(
             if entity_system_id(ship) == system_id
         },
         structures=structures,
-        intents=shard_intents,
+        intents={},
         squad_leaders={
             key: leader_id
             for key, leader_id in world.squad_leaders.items()
-            if key in local_squad_keys and str(leader_id) in all_local_ship_ids
+            if key in shard_squad_keys
+        },
+        squad_leader_locations={
+            key: deepcopy(location)
+            for key, location in world.squad_leader_locations.items()
+            if key in shard_squad_keys
+        },
+        squad_leader_location_versions={
+            key: int(version)
+            for key, version in world.squad_leader_location_versions.items()
+            if key in shard_squad_keys
         },
         squad_propulsion_commands={
             key: value
             for key, value in world.squad_propulsion_commands.items()
-            if key in local_squad_keys
+            if key in shard_squad_keys
         },
         squad_leader_speed_limits={
             key: value
             for key, value in world.squad_leader_speed_limits.items()
-            if key in local_squad_keys
+            if key in shard_squad_keys
         },
         squad_focus_queues={
             key: _filter_focus_queue(world, queue, local_entity_ids)
             for key, queue in world.squad_focus_queues.items()
-            if key in local_squad_keys
+            if key in shard_squad_keys
         },
         squad_focus_updated_at={
             key: float(value)
             for key, value in world.squad_focus_updated_at.items()
-            if key in local_squad_keys
-        },
-        squad_prelocked_targets={
-            key: {
-                ship_id: {target_id for target_id in targets if target_id in local_entity_ids}
-                for ship_id, targets in by_ship.items()
-                if ship_id in all_local_ship_ids
-            }
-            for key, by_ship in world.squad_prelocked_targets.items()
-            if key in local_squad_keys
-        },
-        squad_prelock_timers={
-            key: {
-                ship_id: {
-                    target_id: float(timer)
-                    for target_id, timer in timers.items()
-                    if target_id in local_entity_ids
-                }
-                for ship_id, timers in by_ship.items()
-                if ship_id in all_local_ship_ids
-            }
-            for key, by_ship in world.squad_prelock_timers.items()
-            if key in local_squad_keys
+            if key in shard_squad_keys
         },
         drones={
             drone_id: deepcopy(drone)
@@ -412,19 +417,6 @@ def build_system_shard(
             if entity_system_id(field) == system_id
         },
     )
-    shard.squad_prelocked_targets = {
-        key: {ship_id: targets for ship_id, targets in by_ship.items() if targets}
-        for key, by_ship in shard.squad_prelocked_targets.items()
-    }
-    shard.squad_prelock_timers = {
-        key: {ship_id: timers for ship_id, timers in by_ship.items() if timers}
-        for key, by_ship in shard.squad_prelock_timers.items()
-    }
-    shard_commanders = [
-        deepcopy(commander)
-        for commander in commanders
-        if local_squad_ids_by_team.get(commander.team, set()).intersection(set(commander.squad_ids))
-    ]
     shard_agents = {
         ship_id: deepcopy(agent)
         for ship_id, agent in ship_agents.items()
@@ -435,11 +427,9 @@ def build_system_shard(
         system_id=system_id,
         world=shard,
         combat=combat,
-        commanders=shard_commanders,
         ship_agents=shard_agents,
         owned_entity_ids=owned_entity_ids,
-        intent_keys=set(shard_intents.keys()),
-        squad_keys=set(local_squad_keys),
+        tick=int(world.tick),
     )
 
 
@@ -448,11 +438,11 @@ def replace_task_combat(task: SystemShardTask, combat: CombatSystem) -> SystemSh
         system_id=task.system_id,
         world=task.world,
         combat=combat,
-        commanders=task.commanders,
         ship_agents=task.ship_agents,
         owned_entity_ids=task.owned_entity_ids,
-        intent_keys=task.intent_keys,
-        squad_keys=task.squad_keys,
+        tick=task.tick,
+        protocol_version=task.protocol_version,
+        random_state=task.random_state,
     )
 
 
@@ -463,7 +453,7 @@ def _reset_combat_process_state(combat: CombatSystem) -> None:
 
 
 def sanitize_combat_for_worker(combat: CombatSystem) -> CombatSystem:
-    cloned = deepcopy(combat)
+    cloned = combat.clone_for_system(combat._system_id)
     _reset_combat_process_state(cloned)
     return cloned
 
@@ -509,61 +499,59 @@ def _detect_transfer_outs(task: SystemShardTask) -> list[SystemTransferOut]:
 
 def _run_shard(task: SystemShardTask, config: EngineConfig, step_start: float, step_end: float, dt: float) -> SystemShardResult:
     started = time.perf_counter()
+    process_random_state = random.getstate()
+    if task.random_state is not None:
+        random.setstate(task.random_state)
     world = task.world
     world.now = float(step_end)
     combat = task.combat
     events: list[CombatEvent] = []
 
-    logger = get_sim_logger(config)
-    combat.attach_logger(
-        logger,
-        bool(getattr(config, "detailed_logging", False)),
-        float(getattr(config, "log_merge_window_sec", 1.0) or 1.0),
-        bool(getattr(config, "hotspot_logging", False)),
-    )
-    combat.attach_event_sink(events.append)
-    _rebuild_timing_wheel(combat, world)
+    try:
+        # Workers collect authority events in memory; only the parent process commits them.
+        combat.logger = None
+        combat.attach_event_sink(events.append)
+        _rebuild_timing_wheel(combat, world)
 
-    perception = PerceptionSystem()
-    movement = MovementSystem()
-    deployables = DeployableSystem(combat, movement)
-    logistics = LogisticsSystem()
+        perception = PerceptionSystem()
+        movement = MovementSystem()
+        deployables = DeployableSystem(combat, movement)
+        logistics = LogisticsSystem()
 
-    perception.run(world)
+        perception.run(world)
 
-    for commander in task.commanders:
-        commander.think(world)
+        for agent in task.ship_agents.values():
+            if agent.ship_id not in world.ships:
+                continue
+            agent.sense(world)
+            agent.think(world)
 
-    for agent in task.ship_agents.values():
-        if agent.ship_id not in world.ships:
-            continue
-        agent.sense(world)
-        agent.think(world)
+        deployables.run(world, dt, advance_physics=False, apply_effects=False)
 
-    deployables.run(world, dt, advance_physics=False, apply_effects=False)
+        substep_count = max(1, int(getattr(config, "physics_substeps", 1) or 1))
+        base_slice_dt = dt / substep_count
+        world.now = float(step_start)
 
-    substep_count = max(1, int(getattr(config, "physics_substeps", 1) or 1))
-    base_slice_dt = dt / substep_count
-    world.now = float(step_start)
+        for slice_index in range(substep_count):
+            substep_start = step_start + (base_slice_dt * slice_index)
+            if slice_index + 1 >= substep_count:
+                substep_end = step_end
+            else:
+                substep_end = substep_start + base_slice_dt
+            slice_dt = max(1e-6, float(substep_end) - float(substep_start))
+            world.now = float(substep_end)
+            movement.run(world, slice_dt)
+            deployables.run_physics(world, slice_dt)
 
-    for slice_index in range(substep_count):
-        substep_start = step_start + (base_slice_dt * slice_index)
-        if slice_index + 1 >= substep_count:
-            substep_end = step_end
-        else:
-            substep_end = substep_start + base_slice_dt
-        slice_dt = max(1e-6, float(substep_end) - float(substep_start))
-        world.now = float(substep_end)
-        movement.run(world, slice_dt)
-        deployables.run_physics(world, slice_dt)
-
-    world.now = float(step_end)
-    combat.run(world, dt)
-    deployables.run(world, dt, advance_physics=False, apply_effects=True)
-    logistics.run(world, dt)
-
-    combat.attach_event_sink(None)
-    combat.logger = None
+        world.now = float(step_end)
+        combat.run(world, dt)
+        deployables.run(world, dt, advance_physics=False, apply_effects=True)
+        logistics.run(world, dt)
+        completed_random_state = random.getstate()
+    finally:
+        combat.attach_event_sink(None)
+        combat.logger = None
+        random.setstate(process_random_state)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return SystemShardResult(
         system_id=task.system_id,
@@ -573,68 +561,119 @@ def _run_shard(task: SystemShardTask, config: EngineConfig, step_start: float, s
         events=events,
         elapsed_ms=elapsed_ms,
         owned_entity_ids={key: set(value) for key, value in task.owned_entity_ids.items()},
-        intent_keys=set(task.intent_keys),
-        consumed_intent_keys=set(task.intent_keys) - set(world.intents.keys()),
-        squad_keys=set(task.squad_keys),
         transfer_outs=_detect_transfer_outs(task),
+        tick=int(task.tick),
+        protocol_version=task.protocol_version,
+        random_state=completed_random_state,
     )
 
 
 def run_system_group(tasks: list[SystemShardTask], config: EngineConfig, step_start: float, step_end: float, dt: float) -> SystemGroupResult:
     started = time.perf_counter()
-    results = [_run_shard(task, config, step_start, step_end, dt) for task in tasks]
+    results = [_run_shard(task, config, step_start, step_end, dt) for task in sorted(tasks, key=lambda item: item.system_id)]
     return SystemGroupResult(results=results, elapsed_ms=(time.perf_counter() - started) * 1000.0)
 
 
-def _local_entity_ids(result: SystemShardResult) -> set[str]:
-    ids = set(result.world.ships.keys())
-    ids.update(result.world.drones.keys())
-    ids.update(result.world.fighters.keys())
-    return ids
+def parallel_worker_probe() -> tuple[int, int, str]:
+    return os.getpid(), SYSTEM_SHARD_PROTOCOL_VERSION, sys.version.split()[0]
 
 
-def _merge_focus_state(world: WorldState, result: SystemShardResult) -> None:
-    local_ids = _local_entity_ids(result)
-    local_focus_keys = {
-        _focus_key(ship.team, ship.squad_id)
-        for ship in result.world.ships.values()
-    }
-    for focus_key in local_focus_keys:
-        existing = [target_id for target_id in world.squad_focus_queues.get(focus_key, []) if str(target_id) not in local_ids]
-        local_queue = [
-            target_id
-            for target_id in result.world.squad_focus_queues.get(focus_key, [])
-            if str(target_id) in local_ids and str(target_id) not in existing
-        ]
-        merged = existing + local_queue
-        if merged:
-            world.squad_focus_queues[focus_key] = merged
-            local_updated = result.world.squad_focus_updated_at.get(focus_key)
-            if local_updated is not None:
-                world.squad_focus_updated_at[focus_key] = max(
-                    float(world.squad_focus_updated_at.get(focus_key, 0.0) or 0.0),
-                    float(local_updated),
+def validate_parallel_capability(
+    config: EngineConfig,
+    tasks: list[SystemShardTask],
+    worker_count: int,
+) -> None:
+    if os.getpid() <= 0:
+        raise ParallelCapabilityError("multiprocessing is unavailable")
+    import multiprocessing
+
+    if multiprocessing.current_process().daemon:
+        raise ParallelCapabilityError("daemon processes cannot create process workers")
+    if worker_count <= 1 or len(tasks) <= 1:
+        raise ParallelCapabilityError("parallel execution requires at least two worker groups")
+    if has_unassigned_active_entities(tasks[0].world):
+        raise ParallelCapabilityError("active entities must have a non-empty system_id")
+    try:
+        pickle.dumps(config)
+        for task in tasks:
+            pickle.dumps(task)
+    except Exception as exc:
+        raise ParallelCapabilityError(f"parallel task is not serializable: {exc}") from exc
+
+
+def _finite_number(value: Any, label: str) -> None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ShardResultValidationError(f"{label} is not numeric") from exc
+    if not math.isfinite(numeric):
+        raise ShardResultValidationError(f"{label} is not finite")
+
+
+def validate_shard_result(
+    task: SystemShardTask,
+    result: SystemShardResult,
+    expected_tick: int,
+) -> None:
+    if result.protocol_version != SYSTEM_SHARD_PROTOCOL_VERSION:
+        raise ShardResultValidationError("unsupported shard result protocol")
+    if result.system_id != task.system_id:
+        raise ShardResultValidationError(
+            f"worker returned system {result.system_id!r} for task {task.system_id!r}"
+        )
+    if result.tick != expected_tick or int(result.world.tick) != expected_tick:
+        raise ShardResultValidationError(
+            f"worker tick mismatch for {task.system_id!r}: {result.tick}/{result.world.tick} != {expected_tick}"
+        )
+    if not isinstance(result.combat, CombatSystem):
+        raise ShardResultValidationError(f"missing CombatSystem for {task.system_id!r}")
+    if result.random_state is None:
+        raise ShardResultValidationError(f"missing random state for {task.system_id!r}")
+    try:
+        random.Random().setstate(result.random_state)
+    except Exception as exc:
+        raise ShardResultValidationError(f"invalid random state for {task.system_id!r}") from exc
+
+    transfers = {(item.collection_name, item.entity_id): item for item in result.transfer_outs}
+    if len(transfers) != len(result.transfer_outs):
+        raise ShardResultValidationError(f"duplicate transfer in {task.system_id!r}")
+    for transfer in result.transfer_outs:
+        if transfer.source_system_id != task.system_id or not str(transfer.destination_system_id).strip():
+            raise ShardResultValidationError(f"invalid transfer {transfer.entity_id!r}")
+
+    for collection_name in ("ships", "drones", "fighters", "projectiles", "projectile_blasts", "bubble_fields"):
+        collection = getattr(result.world, collection_name, {}) or {}
+        for entity_id, entity in collection.items():
+            system_id = entity_system_id(entity)
+            is_transfer = (collection_name, str(entity_id)) in transfers
+            if not system_id:
+                raise ShardResultValidationError(f"{collection_name}:{entity_id} has an empty system_id")
+            if not is_transfer and system_id != task.system_id:
+                raise ShardResultValidationError(
+                    f"{collection_name}:{entity_id} escaped shard {task.system_id!r}"
                 )
-        else:
-            world.squad_focus_queues.pop(focus_key, None)
-            world.squad_focus_updated_at.pop(focus_key, None)
+            vital = getattr(entity, "vital", None)
+            if vital is not None:
+                for name in ("shield", "armor", "structure", "cap"):
+                    if hasattr(vital, name):
+                        _finite_number(getattr(vital, name), f"{collection_name}:{entity_id}.{name}")
+            position = getattr(getattr(entity, "nav", None), "position", None) or getattr(entity, "position", None)
+            if position is not None:
+                _finite_number(getattr(position, "x", None), f"{collection_name}:{entity_id}.x")
+                _finite_number(getattr(position, "y", None), f"{collection_name}:{entity_id}.y")
+    _finite_number(result.world.now, f"{task.system_id}.now")
 
-        local_ship_ids = {ship.ship_id for ship in result.world.ships.values() if _focus_key(ship.team, ship.squad_id) == focus_key}
-        prelocked = world.squad_prelocked_targets.setdefault(focus_key, {})
-        timers = world.squad_prelock_timers.setdefault(focus_key, {})
-        for ship_id in local_ship_ids:
-            prelocked.pop(ship_id, None)
-            timers.pop(ship_id, None)
-        for ship_id, targets in result.world.squad_prelocked_targets.get(focus_key, {}).items():
-            if ship_id in local_ship_ids and targets:
-                prelocked[ship_id] = set(targets)
-        for ship_id, target_timers in result.world.squad_prelock_timers.get(focus_key, {}).items():
-            if ship_id in local_ship_ids and target_timers:
-                timers[ship_id] = dict(target_timers)
-        if not prelocked:
-            world.squad_prelocked_targets.pop(focus_key, None)
-        if not timers:
-            world.squad_prelock_timers.pop(focus_key, None)
+    seen_event_sequences: set[tuple[int, int]] = set()
+    for event in result.events:
+        key = (int(event.rng_seed), int(event.rng_counter))
+        if key in seen_event_sequences:
+            raise ShardResultValidationError(f"duplicate event sequence in {task.system_id!r}")
+        seen_event_sequences.add(key)
+        if event.system_id and event.system_id != task.system_id:
+            raise ShardResultValidationError(f"event belongs to unexpected system {event.system_id!r}")
+    for ship_id, agent in result.ship_agents.items():
+        if ship_id not in result.world.ships or agent.ship_id != ship_id:
+            raise ShardResultValidationError(f"agent {ship_id!r} does not belong to shard {task.system_id!r}")
 
 
 def _merge_collection(
@@ -649,6 +688,8 @@ def _merge_collection(
     for entity_id, entity in result_collection.items():
         if entity_id in transfer_out_ids:
             continue
+        if entity_id in world_collection and entity_id not in owned_ids:
+            raise DuplicateEntityIdError(f"entity ID collision: {entity_id}")
         world_collection[entity_id] = entity
 
 
@@ -671,25 +712,28 @@ def _transfer_in_from_out(transfer: SystemTransferOut) -> SystemTransferIn:
 
 
 def _apply_transfer_ins(world: WorldState, transfer_ins: list[SystemTransferIn]) -> None:
-    for transfer in transfer_ins:
+    for transfer in sorted(
+        transfer_ins,
+        key=lambda item: (item.source_system_id, item.destination_system_id, item.collection_name, item.entity_id),
+    ):
         if not transfer.destination_system_id:
-            continue
+            raise ShardResultValidationError(f"transfer {transfer.entity_id!r} has no destination")
         collection = getattr(world, transfer.collection_name, None)
         if not isinstance(collection, dict):
-            continue
+            raise ShardResultValidationError(f"unknown transfer collection {transfer.collection_name!r}")
+        if transfer.entity_id in collection:
+            raise DuplicateEntityIdError(f"transfer entity ID collision: {transfer.entity_id}")
         collection[transfer.entity_id] = transfer.entity
 
 
-def merge_system_results(
+def _merge_system_results_in_place(
     world: WorldState,
     results: list[SystemShardResult],
     ship_agents: dict[str, ShipAgent],
-    transfer_sink: list[SystemTransferIn] | None = None,
-) -> list[CombatEvent]:
+) -> tuple[list[CombatEvent], list[SystemTransferIn]]:
     events: list[CombatEvent] = []
-    consumed_intent_keys: set[str] = set()
     transfer_ins: list[SystemTransferIn] = []
-    for result in results:
+    for result in sorted(results, key=lambda item: item.system_id):
         owned = result.owned_entity_ids
         transfer_ids = _transfer_ids_by_collection(result.transfer_outs)
         _merge_collection(world.ships, result.world.ships, owned.get("ships", set()), transfer_ids.get("ships", set()))
@@ -707,23 +751,54 @@ def merge_system_results(
 
         for ship_id, agent in result.ship_agents.items():
             ship_agents[ship_id] = agent
-        _merge_focus_state(world, result)
-        for squad_key in result.squad_keys:
-            if squad_key in result.world.squad_leaders:
-                world.squad_leaders[squad_key] = result.world.squad_leaders[squad_key]
-            if squad_key in result.world.squad_propulsion_commands:
-                world.squad_propulsion_commands[squad_key] = bool(result.world.squad_propulsion_commands[squad_key])
-            if squad_key in result.world.squad_leader_speed_limits:
-                world.squad_leader_speed_limits[squad_key] = float(result.world.squad_leader_speed_limits[squad_key])
-        consumed_intent_keys.update(result.consumed_intent_keys)
         events.extend(result.events)
 
-    for intent_key in consumed_intent_keys:
-        world.intents.pop(intent_key, None)
+    transfer_ins.sort(
+        key=lambda item: (item.source_system_id, item.destination_system_id, item.collection_name, item.entity_id)
+    )
     _apply_transfer_ins(world, transfer_ins)
+    return events, transfer_ins
+
+
+def prepare_system_merge(
+    world: WorldState,
+    results: list[SystemShardResult],
+    ship_agents: dict[str, ShipAgent],
+) -> SystemMergePlan:
+    staged_world = deepcopy(world)
+    staged_agents = deepcopy(ship_agents)
+    events, transfer_ins = _merge_system_results_in_place(staged_world, results, staged_agents)
+    return SystemMergePlan(
+        world=staged_world,
+        ship_agents=staged_agents,
+        events=events,
+        transfer_ins=transfer_ins,
+    )
+
+
+def commit_system_merge(
+    world: WorldState,
+    ship_agents: dict[str, ShipAgent],
+    plan: SystemMergePlan,
+    transfer_sink: list[SystemTransferIn] | None = None,
+) -> list[CombatEvent]:
+    for world_field in fields(WorldState):
+        setattr(world, world_field.name, getattr(plan.world, world_field.name))
+    ship_agents.clear()
+    ship_agents.update(plan.ship_agents)
     if transfer_sink is not None:
-        transfer_sink.extend(transfer_ins)
-    return events
+        transfer_sink.extend(plan.transfer_ins)
+    return list(plan.events)
+
+
+def merge_system_results(
+    world: WorldState,
+    results: list[SystemShardResult],
+    ship_agents: dict[str, ShipAgent],
+    transfer_sink: list[SystemTransferIn] | None = None,
+) -> list[CombatEvent]:
+    plan = prepare_system_merge(world, results, ship_agents)
+    return commit_system_merge(world, ship_agents, plan, transfer_sink)
 
 
 def log_group_hotspot(config: EngineConfig, plan: SystemExecutionPlan, elapsed_ms: float) -> None:
@@ -744,18 +819,32 @@ def log_group_hotspot(config: EngineConfig, plan: SystemExecutionPlan, elapsed_m
 
 
 __all__ = [
+    "DuplicateEntityIdError",
+    "ParallelCapabilityError",
+    "ShardResultValidationError",
+    "SystemExecutionMode",
     "SystemExecutionPlan",
+    "SystemMergePlan",
     "SystemPressure",
+    "SystemShardResult",
+    "SystemShardTask",
     "SystemTransferIn",
     "SystemTransferOut",
     "active_system_pressures",
     "build_system_shard",
+    "commit_system_merge",
     "entity_system_id",
     "has_unassigned_active_entities",
     "log_group_hotspot",
     "merge_system_results",
+    "normalize_system_namespace",
+    "parallel_worker_probe",
     "plan_system_execution",
+    "prepare_system_merge",
     "replace_task_combat",
     "run_system_group",
     "sanitize_combat_for_worker",
+    "stable_system_seed",
+    "validate_parallel_capability",
+    "validate_shard_result",
 ]

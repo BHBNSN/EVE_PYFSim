@@ -3968,7 +3968,7 @@ def build_world_from_manual_setup(
     for squad_key, ship_ids in ships_per_squad.items():
         leader_candidates = leader_candidates_per_squad.get(squad_key) or ship_ids
         if leader_candidates:
-            world.squad_leaders[squad_key] = random.choice(leader_candidates)
+            world.squad_leaders[squad_key] = min(str(ship_id) for ship_id in leader_candidates)
 
     return world
 

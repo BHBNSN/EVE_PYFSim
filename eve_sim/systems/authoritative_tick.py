@@ -110,6 +110,7 @@ class AuthoritativeTickMixin:
             module_id=module_id,
             rng_seed=int(self._event_rng_seed),
             rng_counter=int(self._event_rng_counter),
+            system_id=str(self._system_id),
             payload=dict(payload),
         )
         self._event_rng_counter += 1

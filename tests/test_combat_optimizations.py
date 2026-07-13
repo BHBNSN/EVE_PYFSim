@@ -783,7 +783,11 @@ class CombatOptimizationTests(unittest.TestCase):
 
     def _make_engine(self, world: WorldState, *, tick_rate: int = 1, physics_substeps: int = 1) -> SimulationEngine:
         combat = CombatSystem(PyfaBridge())
-        engine = SimulationEngine(world, EngineConfig(tick_rate=tick_rate, physics_substeps=physics_substeps), combat)
+        engine = SimulationEngine(
+            world,
+            EngineConfig(tick_rate=tick_rate, physics_substeps=physics_substeps, isolate_systems=False),
+            combat,
+        )
         for ship_id in world.ships:
             engine.register_ship(ship_id)
         return engine
@@ -796,7 +800,7 @@ class CombatOptimizationTests(unittest.TestCase):
         before_step_callbacks: list[Callable[[WorldState], None] | None] | None = None,
     ) -> list[list[ResolveCall]]:
         combat = CombatSystem(PyfaBridge())
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), combat)
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False), combat)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
@@ -1031,7 +1035,7 @@ class CombatOptimizationTests(unittest.TestCase):
             world.ships[ship.ship_id] = ship
 
         combat = CombatSystem(PyfaBridge())
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), combat)
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False), combat)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
@@ -1337,7 +1341,7 @@ Remote Sensor Dampener II
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
 
         combat = CombatSystem(PyfaBridge())
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4), combat)
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4, isolate_systems=False), combat)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
@@ -1401,7 +1405,7 @@ Remote Sensor Dampener II
         ship = _make_ship("ship-fixed-substeps", [])
         world = WorldState(ships={ship.ship_id: ship})
         combat = CombatSystem(PyfaBridge())
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4), combat)
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4, isolate_systems=False), combat)
         engine.register_ship(ship.ship_id)
 
         with patch.object(combat, "recommended_time_slice", side_effect=AssertionError("dynamic slice disabled")), patch.object(
@@ -1419,7 +1423,7 @@ Remote Sensor Dampener II
         combat = CombatSystem(PyfaBridge())
 
         with patch("eve_sim.simulation_engine.prewarm_world_base_cache", return_value=0) as prewarm_world:
-            SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), combat)
+            SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False), combat)
 
         prewarm_world.assert_called_once_with(world)
 
@@ -1432,7 +1436,7 @@ Remote Sensor Dampener II
             "eve_sim.simulation_engine.prewarm_runtime_base_cache",
             return_value=True,
         ) as prewarm_runtime:
-            engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), combat)
+            engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False), combat)
             engine.register_ship(ship.ship_id)
 
         prewarm_runtime.assert_called_once_with(ship.runtime)
@@ -1805,7 +1809,11 @@ Remote Sensor Dampener II
         )
         ship = _make_ship("ship-passive-snapshot", [passive_module])
         world = WorldState(ships={ship.ship_id: ship})
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
+        engine = SimulationEngine(
+            world,
+            EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False),
+            CombatSystem(PyfaBridge()),
+        )
 
         snapshot = engine.snapshot()
 
@@ -3969,7 +3977,11 @@ Heavy Gremlin Compact Energy Neutralizer
     def test_real_fit_propulsion_activation_updates_speed_cap(self) -> None:
         ship = _make_pyfa_ship_from_fit_text(_ROKH_PROPULSION_FIT, ship_id="rokh-propulsion-real")
         world = WorldState(ships={ship.ship_id: ship})
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
+        engine = SimulationEngine(
+            world,
+            EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False),
+            CombatSystem(PyfaBridge()),
+        )
         engine.register_ship(ship.ship_id)
 
         assert ship.runtime is not None
@@ -3996,7 +4008,7 @@ Heavy Gremlin Compact Energy Neutralizer
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
         combat = CombatSystem(PyfaBridge())
         world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4), combat)
+        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4, isolate_systems=False), combat)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 

@@ -133,8 +133,10 @@ class BubblesMixin:
         duration_sec = max(0.0, float(effect.local_add.get("bubble_duration_sec", 0.0) or 0.0))
         if radius_m <= 0.0 or duration_sec <= 0.0 or self._bubble_follows_owner(effect):
             return
+        system_id = str(getattr(source.nav, "system_id", "") or "")
+        namespace = normalize_system_namespace(system_id or self._system_id or "legacy")
         self._bubble_seq += 1
-        field_id = f"bubble:{self._bubble_seq}"
+        field_id = f"bubble:{namespace}:{self._bubble_seq}"
         shield_max = max(0.0, float(effect.local_add.get("bubble_shield_hp", 0.0) or 0.0))
         armor_max = max(0.0, float(effect.local_add.get("bubble_armor_hp", 0.0) or 0.0))
         structure_max = max(0.0, float(effect.local_add.get("bubble_structure_hp", 0.0) or 0.0))
@@ -150,7 +152,7 @@ class BubblesMixin:
             position=Vector2(source.nav.position.x, source.nav.position.y),
             radius_m=radius_m,
             expires_at=float(world.now) + duration_sec,
-            system_id=str(getattr(source.nav, "system_id", "") or ""),
+            system_id=system_id,
             blocks_warp=self._bubble_blocks_warp(effect),
             speed_factor_mult=self._bubble_speed_factor_mult(effect),
             anchor_ship_id=None,

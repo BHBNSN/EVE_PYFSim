@@ -1422,6 +1422,11 @@ class DeployableSystem:
         for owner in world.ships.values():
             if not owner.vital.alive:
                 continue
+            if str(getattr(owner.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW") in {
+                "FOLLOW_LEADER_SYSTEM",
+                "WARP_TO_LEADER",
+            }:
+                continue
             self._process_pending_owner_commands(world, owner)
             self._resolve_owner_drone_focus(world, owner)
 
@@ -1431,6 +1436,11 @@ class DeployableSystem:
             owner = world.ships.get(drone.owner_ship_id)
             if not self._update_asset_connection(world, drone, owner):
                 continue
+            if owner is not None and str(getattr(owner.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW") in {
+                "FOLLOW_LEADER_SYSTEM",
+                "WARP_TO_LEADER",
+            }:
+                drone.target_id = None
             if drone.state == "recalling":
                 if advance_physics:
                     recovered = self._drive_asset_to_owner(world, drone, owner, dt)
@@ -1470,6 +1480,11 @@ class DeployableSystem:
             owner = world.ships.get(fighter.owner_ship_id)
             if not self._update_asset_connection(world, fighter, owner):
                 continue
+            if owner is not None and str(getattr(owner.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW") in {
+                "FOLLOW_LEADER_SYSTEM",
+                "WARP_TO_LEADER",
+            }:
+                fighter.target_id = None
             if apply_effects:
                 self._advance_fighter_timers(fighter, dt)
                 self._activate_pending_fighter_mwd(fighter)

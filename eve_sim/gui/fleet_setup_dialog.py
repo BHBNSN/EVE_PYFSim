@@ -199,6 +199,9 @@ class FleetSetupDialog(QDialog):
         self.lbl_cfg_lockstep = QLabel(settings_tab)
         self.chk_cfg_lockstep = QCheckBox(settings_tab)
 
+        self.lbl_cfg_parallel_systems = QLabel(settings_tab)
+        self.chk_cfg_parallel_systems = QCheckBox(settings_tab)
+
         self.lbl_cfg_detailed_log = QLabel(settings_tab)
         self.chk_cfg_detailed_log = QCheckBox(settings_tab)
 
@@ -224,6 +227,7 @@ class FleetSetupDialog(QDialog):
         settings_form.addRow(self.lbl_cfg_tick_rate, self.spin_cfg_tick_rate)
         settings_form.addRow(self.lbl_cfg_substeps, self.spin_cfg_substeps)
         settings_form.addRow(self.lbl_cfg_lockstep, self.chk_cfg_lockstep)
+        settings_form.addRow(self.lbl_cfg_parallel_systems, self.chk_cfg_parallel_systems)
         settings_form.addRow(self.lbl_cfg_detailed_log, self.chk_cfg_detailed_log)
         settings_form.addRow(self.lbl_cfg_hotspot_log, self.chk_cfg_hotspot_log)
         settings_form.addRow(self.lbl_cfg_log_file, self.edit_cfg_log_file)
@@ -287,6 +291,7 @@ class FleetSetupDialog(QDialog):
         self.combo_cfg_map.currentIndexChanged.connect(self._on_engine_pref_changed)
         self.btn_cfg_edit_map.clicked.connect(self._open_map_editor)
         self.chk_cfg_lockstep.toggled.connect(self._on_engine_pref_changed)
+        self.chk_cfg_parallel_systems.toggled.connect(self._on_engine_pref_changed)
         self.chk_cfg_detailed_log.toggled.connect(self._on_engine_pref_changed)
         self.chk_cfg_hotspot_log.toggled.connect(self._on_engine_pref_changed)
         self.edit_cfg_log_file.textChanged.connect(self._on_engine_pref_changed)
@@ -496,6 +501,9 @@ class FleetSetupDialog(QDialog):
         self.btn_cfg_edit_map.setText(QCoreApplication.translate("eve_sim", 'Edit...'))
         self.lbl_cfg_tick_rate.setText(QCoreApplication.translate("eve_sim", 'Tick Rate (Hz)'))
         self.lbl_cfg_substeps.setText(QCoreApplication.translate("eve_sim", 'Physics Substeps'))
+        self.lbl_cfg_parallel_systems.setText(
+            QCoreApplication.translate("eve_sim", 'Enable experimental multi-system processes')
+        )
         self.lbl_cfg_lockstep.setText(QCoreApplication.translate("eve_sim", 'Lockstep'))
         self.lbl_cfg_detailed_log.setText(QCoreApplication.translate("eve_sim", 'Detailed Logging'))
         self.lbl_cfg_hotspot_log.setText(QCoreApplication.translate("eve_sim", 'Hotspot Timing Logging'))
@@ -513,6 +521,7 @@ class FleetSetupDialog(QDialog):
         self.spin_cfg_tick_rate.setEnabled(enabled)
         self.spin_cfg_substeps.setEnabled(enabled)
         self.chk_cfg_lockstep.setEnabled(enabled)
+        self.chk_cfg_parallel_systems.setEnabled(enabled)
         self.chk_cfg_detailed_log.setEnabled(enabled)
         self.chk_cfg_hotspot_log.setEnabled(enabled)
         self.edit_cfg_log_file.setEnabled(enabled)
@@ -529,6 +538,7 @@ class FleetSetupDialog(QDialog):
             self.spin_cfg_tick_rate.setValue(max(1, int(self._pref.engine_tick_rate)))
             self.spin_cfg_substeps.setValue(max(1, int(self._pref.engine_physics_substeps)))
             self.chk_cfg_lockstep.setChecked(bool(self._pref.engine_lockstep))
+            self.chk_cfg_parallel_systems.setChecked(bool(self._pref.engine_parallel_systems))
             self.chk_cfg_detailed_log.setChecked(bool(self._pref.engine_detailed_logging))
             self.chk_cfg_hotspot_log.setChecked(bool(self._pref.engine_hotspot_logging))
             log_path = str(self._pref.engine_detail_log_file or "").strip() or defaults.detail_log_file
@@ -547,6 +557,7 @@ class FleetSetupDialog(QDialog):
         self._pref.engine_tick_rate = max(1, int(self.spin_cfg_tick_rate.value()))
         self._pref.engine_physics_substeps = max(1, int(self.spin_cfg_substeps.value()))
         self._pref.engine_lockstep = bool(self.chk_cfg_lockstep.isChecked())
+        self._pref.engine_parallel_systems = bool(self.chk_cfg_parallel_systems.isChecked())
         self._pref.engine_detailed_logging = bool(self.chk_cfg_detailed_log.isChecked())
         self._pref.engine_hotspot_logging = bool(self.chk_cfg_hotspot_log.isChecked())
         self._pref.engine_detail_log_file = self.edit_cfg_log_file.text().strip() or defaults.detail_log_file
@@ -560,6 +571,8 @@ class FleetSetupDialog(QDialog):
             tick_rate=max(1, int(self.spin_cfg_tick_rate.value())),
             physics_substeps=max(1, int(self.spin_cfg_substeps.value())),
             lockstep=bool(self.chk_cfg_lockstep.isChecked()),
+            isolate_systems=True,
+            parallel_systems=bool(self.chk_cfg_parallel_systems.isChecked()),
             detailed_logging=bool(self.chk_cfg_detailed_log.isChecked()),
             hotspot_logging=bool(self.chk_cfg_hotspot_log.isChecked()),
             detail_log_file=self.edit_cfg_log_file.text().strip() or defaults.detail_log_file,

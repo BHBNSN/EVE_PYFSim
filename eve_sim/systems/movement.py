@@ -459,6 +459,10 @@ class MovementSystem:
     def _prepare_warp_alignment(self, world: WorldState, ship) -> None:
         if str(ship.nav.warp.phase or "idle") != "align":
             return
+        if not self._follow_command_is_current(world, ship):
+            self._cancel_warp(ship)
+            self._clear_gate_transit(ship)
+            return
         if self._ship_is_scrammed(ship):
             self._cancel_warp(ship)
             return
@@ -544,18 +548,13 @@ class MovementSystem:
             cloak.expires_at = float(world.now) + self.STARGATE_GATE_CLOAK_SEC
             cloak.source = "stargate"
 
-        leader_key = f"{ship.team.value}:{ship.squad_id}"
-        leader_id = str(world.squad_leaders.get(leader_key, "") or "")
-        if leader_id and leader_id != ship.ship_id:
-            ship.nav.follow_hold_active = True
-            ship.nav.follow_hold_leader_id = leader_id
-        else:
-            ship.nav.follow_hold_active = False
-            ship.nav.follow_hold_leader_id = None
-
     def _prepare_gate_transit(self, world: WorldState, ship) -> None:
         target_structure_id = str(getattr(getattr(ship.nav, "gate", None), "target_structure_id", "") or "").strip()
         if not target_structure_id:
+            return
+        if not self._follow_command_is_current(world, ship):
+            self._clear_gate_transit(ship)
+            self._cancel_warp(ship)
             return
         structure = world.structures.get(target_structure_id)
         if structure is None or str(getattr(structure, "kind", "") or "").upper() != "STARGATE":
@@ -585,6 +584,24 @@ class MovementSystem:
         ship.nav.command_target_structure_id = str(target_structure_id)
         ship.nav.command_range_m = activation_range
         ship.nav.command_target = Vector2(structure.position.x, structure.position.y)
+
+    @staticmethod
+    def _follow_command_is_current(world: WorldState, ship) -> bool:
+        state = str(getattr(ship.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW")
+        if state not in {"FOLLOW_LEADER_SYSTEM", "WARP_TO_LEADER"}:
+            return True
+        squad_key = f"{ship.team.value}:{ship.squad_id}"
+        location = world.squad_leader_locations.get(squad_key)
+        if location is None:
+            return False
+        if str(getattr(ship.nav, "squad_follow_leader_id", "") or "") != location.leader_id:
+            return False
+        if int(getattr(ship.nav, "squad_follow_leader_location_version", -1)) != int(location.location_version):
+            return False
+        ship_system = str(getattr(ship.nav, "system_id", "") or "")
+        if state == "FOLLOW_LEADER_SYSTEM":
+            return ship_system != location.system_id
+        return ship_system == location.system_id
 
     def _update_gate_cloak(self, world: WorldState, ship) -> None:
         if not self._ship_is_gate_cloaked(ship, float(world.now)):

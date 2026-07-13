@@ -291,7 +291,7 @@ class MapSystemTests(unittest.TestCase):
         self.assertEqual(ship.nav.system_id, "alpha")
         self.assertAlmostEqual(ship.nav.position.distance_to(source_gate.position), 0.0, delta=0.01)
 
-    def test_gate_use_applies_gate_cloak_and_follow_hold(self) -> None:
+    def test_gate_use_applies_gate_cloak_with_global_leader_state(self) -> None:
         map_definition = _dual_gate_test_map()
         world = build_world_from_manual_setup([], map_definition=map_definition)
         source_gate = world.structures["alpha_gate_to_beta"]
@@ -326,9 +326,9 @@ class MapSystemTests(unittest.TestCase):
             self.assertTrue(ship.nav.cloak.active)
             self.assertAlmostEqual(ship.nav.cloak.expires_at, world.now + 60.0, delta=0.01)
             self.assertIsNone(ship.nav.gate.target_structure_id)
-        self.assertFalse(leader.nav.follow_hold_active)
-        self.assertTrue(follower.nav.follow_hold_active)
-        self.assertEqual(follower.nav.follow_hold_leader_id, leader.ship_id)
+        self.assertEqual(leader.nav.squad_follow_state, "FORMATION_FOLLOW")
+        self.assertEqual(follower.nav.squad_follow_state, "FORMATION_FOLLOW")
+        self.assertEqual(world.squad_leaders["BLUE:BLUE-ALPHA"], leader.ship_id)
 
     def test_perception_ignores_gate_cloaked_ships(self) -> None:
         world = WorldState()

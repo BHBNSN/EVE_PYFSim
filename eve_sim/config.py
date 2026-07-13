@@ -14,6 +14,12 @@ class EngineConfig:
     parallel_systems: bool = False
     parallel_system_workers: int = 0
     parallel_system_target_pressure: float = 96.0
+    parallel_system_timeout_sec: float = 30.0
+    parallel_system_preflight: bool = True
+    parallel_system_disable_after_failure: bool = True
+    parallel_system_worker_start_method: str = "spawn"
+    parallel_system_strict_validation: bool = True
+    simulation_seed: int = 0
     tidi_min_factor: float = 0.1
     detailed_logging: bool = False
     hotspot_logging: bool = False

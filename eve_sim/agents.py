@@ -1,57 +1,105 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import random
 
 from .math2d import Vector2
-from .models import FleetIntent, Order, ShipEntity, Team
+from .models import FleetIntent, Order, ShipEntity, SquadLeaderLocation, Team
 from .world import WorldState
 
 
-def _ship_warp_idle(ship: ShipEntity) -> bool:
-    return str(getattr(getattr(ship.nav, "warp", None), "phase", "idle") or "idle") == "idle"
+FOLLOW_LEADER_SYSTEM = "FOLLOW_LEADER_SYSTEM"
+WARP_TO_LEADER = "WARP_TO_LEADER"
+FORMATION_FOLLOW = "FORMATION_FOLLOW"
+WARP_FOLLOW_TRIGGER_DISTANCE_M = 170_000.0
+WARP_FOLLOW_RESET_DISTANCE_M = 150_000.0
 
 
-def _valid_squad_leader_candidate(ship: ShipEntity | None, team: Team, squad_id: str, *, require_idle: bool) -> bool:
-    if ship is None or not ship.vital.alive or ship.team != team or ship.squad_id != squad_id:
-        return False
-    return (not require_idle) or _ship_warp_idle(ship)
+def _squad_key(team: Team, squad_id: str) -> str:
+    return f"{team.value}:{squad_id}"
 
 
-def _alive_squad_leader_candidates(world: WorldState, team: Team, squad_id: str, *, require_idle: bool) -> list[ShipEntity]:
-    return [
-        s
-        for s in world.ships.values()
-        if _valid_squad_leader_candidate(s, team, squad_id, require_idle=require_idle)
-    ]
+def _valid_squad_leader_candidate(ship: ShipEntity | None, team: Team, squad_id: str) -> bool:
+    return bool(ship is not None and ship.vital.alive and ship.team == team and ship.squad_id == squad_id)
 
 
-def _choose_squad_leader(world: WorldState, team: Team, squad_id: str, *, require_idle: bool = False) -> ShipEntity | None:
-    squad_key = f"{team.value}:{squad_id}"
-    mapped_id = str(world.squad_leaders.get(squad_key, "") or "")
-    mapped_ship = world.ships.get(mapped_id) if mapped_id else None
-    if _valid_squad_leader_candidate(mapped_ship, team, squad_id, require_idle=require_idle):
-        return mapped_ship
-
-    members = _alive_squad_leader_candidates(world, team, squad_id, require_idle=require_idle)
-    if not members:
+def _replacement_leader(
+    candidates: list[ShipEntity],
+    previous_ship: ShipEntity | None,
+    previous_location: SquadLeaderLocation | None,
+) -> ShipEntity | None:
+    if not candidates:
         return None
+    previous_system = str(
+        previous_location.system_id
+        if previous_location is not None
+        else getattr(getattr(previous_ship, "nav", None), "system_id", "") or ""
+    )
+    previous_group = str(getattr(previous_ship, "ship_group_id", "") or "")
 
-    previous_group_id = str(getattr(mapped_ship, "ship_group_id", "") or "") if mapped_ship is not None else ""
-    if previous_group_id:
-        same_group_members = [
-            member
-            for member in members
-            if str(getattr(member, "ship_group_id", "") or "") == previous_group_id
-        ]
-        if same_group_members:
-            leader = random.choice(same_group_members)
-            world.squad_leaders[squad_key] = leader.ship_id
-            return leader
+    def priority(ship: ShipEntity) -> tuple[int, int, str]:
+        same_system = bool(previous_system) and str(ship.nav.system_id or "") == previous_system
+        same_group = bool(previous_group) and str(ship.ship_group_id or "") == previous_group
+        if same_system and same_group:
+            locality = 0
+        elif same_system:
+            locality = 1
+        elif same_group:
+            locality = 2
+        else:
+            locality = 3
+        return locality, int(getattr(ship, "command_priority", 0) or 0), str(ship.ship_id)
 
-    leader = random.choice(members)
-    world.squad_leaders[squad_key] = leader.ship_id
-    return leader
+    return min(candidates, key=priority)
+
+
+def refresh_global_squad_leaders(world: WorldState) -> None:
+    """Elect one deterministic leader per squad and refresh its read-only location snapshot."""
+    members_by_key: dict[str, list[ShipEntity]] = {}
+    for ship in world.ships.values():
+        if ship.vital.alive:
+            members_by_key.setdefault(_squad_key(ship.team, ship.squad_id), []).append(ship)
+
+    active_keys = set(members_by_key)
+    active_keys.update(str(key) for key in world.squad_leaders)
+    for squad_key in sorted(active_keys):
+        candidates = members_by_key.get(squad_key, [])
+        mapped_id = str(world.squad_leaders.get(squad_key, "") or "")
+        mapped_ship = world.ships.get(mapped_id)
+        previous_location = world.squad_leader_locations.get(squad_key)
+        if mapped_ship is not None and mapped_ship.vital.alive and any(ship.ship_id == mapped_ship.ship_id for ship in candidates):
+            leader = mapped_ship
+        else:
+            leader = _replacement_leader(candidates, mapped_ship, previous_location)
+
+        if leader is None:
+            world.squad_leaders.pop(squad_key, None)
+            world.squad_leader_locations.pop(squad_key, None)
+            world.squad_leader_location_versions.pop(squad_key, None)
+            world.squad_focus_queues.pop(squad_key, None)
+            world.squad_focus_updated_at.pop(squad_key, None)
+            world.squad_leader_speed_limits.pop(squad_key, None)
+            continue
+
+        leader_id = str(leader.ship_id)
+        leader_system = str(leader.nav.system_id or "")
+        old_id = previous_location.leader_id if previous_location is not None else mapped_id
+        old_system = previous_location.system_id if previous_location is not None else leader_system
+        version = int(world.squad_leader_location_versions.get(squad_key, 0) or 0)
+        if previous_location is not None and (old_id != leader_id or old_system != leader_system):
+            version += 1
+        if previous_location is not None and old_system != leader_system:
+            world.squad_focus_queues.pop(squad_key, None)
+            world.squad_focus_updated_at.pop(squad_key, None)
+
+        world.squad_leaders[squad_key] = leader_id
+        world.squad_leader_location_versions[squad_key] = version
+        world.squad_leader_locations[squad_key] = SquadLeaderLocation(
+            leader_id=leader_id,
+            system_id=leader_system,
+            location_version=version,
+        )
 
 
 @dataclass(slots=True)
@@ -85,18 +133,6 @@ class ShipAgent(BaseAgent):
         return f"{team.value}:{squad_id}"
 
     @staticmethod
-    def _leader_motion_active(leader: ShipEntity | None) -> bool:
-        if leader is None or not leader.vital.alive:
-            return False
-        if leader.nav.command_target is not None:
-            return True
-        if str(getattr(getattr(leader.nav, "warp", None), "phase", "idle") or "idle") != "idle":
-            return True
-        if str(getattr(getattr(leader.nav, "gate", None), "target_structure_id", "") or "").strip():
-            return True
-        return leader.nav.velocity.length() > 5.0
-
-    @staticmethod
     def _clear_navigation_command(ship: ShipEntity) -> None:
         ship.nav.command_target = None
         ship.nav.command_mode = "move"
@@ -105,17 +141,210 @@ class ShipAgent(BaseAgent):
         ship.nav.command_range_m = 0.0
         ship.nav.command_orbit_clockwise = True
 
+    @classmethod
+    def _cancel_warp(cls, ship: ShipEntity) -> None:
+        warp = ship.nav.warp
+        warp.phase = "idle"
+        warp.target_position = None
+        warp.target_ship_id = None
+        warp.target_beacon_id = None
+        warp.align_elapsed = 0.0
+        warp.origin = None
+        warp.destination = None
+        warp.warp_distance_m = 0.0
+        warp.warp_duration = 0.0
+        warp.warp_elapsed = 0.0
+        warp.capacitor_cost = 0.0
+        warp.bubble_immune_snapshot = False
+        warp.interdiction_snapshots_captured = False
+        warp.interdiction_snapshots = tuple()
+        cls._clear_navigation_command(ship)
+
+    @classmethod
+    def _begin_warp(
+        cls,
+        ship: ShipEntity,
+        target_position: Vector2,
+        *,
+        target_ship_id: str | None = None,
+        target_beacon_id: str | None = None,
+    ) -> None:
+        cls._cancel_warp(ship)
+        warp = ship.nav.warp
+        warp.phase = "align"
+        warp.target_position = Vector2(target_position.x, target_position.y)
+        warp.target_ship_id = target_ship_id
+        warp.target_beacon_id = target_beacon_id
+
+    @staticmethod
+    def _clear_combat_for_follow(ship: ShipEntity) -> None:
+        ship.order_queue = [order for order in ship.order_queue if order.kind not in {"ATTACK", "MOVE", "WARP", "USE_STARGATE"}]
+        ship.combat.current_target = None
+        ship.combat.last_attack_target = None
+        ship.combat.projected_targets.clear()
+
+    @staticmethod
+    def _next_gate_toward(world: WorldState, source_system: str, target_system: str):
+        if not source_system or not target_system or source_system == target_system:
+            return None
+        edges: dict[str, list[tuple[str, str]]] = {}
+        for gate_id, gate in world.structures.items():
+            if str(getattr(gate, "kind", "") or "").upper() != "STARGATE":
+                continue
+            linked_id = str(getattr(gate, "linked_structure_id", "") or "").strip()
+            linked = world.structures.get(linked_id)
+            if linked is None:
+                continue
+            gate_system = str(getattr(gate, "system_id", "") or "")
+            linked_system = str(getattr(linked, "system_id", "") or "")
+            if gate_system and linked_system and gate_system != linked_system:
+                edges.setdefault(gate_system, []).append((linked_system, str(gate_id)))
+        for values in edges.values():
+            values.sort(key=lambda item: (item[0], item[1]))
+
+        pending = deque([(source_system, None)])
+        visited = {source_system}
+        while pending:
+            current_system, first_gate_id = pending.popleft()
+            for next_system, gate_id in edges.get(current_system, []):
+                if next_system in visited:
+                    continue
+                next_first_gate = first_gate_id or gate_id
+                if next_system == target_system:
+                    return world.structures.get(next_first_gate)
+                visited.add(next_system)
+                pending.append((next_system, next_first_gate))
+        return None
+
+    @staticmethod
+    def _leader_location(world: WorldState, ship: ShipEntity) -> SquadLeaderLocation | None:
+        return world.squad_leader_locations.get(_squad_key(ship.team, ship.squad_id))
+
+    @classmethod
+    def _configure_cross_system_follow(
+        cls,
+        world: WorldState,
+        ship: ShipEntity,
+        location: SquadLeaderLocation,
+    ) -> None:
+        cls._clear_combat_for_follow(ship)
+        ship.nav.squad_follow_state = FOLLOW_LEADER_SYSTEM
+        ship.nav.squad_follow_leader_id = location.leader_id
+        ship.nav.squad_follow_leader_location_version = int(location.location_version)
+
+        source_system = str(ship.nav.system_id or "")
+        gate = cls._next_gate_toward(world, source_system, location.system_id)
+        if gate is None:
+            cls._cancel_warp(ship)
+            ship.nav.gate.target_structure_id = None
+            return
+
+        gate_id = str(gate.structure_id)
+        warp_phase = str(ship.nav.warp.phase or "idle")
+        if warp_phase != "idle" and str(ship.nav.warp.target_beacon_id or "") != gate_id:
+            cls._cancel_warp(ship)
+            warp_phase = "idle"
+        ship.nav.gate.target_structure_id = gate_id
+        distance = ship.nav.position.distance_to(gate.position)
+        if (
+            distance > WARP_FOLLOW_TRIGGER_DISTANCE_M
+            and warp_phase == "idle"
+            and float(getattr(ship.profile, "warp_scramble_status", 0.0) or 0.0) <= 0.0
+        ):
+            cls._begin_warp(ship, gate.position, target_beacon_id=gate_id)
+            ship.nav.gate.target_structure_id = gate_id
+        elif distance <= WARP_FOLLOW_TRIGGER_DISTANCE_M and warp_phase == "align":
+            cls._cancel_warp(ship)
+            ship.nav.gate.target_structure_id = gate_id
+
+    @classmethod
+    def _apply_squad_follow_state(
+        cls,
+        world: WorldState,
+        ship: ShipEntity,
+        leader: ShipEntity | None,
+    ) -> bool:
+        location = cls._leader_location(world, ship)
+        if location is None:
+            ship.nav.squad_follow_state = FORMATION_FOLLOW
+            ship.nav.squad_follow_leader_id = None
+            return False
+
+        version_changed = (
+            ship.nav.squad_follow_leader_id != location.leader_id
+            or int(ship.nav.squad_follow_leader_location_version) != int(location.location_version)
+        )
+        if version_changed and ship.nav.squad_follow_leader_id is not None:
+            cls._cancel_warp(ship)
+            ship.nav.gate.target_structure_id = None
+
+        ship.nav.squad_follow_leader_id = location.leader_id
+        ship.nav.squad_follow_leader_location_version = int(location.location_version)
+        if ship.ship_id == location.leader_id:
+            ship.nav.squad_follow_state = FORMATION_FOLLOW
+            ship.nav.squad_follow_warp_ready = True
+            return False
+
+        if str(ship.nav.system_id or "") != location.system_id:
+            cls._configure_cross_system_follow(world, ship, location)
+            return True
+
+        if leader is None or not leader.vital.alive or str(leader.nav.system_id or "") != str(ship.nav.system_id or ""):
+            cls._configure_cross_system_follow(world, ship, location)
+            return True
+
+        ship.nav.gate.target_structure_id = None
+        distance = ship.nav.position.distance_to(leader.nav.position)
+        warp_phase = str(ship.nav.warp.phase or "idle")
+        if warp_phase != "idle" and str(ship.nav.warp.target_ship_id or "") != leader.ship_id:
+            cls._clear_combat_for_follow(ship)
+            ship.nav.squad_follow_state = WARP_TO_LEADER
+            return True
+
+        if distance < WARP_FOLLOW_RESET_DISTANCE_M:
+            if warp_phase == "align":
+                cls._cancel_warp(ship)
+            ship.nav.squad_follow_state = FORMATION_FOLLOW
+            ship.nav.squad_follow_warp_ready = True
+            return False
+
+        if distance > WARP_FOLLOW_TRIGGER_DISTANCE_M:
+            cls._clear_combat_for_follow(ship)
+            ship.nav.squad_follow_state = WARP_TO_LEADER
+            if (
+                warp_phase == "idle"
+                and bool(ship.nav.squad_follow_warp_ready)
+                and float(getattr(ship.profile, "warp_scramble_status", 0.0) or 0.0) <= 0.0
+            ):
+                cls._begin_warp(ship, leader.nav.position, target_ship_id=leader.ship_id)
+                ship.nav.squad_follow_warp_ready = False
+            return True
+
+        if ship.nav.squad_follow_state == WARP_TO_LEADER:
+            cls._clear_combat_for_follow(ship)
+            return True
+        ship.nav.squad_follow_state = FORMATION_FOLLOW
+        return False
+
     def sense(self, world: WorldState) -> None:
         ship = self._ship(world)
         self.perception_buffer = ship.perception.copy()
 
     @staticmethod
     def _find_squad_leader(world: WorldState, ship: ShipEntity) -> ShipEntity | None:
-        return _choose_squad_leader(world, ship.team, ship.squad_id, require_idle=True)
+        leader_id = str(world.squad_leaders.get(_squad_key(ship.team, ship.squad_id), "") or "")
+        leader = world.ships.get(leader_id)
+        return leader if _valid_squad_leader_candidate(leader, ship.team, ship.squad_id) else None
 
     def think(self, world: WorldState) -> None:
         ship = self._ship(world)
         if not ship.vital.alive:
+            return
+
+        leader = self._find_squad_leader(world, ship)
+        is_leader = leader is not None and leader.ship_id == ship.ship_id
+        if self._apply_squad_follow_state(world, ship, leader):
+            self.current_order = None
             return
 
         if self.current_order and self.current_order.kind == "ATTACK":
@@ -126,9 +355,6 @@ class ShipAgent(BaseAgent):
                 self.current_order = None
                 ship.combat.current_target = None
                 ship.combat.last_attack_target = None
-
-        leader = self._find_squad_leader(world, ship)
-        is_leader = leader is not None and leader.ship_id == ship.ship_id
 
         if ship.order_queue:
             oldest = ship.order_queue[0]
@@ -194,21 +420,15 @@ class ShipAgent(BaseAgent):
                 ship.nav.command_target = move_target
 
         if not is_leader and leader is not None:
-            hold_active = bool(getattr(ship.nav, "follow_hold_active", False))
-            hold_leader_id = str(getattr(ship.nav, "follow_hold_leader_id", "") or "")
-            if hold_active and (not hold_leader_id or hold_leader_id == leader.ship_id):
-                if not self._leader_motion_active(leader):
-                    ship.nav.command_target = None
-                else:
-                    ship.nav.follow_hold_active = False
-                    ship.nav.follow_hold_leader_id = None
-            if not bool(getattr(ship.nav, "follow_hold_active", False)):
-                to_leader = leader.nav.position - ship.nav.position
-                dist = to_leader.length()
-                if dist > max(600.0, ship.nav.radius * 6.0):
-                    ship.nav.command_target = leader.nav.position
-                else:
-                    ship.nav.command_target = None
+            to_leader = leader.nav.position - ship.nav.position
+            dist = to_leader.length()
+            if dist > max(600.0, ship.nav.radius * 6.0):
+                ship.nav.command_target = Vector2(leader.nav.position.x, leader.nav.position.y)
+                ship.nav.command_mode = "move"
+                ship.nav.command_target_ship_id = None
+                ship.nav.command_target_structure_id = None
+            else:
+                ship.nav.command_target = None
 
         if self.current_order and self.current_order.kind == "ATTACK":
             ship.combat.current_target = self.current_order.payload.get("target_id")
@@ -238,33 +458,26 @@ class CommanderAgent(BaseAgent):
 
     @staticmethod
     def _alive_members(world: WorldState, squad_id: str, team: Team) -> list[ShipEntity]:
+        squad_key = _squad_key(team, squad_id)
+        location = world.squad_leader_locations.get(squad_key)
+        leader_system = location.system_id if location is not None else None
         members = [
             s
             for s in world.ships.values()
             if s.squad_id == squad_id
             and s.team == team
             and s.vital.alive
-            and str(getattr(getattr(s.nav, "warp", None), "phase", "idle") or "idle") == "idle"
+            and (leader_system is None or str(s.nav.system_id or "") == leader_system)
         ]
         members.sort(key=lambda s: s.ship_id)
         return members
-
-    @staticmethod
-    def _current_target_of(members: list[ShipEntity], world: WorldState) -> str | None:
-        for ship in members:
-            target_id = ship.combat.current_target
-            if not target_id:
-                continue
-            target = world.combat_entity(target_id)
-            if target is not None and target.vital.alive and target.team != ship.team:
-                return target_id
-        return None
 
     @staticmethod
     def _sanitize_queue(world: WorldState, members: list[ShipEntity], queue: list[str]) -> list[str]:
         if not members:
             return []
         own_team = members[0].team
+        system_id = str(members[0].nav.system_id or "")
         seen: set[str] = set()
         out: list[str] = []
         for target_id in queue:
@@ -276,6 +489,7 @@ class CommanderAgent(BaseAgent):
                 or not target.vital.alive
                 or str(getattr(getattr(target.nav, "warp", None), "phase", "idle") or "idle") != "idle"
                 or target.team == own_team
+                or str(getattr(target.nav, "system_id", "") or "") != system_id
             ):
                 continue
             seen.add(target_id)
@@ -316,6 +530,8 @@ class CommanderAgent(BaseAgent):
             ship.combat.current_target = None
             ship.combat.last_attack_target = None
             ship.combat.fire_delay_timers.clear()
+            ship.combat.prelocked_targets.clear()
+            ship.combat.prelock_timers.clear()
 
     @staticmethod
     def _sample_propulsion_delay(ship: ShipEntity) -> float:
@@ -340,6 +556,7 @@ class CommanderAgent(BaseAgent):
         return random.uniform(3.5, 5.0)
 
     def think(self, world: WorldState) -> None:
+        refresh_global_squad_leaders(world)
         for squad in list(self.squad_ids):
             intent_key = self._intent_key(self.team, squad)
             intent = world.intents.pop(intent_key, None)
@@ -357,8 +574,6 @@ class CommanderAgent(BaseAgent):
         if not members:
             world.squad_focus_queues.pop(focus_key, None)
             world.squad_focus_updated_at.pop(focus_key, None)
-            world.squad_prelocked_targets.pop(focus_key, None)
-            world.squad_prelock_timers.pop(focus_key, None)
             return
 
         queue = self._sanitize_queue(world, members, list(world.squad_focus_queues.get(focus_key, [])))
@@ -368,15 +583,13 @@ class CommanderAgent(BaseAgent):
             world.squad_focus_queues[focus_key] = []
             return
 
-        prelocked_by_ship = world.squad_prelocked_targets.get(focus_key, {})
-        prelock_timers_by_ship = world.squad_prelock_timers.get(focus_key, {})
         fallback_target = queue[0]
         next_target = queue[1] if len(queue) > 1 else None
 
         updates: dict[str, str] = {}
         for ship in members:
-            ship_prelocked = prelocked_by_ship.get(ship.ship_id, set())
-            ship_prelock_timers = prelock_timers_by_ship.get(ship.ship_id, {})
+            ship_prelocked = ship.combat.prelocked_targets
+            ship_prelock_timers = ship.combat.prelock_timers
             next_available = bool(next_target) and (
                 (next_target in ship_prelocked) or (next_target in ship_prelock_timers)
             )
@@ -406,8 +619,8 @@ class CommanderAgent(BaseAgent):
                 assigned = updates.get(ship.ship_id)
                 if not assigned:
                     continue
-                ship_prelocked = prelocked_by_ship.get(ship.ship_id, set())
-                ship_prelock_timers = prelock_timers_by_ship.get(ship.ship_id, {})
+                ship_prelocked = ship.combat.prelocked_targets
+                ship_prelock_timers = ship.combat.prelock_timers
                 if assigned in ship_prelocked:
                     ship.combat.lock_targets.add(assigned)
                     ship.combat.lock_started_at.setdefault(assigned, float(world.now))
@@ -426,7 +639,8 @@ class CommanderAgent(BaseAgent):
 
     def _dispatch_intent(self, world: WorldState, intent: FleetIntent) -> None:
         members = self._alive_members(world, intent.squad_id, self.team)
-        leader = _choose_squad_leader(world, self.team, intent.squad_id)
+        leader_id = str(world.squad_leaders.get(_squad_key(self.team, intent.squad_id), "") or "")
+        leader = world.ships.get(leader_id)
         leader_id = leader.ship_id if leader is not None else None
 
         if intent.focus_target:
@@ -474,7 +688,6 @@ class CommanderAgent(BaseAgent):
             if intent.propulsion_active is not None:
                 prop_key = self._focus_key(self.team, intent.squad_id)
                 world.squad_propulsion_commands[prop_key] = bool(intent.propulsion_active)
-                world.squad_propulsion_commands.pop(intent.squad_id, None)
                 ship.order_queue = [o for o in ship.order_queue if o.kind != "PROPULSION"]
                 ship.order_queue.append(
                     Order(

@@ -1,28 +1,39 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import logging
+import multiprocessing
+import random
 import time
 
-from .agents import CommanderAgent, ShipAgent
+from .agents import CommanderAgent, ShipAgent, refresh_global_squad_leaders
 from .config import EngineConfig
 from .fleet_setup import prewarm_runtime_base_cache, prewarm_world_base_cache
-from .pyfa_bridge import PyfaBridge
 from .sim_logging import get_sim_logger, log_sim_event
-from .systems import CombatSystem, DeployableSystem, LogisticsSystem, MovementSystem, PerceptionSystem
+from .system_identity import stable_system_seed
+from .systems import CombatStateCloneError, CombatSystem, DeployableSystem, LogisticsSystem, MovementSystem, PerceptionSystem
 from .system_isolation import (
+    SYSTEM_SHARD_PROTOCOL_VERSION,
+    ParallelCapabilityError,
     SystemExecutionPlan,
+    SystemExecutionMode,
+    SystemGroupResult,
+    SystemShardResult,
     SystemTransferIn,
     build_system_shard,
+    commit_system_merge,
     log_group_hotspot,
     has_unassigned_active_entities,
-    merge_system_results,
+    parallel_worker_probe,
     plan_system_execution,
+    prepare_system_merge,
     replace_task_combat,
     run_system_group,
     sanitize_combat_for_worker,
+    validate_parallel_capability,
+    validate_shard_result,
 )
 from .world import WorldState
 
@@ -52,23 +63,111 @@ class SimulationEngine:
         self.last_step_budget_ms: float = self.nominal_tick_interval_ms()
         self._dt = 1.0 / float(self._configured_tick_rate())
         self._system_combats: dict[str, CombatSystem] = {}
+        self._system_random_states: dict[str, object] = {}
         self._system_executor: ProcessPoolExecutor | None = None
         self._system_executor_workers: int = 0
+        self._parallel_preflight_complete: bool = False
+        self._closed: bool = False
         self.last_system_execution_plan: SystemExecutionPlan = SystemExecutionPlan()
         self.last_system_parallel_error: str | None = None
         self.last_system_transfers: list[SystemTransferIn] = []
+        if (
+            not bool(getattr(config, "isolate_systems", True))
+            or not isinstance(combat_system, CombatSystem)
+        ):
+            self.system_execution_mode = SystemExecutionMode.GLOBAL_LEGACY
+        elif bool(getattr(config, "parallel_systems", False)):
+            self.system_execution_mode = SystemExecutionMode.SHARD_PROCESS
+        else:
+            self.system_execution_mode = SystemExecutionMode.SHARD_SERIAL
+        self.parallel_disabled_reason: str | None = None
+        self.parallel_failure_count: int = 0
+        self.parallel_disabled_at_tick: int | None = None
+        self.last_parallel_tick_duration_ms: float | None = None
+        self.last_serial_fallback_duration_ms: float | None = None
+        self.last_effective_system_execution_mode: str = self.system_execution_mode.value
+        self._fixed_system_executor_workers: int = 0
+        self._isolated_commit_completed: bool = False
         prewarm_world_base_cache(world)
 
-    def shutdown_parallel_workers(self) -> None:
-        if self._system_executor is None:
+    @property
+    def system_executor_workers(self) -> int:
+        return self._system_executor_workers
+
+    @staticmethod
+    def _executor_process_snapshot(executor: ProcessPoolExecutor) -> list:
+        processes = getattr(executor, "_processes", None)
+        return list(processes.values()) if isinstance(processes, dict) else []
+
+    @staticmethod
+    def _process_is_alive(process) -> bool:
+        try:
+            return bool(process.is_alive())
+        except Exception:
+            return False
+
+    def shutdown_parallel_workers(
+        self,
+        *,
+        wait_for_workers: bool = True,
+        force: bool = False,
+        timeout_sec: float = 3.0,
+    ) -> None:
+        executor = self._system_executor
+        if executor is None:
             return
-        self._system_executor.shutdown(wait=False, cancel_futures=True)
         self._system_executor = None
         self._system_executor_workers = 0
+        processes = self._executor_process_snapshot(executor)
+        executor.shutdown(wait=False, cancel_futures=True)
+        if force:
+            for process in processes:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        elif wait_for_workers:
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            for process in processes:
+                try:
+                    process.join(timeout=max(0.0, deadline - time.monotonic()))
+                except Exception:
+                    pass
+        for process in processes:
+            if self._process_is_alive(process):
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        for process in processes:
+            if self._process_is_alive(process):
+                try:
+                    process.join(timeout=1.0)
+                except Exception:
+                    pass
+        for process in processes:
+            if self._process_is_alive(process) and hasattr(process, "kill"):
+                try:
+                    process.kill()
+                    process.join(timeout=1.0)
+                except Exception:
+                    pass
+
+    def close(self, timeout_sec: float = 3.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.shutdown_parallel_workers(wait_for_workers=True, timeout_sec=timeout_sec)
+
+    def __enter__(self) -> "SimulationEngine":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
 
     def __del__(self) -> None:
         try:
-            self.shutdown_parallel_workers()
+            self.shutdown_parallel_workers(wait_for_workers=False, force=True)
         except Exception:
             pass
 
@@ -134,15 +233,36 @@ class SimulationEngine:
             prewarm_runtime_base_cache(getattr(ship, "runtime", None))
 
     def step(self) -> None:
+        if self._closed:
+            raise RuntimeError("SimulationEngine is closed")
         step_perf_started = time.perf_counter()
+        previous_tick = int(self.world.tick)
+        previous_now = float(self.world.now)
+        self._isolated_commit_completed = False
         self.world.tick += 1
 
         step_start = float(self.world.now)
         step_end = step_start + self._dt
         self.world.now = step_end
 
-        if self._should_run_isolated_systems():
-            self._step_isolated_systems(step_start, step_end, step_perf_started)
+        try:
+            run_isolated = self._should_run_isolated_systems()
+        except Exception:
+            self.world.tick = previous_tick
+            self.world.now = previous_now
+            raise
+
+        if run_isolated:
+            authority_before_step = deepcopy(self.world)
+            authority_before_step.tick = previous_tick
+            authority_before_step.now = previous_now
+            try:
+                self._step_isolated_systems(step_start, step_end, step_perf_started)
+            except Exception:
+                if not self._isolated_commit_completed:
+                    for state_field in fields(WorldState):
+                        setattr(self.world, state_field.name, getattr(authority_before_step, state_field.name))
+                raise
             return
 
         self.last_system_execution_plan = SystemExecutionPlan()
@@ -152,6 +272,7 @@ class SimulationEngine:
     def _step_global_systems(self, step_start: float, step_end: float, step_perf_started: float) -> None:
         self.shutdown_parallel_workers()
         self.last_system_transfers = []
+        refresh_global_squad_leaders(self.world)
 
         perf_started = time.perf_counter()
         self.perception.run(self.world)
@@ -210,52 +331,122 @@ class SimulationEngine:
         self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=substep_count)
 
     def _should_run_isolated_systems(self) -> bool:
-        if not bool(getattr(self.config, "isolate_systems", True)):
+        if self.system_execution_mode is SystemExecutionMode.GLOBAL_LEGACY:
             return False
         if not isinstance(self.combat, CombatSystem):
             return False
         plan = plan_system_execution(self.world, self.config)
+        if self.system_execution_mode is not SystemExecutionMode.SHARD_PROCESS:
+            plan = SystemExecutionPlan(
+                active_systems=plan.active_systems,
+                groups=plan.groups,
+                worker_count=1 if plan.groups else 0,
+                use_processes=False,
+            )
         if has_unassigned_active_entities(self.world):
             self.last_system_execution_plan = plan
-            return False
-        if len(plan.active_systems) <= 1:
-            self.last_system_execution_plan = plan
-            return False
+            if self.system_execution_mode is SystemExecutionMode.SHARD_PROCESS:
+                self.disable_parallel_for_match("active entity has an empty system_id", self.world.tick)
+            raise ValueError("isolated execution requires every active entity to have a system_id")
         self.last_system_execution_plan = plan
         return True
-
-    def _clone_base_combat(self) -> CombatSystem:
-        sink = getattr(self.combat, "_combat_event_sink", None)
-        logger = getattr(self.combat, "logger", None)
-        try:
-            self.combat.attach_event_sink(None)
-            self.combat.logger = None
-            cloned = deepcopy(self.combat)
-        except Exception:
-            cloned = CombatSystem(PyfaBridge())
-        finally:
-            self.combat.attach_event_sink(sink)
-            self.combat.logger = logger
-        cloned.attach_event_sink(None)
-        cloned.logger = None
-        return cloned
 
     def _combat_for_system(self, system_id: str) -> CombatSystem:
         combat = self._system_combats.get(system_id)
         if combat is not None:
             return combat
-        combat = self._clone_base_combat() if not self._system_combats else CombatSystem(PyfaBridge())
+        combat = self.combat.clone_for_system(system_id)
+        combat.set_event_rng_context(stable_system_seed(self.config.simulation_seed, system_id), 0)
         self._system_combats[system_id] = combat
         return combat
 
+    def _random_state_for_system(self, system_id: str) -> object:
+        state = self._system_random_states.get(system_id)
+        if state is not None:
+            return state
+        return random.Random(stable_system_seed(self.config.simulation_seed, system_id)).getstate()
+
     def _executor_for_plan(self, plan: SystemExecutionPlan) -> ProcessPoolExecutor:
-        workers = max(1, int(plan.worker_count or len(plan.groups) or 1))
-        if self._system_executor is not None and self._system_executor_workers == workers:
+        requested_workers = max(1, int(plan.worker_count or len(plan.groups) or 1))
+        if self._fixed_system_executor_workers <= 0:
+            self._fixed_system_executor_workers = requested_workers
+        workers = self._fixed_system_executor_workers
+        if self._system_executor is not None:
             return self._system_executor
-        self.shutdown_parallel_workers()
-        self._system_executor = ProcessPoolExecutor(max_workers=workers)
+        requested_method = str(getattr(self.config, "parallel_system_worker_start_method", "spawn") or "spawn")
+        available_methods = multiprocessing.get_all_start_methods()
+        if requested_method not in available_methods:
+            requested_method = "spawn" if "spawn" in available_methods else available_methods[0]
+            self.config.parallel_system_worker_start_method = requested_method
+        self._system_executor = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context(requested_method),
+        )
         self._system_executor_workers = workers
         return self._system_executor
+
+    def _parallel_timeout_sec(self) -> float:
+        try:
+            timeout = float(getattr(self.config, "parallel_system_timeout_sec", 30.0))
+        except Exception:
+            timeout = 30.0
+        if timeout <= 0.0:
+            timeout = 30.0
+            self.config.parallel_system_timeout_sec = timeout
+        return timeout
+
+    def disable_parallel_for_match(self, reason: str, tick: int) -> None:
+        self.parallel_failure_count += 1
+        if self.parallel_disabled_reason is None:
+            self.parallel_disabled_reason = str(reason)
+            self.parallel_disabled_at_tick = int(tick)
+        self.system_execution_mode = SystemExecutionMode.SHARD_SERIAL_DEGRADED
+        self.last_system_parallel_error = str(reason)
+        self.shutdown_parallel_workers(wait_for_workers=False, force=True)
+
+    def _preflight_parallel(self, plan: SystemExecutionPlan, tasks: list) -> None:
+        if self._parallel_preflight_complete or not bool(getattr(self.config, "parallel_system_preflight", True)):
+            return
+        validate_parallel_capability(self.config, tasks, plan.worker_count)
+        executor = self._executor_for_plan(plan)
+        pid, protocol_version, _python_version = executor.submit(parallel_worker_probe).result(
+            timeout=self._parallel_timeout_sec()
+        )
+        if pid <= 0 or protocol_version != SYSTEM_SHARD_PROTOCOL_VERSION:
+            raise ParallelCapabilityError("worker probe returned an incompatible protocol")
+        self._parallel_preflight_complete = True
+
+    @staticmethod
+    def _flatten_group_results(group_results: list[SystemGroupResult]) -> list[SystemShardResult]:
+        return sorted(
+            [result for group_result in group_results for result in group_result.results],
+            key=lambda result: result.system_id,
+        )
+
+    def _validate_shard_results(self, tasks_by_system: dict, results: list[SystemShardResult]) -> None:
+        result_ids = [result.system_id for result in results]
+        expected_ids = sorted(tasks_by_system)
+        if sorted(result_ids) != expected_ids or len(set(result_ids)) != len(result_ids):
+            raise ValueError(f"worker result systems mismatch: expected {expected_ids}, got {result_ids}")
+        if not bool(getattr(self.config, "parallel_system_strict_validation", True)):
+            return
+        for result in results:
+            validate_shard_result(tasks_by_system[result.system_id], result, int(self.world.tick))
+
+    def _run_parallel_groups(self, plan: SystemExecutionPlan, group_tasks: list[list], step_start: float, step_end: float):
+        tasks = [task for group in group_tasks for task in group]
+        self._preflight_parallel(plan, tasks)
+        executor = self._executor_for_plan(plan)
+        futures = [
+            executor.submit(run_system_group, items, self.config, step_start, step_end, self._dt)
+            for items in group_tasks
+        ]
+        done, not_done = wait(futures, timeout=self._parallel_timeout_sec())
+        if not_done:
+            for future in futures:
+                future.cancel()
+            raise TimeoutError(f"parallel system tick exceeded {self._parallel_timeout_sec():.3f}s")
+        return [future.result() for future in futures]
 
     def _emit_isolated_events(self, events) -> None:
         sink = getattr(self.combat, "_combat_event_sink", None)
@@ -264,21 +455,48 @@ class SimulationEngine:
         for event in events:
             sink(event)
 
+    def _deliver_committed_events(self, events) -> None:
+        try:
+            self._emit_isolated_events(events)
+        except Exception:
+            self._logger.exception("committed tick event delivery failed")
+
     def _step_isolated_systems(self, step_start: float, step_end: float, step_perf_started: float) -> None:
         plan = self.last_system_execution_plan
+        refresh_global_squad_leaders(self.world)
+        for commander in self.commanders:
+            commander.think(self.world)
         if not plan.groups:
-            self._step_global_systems(step_start, step_end, step_perf_started)
+            self.last_effective_system_execution_mode = "shard_idle"
+            self.last_system_transfers = []
+            self.last_system_parallel_error = None
+            self._log_hotspot(
+                "engine.step_total",
+                step_perf_started,
+                tick=self.world.tick,
+                external_dt=self._dt,
+                slices=0,
+                systems=0,
+                groups=0,
+                processes=False,
+            )
             return
 
         started = time.perf_counter()
         tasks_by_system = {}
-        for group in plan.groups:
-            for system_id in group.system_ids:
-                task = build_system_shard(self.world, system_id, self.commanders, self.ship_agents)
-                tasks_by_system[system_id] = replace_task_combat(
-                    task,
-                    sanitize_combat_for_worker(self._combat_for_system(system_id)),
-                )
+        try:
+            for group in plan.groups:
+                for system_id in group.system_ids:
+                    task = build_system_shard(self.world, system_id, self.ship_agents)
+                    task.random_state = self._random_state_for_system(system_id)
+                    tasks_by_system[system_id] = replace_task_combat(
+                        task,
+                        sanitize_combat_for_worker(self._combat_for_system(system_id)),
+                    )
+        except CombatStateCloneError as exc:
+            if self.system_execution_mode is SystemExecutionMode.SHARD_PROCESS:
+                self.disable_parallel_for_match(str(exc), self.world.tick)
+            raise
 
         group_tasks = [
             [tasks_by_system[system_id] for system_id in group.system_ids if system_id in tasks_by_system]
@@ -286,26 +504,36 @@ class SimulationEngine:
         ]
         group_tasks = [tasks for tasks in group_tasks if tasks]
 
-        group_results = []
+        group_results: list[SystemGroupResult]
+        merge_plan = None
         if plan.use_processes:
-            executor = self._executor_for_plan(plan)
-            futures = [
-                executor.submit(run_system_group, tasks, self.config, step_start, step_end, self._dt)
-                for tasks in group_tasks
-            ]
+            self.last_effective_system_execution_mode = SystemExecutionMode.SHARD_PROCESS.value
+            parallel_started = time.perf_counter()
             try:
-                group_results = [future.result() for future in futures]
+                group_results = self._run_parallel_groups(plan, group_tasks, step_start, step_end)
+                shard_results = self._flatten_group_results(group_results)
+                self._validate_shard_results(tasks_by_system, shard_results)
+                merge_plan = prepare_system_merge(self.world, shard_results, self.ship_agents)
                 self.last_system_parallel_error = None
+                self.last_parallel_tick_duration_ms = (time.perf_counter() - parallel_started) * 1000.0
             except Exception as exc:
-                self.last_system_parallel_error = str(exc) or exc.__class__.__name__
+                reason = str(exc) or exc.__class__.__name__
+                self.last_system_parallel_error = reason
                 self._logger.exception("system parallel execution failed; falling back to serial shard execution")
-                for future in futures:
-                    future.cancel()
-                self.shutdown_parallel_workers()
+                if bool(getattr(self.config, "parallel_system_disable_after_failure", True)):
+                    self.disable_parallel_for_match(reason, self.world.tick)
+                    self.last_effective_system_execution_mode = SystemExecutionMode.SHARD_SERIAL_DEGRADED.value
+                else:
+                    self.shutdown_parallel_workers(wait_for_workers=False, force=True)
+                fallback_started = time.perf_counter()
                 group_results = [
                     run_system_group(tasks, self.config, step_start, step_end, self._dt)
                     for tasks in group_tasks
                 ]
+                shard_results = self._flatten_group_results(group_results)
+                self._validate_shard_results(tasks_by_system, shard_results)
+                merge_plan = prepare_system_merge(self.world, shard_results, self.ship_agents)
+                self.last_serial_fallback_duration_ms = (time.perf_counter() - fallback_started) * 1000.0
                 plan = SystemExecutionPlan(
                     active_systems=plan.active_systems,
                     groups=plan.groups,
@@ -314,21 +542,34 @@ class SimulationEngine:
                 )
                 self.last_system_execution_plan = plan
         else:
-            self.shutdown_parallel_workers()
-            self.last_system_parallel_error = None
+            if self.system_execution_mode is SystemExecutionMode.SHARD_PROCESS:
+                self.last_effective_system_execution_mode = "shard_serial_single_group"
+            else:
+                self.last_effective_system_execution_mode = self.system_execution_mode.value
+            if self.system_execution_mode is not SystemExecutionMode.SHARD_PROCESS:
+                self.shutdown_parallel_workers(wait_for_workers=True)
             group_results = [
                 run_system_group(tasks, self.config, step_start, step_end, self._dt)
                 for tasks in group_tasks
             ]
+            shard_results = self._flatten_group_results(group_results)
+            self._validate_shard_results(tasks_by_system, shard_results)
+            merge_plan = prepare_system_merge(self.world, shard_results, self.ship_agents)
 
-        shard_results = [result for group_result in group_results for result in group_result.results]
+        assert merge_plan is not None
+        transfer_ins: list[SystemTransferIn] = []
+        for result in shard_results:
+            if not isinstance(result.combat, CombatSystem) or result.combat._system_id != result.system_id:
+                raise CombatStateCloneError(f"invalid committed combat state for {result.system_id!r}")
+            if result.random_state is None:
+                raise ValueError(f"missing committed random state for {result.system_id!r}")
+        events = commit_system_merge(self.world, self.ship_agents, merge_plan, transfer_sink=transfer_ins)
         for result in shard_results:
             self._system_combats[result.system_id] = result.combat
-
-        transfer_ins: list[SystemTransferIn] = []
-        events = merge_system_results(self.world, shard_results, self.ship_agents, transfer_sink=transfer_ins)
+            self._system_random_states[result.system_id] = result.random_state
+        self._isolated_commit_completed = True
         self.last_system_transfers = transfer_ins
-        self._emit_isolated_events(events)
+        self._deliver_committed_events(events)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         log_group_hotspot(self.config, plan, elapsed_ms)
         self._log_hotspot(
@@ -356,6 +597,7 @@ class SimulationEngine:
                 "team": ship.team.value,
                 "squad_id": ship.squad_id,
                 "ship_group_id": str(getattr(ship, "ship_group_id", "") or ""),
+                "command_priority": int(getattr(ship, "command_priority", 0) or 0),
                 "ship_name": ship.fit.ship_name,
                 "alive": ship.vital.alive,
                 "position": {"x": ship.nav.position.x, "y": ship.nav.position.y},
@@ -366,8 +608,12 @@ class SimulationEngine:
                 "gate_cloak_active": bool(getattr(getattr(ship.nav, "cloak", None), "active", False)),
                 "gate_cloak_expires_at": float(getattr(getattr(ship.nav, "cloak", None), "expires_at", 0.0) or 0.0),
                 "gate_cloak_source": str(getattr(getattr(ship.nav, "cloak", None), "source", "") or ""),
-                "follow_hold_active": bool(getattr(ship.nav, "follow_hold_active", False)),
-                "follow_hold_leader_id": str(getattr(ship.nav, "follow_hold_leader_id", "") or ""),
+                "squad_follow_state": str(getattr(ship.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW"),
+                "squad_follow_leader_id": str(getattr(ship.nav, "squad_follow_leader_id", "") or ""),
+                "squad_follow_leader_location_version": int(
+                    getattr(ship.nav, "squad_follow_leader_location_version", 0) or 0
+                ),
+                "squad_follow_warp_ready": bool(getattr(ship.nav, "squad_follow_warp_ready", True)),
                 "shield": ship.vital.shield,
                 "armor": ship.vital.armor,
                 "structure": ship.vital.structure,
@@ -378,6 +624,8 @@ class SimulationEngine:
                 "cap_max": ship.vital.cap_max,
                 "target": ship.combat.current_target,
                 "projected_targets": {k: v for k, v in ship.combat.projected_targets.items()},
+                "prelocked_targets": sorted(str(target_id) for target_id in ship.combat.prelocked_targets),
+                "prelock_timers": {k: float(v) for k, v in ship.combat.prelock_timers.items()},
                 "module_cycle_timers": {k: float(v) for k, v in ship.combat.module_cycle_timers.items()},
                 "ecm_jam_sources": {k: float(v) for k, v in ship.combat.ecm_jam_sources.items()},
                 "ecm_last_attempt_target": ship.combat.ecm_last_attempt_target,
@@ -511,6 +759,20 @@ class SimulationEngine:
                 for field_id, field in self.world.bubble_fields.items()
             },
             "intents": {k: asdict(v) for k, v in self.world.intents.items()},
+            "squad_leaders": {k: str(v) for k, v in self.world.squad_leaders.items()},
+            "squad_leader_location_versions": {
+                k: int(v) for k, v in self.world.squad_leader_location_versions.items()
+            },
+            "squad_propulsion_commands": {k: bool(v) for k, v in self.world.squad_propulsion_commands.items()},
+            "squad_leader_speed_limits": {k: float(v) for k, v in self.world.squad_leader_speed_limits.items()},
             "squad_focus_queues": {k: list(v) for k, v in self.world.squad_focus_queues.items()},
             "squad_focus_updated_at": {k: float(v) for k, v in self.world.squad_focus_updated_at.items()},
+            "simulation_metadata": {
+                "system_execution_mode": self.system_execution_mode.value,
+                "effective_system_execution_mode": self.last_effective_system_execution_mode,
+                "parallel_disabled_reason": self.parallel_disabled_reason,
+                "parallel_disabled_at_tick": self.parallel_disabled_at_tick,
+                "parallel_failure_count": self.parallel_failure_count,
+                "engine_config": asdict(self.config),
+            },
         }

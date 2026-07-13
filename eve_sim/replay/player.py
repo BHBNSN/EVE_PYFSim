@@ -22,7 +22,10 @@ class ReplayPlayer:
         self.scenario_id = str(scenario_id)
         self.rng_seed = int(rng_seed)
         self.metadata: dict[str, Any] = dict(metadata or {})
-        self.events = sorted(list(events), key=lambda event: (event.tick, event.at, event.rng_counter))
+        self.events = sorted(
+            list(events),
+            key=lambda event: (event.tick, event.system_id, event.rng_counter, event.at),
+        )
         self.frames = sorted(list(frames or ()), key=lambda frame: (frame.tick, frame.at))
         self._last_resolved_index: int | None = None
         self._last_resolved_snapshot: dict[str, Any] | None = None

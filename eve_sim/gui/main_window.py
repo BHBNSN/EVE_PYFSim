@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..agents import CommanderAgent
+from ..agents import CommanderAgent, refresh_global_squad_leaders
 from ..battle_report import BattleReportService
 from ..config import EngineConfig, UiConfig
 from ..fleet_setup import (
@@ -415,13 +415,9 @@ class MainWindow(QMainWindow):
         return self._ship_is_visible_gate_cloak_leader(ship)
 
     @staticmethod
-    def _parse_team_squad_key(scoped_key: str, default_team: Team) -> tuple[Team, str]:
-        text = str(scoped_key or "")
-        if ":" in text:
-            head, tail = text.split(":", 1)
-            if tail and head in (Team.BLUE.value, Team.RED.value):
-                return Team(head), tail
-        return default_team, text
+    def _parse_team_squad_key(scoped_key: str) -> tuple[Team, str]:
+        team, squad_id = str(scoped_key).split(":", 1)
+        return Team(team), squad_id
 
     def _guidance_target_for_squad(self, squad_id: str) -> Vector2 | None:
         scoped_key = self._focus_key(self.controlled_team, squad_id)
@@ -464,9 +460,7 @@ class MainWindow(QMainWindow):
                 if command_target is not None:
                     return Vector2(command_target.x, command_target.y)
         target = self._squad_guidance_targets.get(scoped_key)
-        if target is not None:
-            return target
-        return self._squad_guidance_targets.get(squad_id)
+        return target
 
     def _inducible_controlled_squad_ids(self) -> list[str]:
         squads = {
@@ -1570,26 +1564,19 @@ class MainWindow(QMainWindow):
 
     def _get_team_propulsion_state(self, team: Team, squad_id: str) -> bool:
         key = self._focus_key(team, squad_id)
-        if key in self.engine.world.squad_propulsion_commands:
-            return bool(self.engine.world.squad_propulsion_commands.get(key, False))
-        return bool(self.engine.world.squad_propulsion_commands.get(squad_id, False))
+        return bool(self.engine.world.squad_propulsion_commands.get(key, False))
 
     def _set_team_propulsion_state(self, team: Team, squad_id: str, active: bool) -> None:
         key = self._focus_key(team, squad_id)
         self.engine.world.squad_propulsion_commands[key] = bool(active)
-        self.engine.world.squad_propulsion_commands.pop(squad_id, None)
 
     def _get_team_intent(self, team: Team, squad_id: str) -> FleetIntent | None:
         key = self._focus_key(team, squad_id)
-        intent = self.engine.world.intents.get(key)
-        if intent is not None:
-            return intent
-        return self.engine.world.intents.get(squad_id)
+        return self.engine.world.intents.get(key)
 
     def _set_team_intent(self, team: Team, squad_id: str, intent: FleetIntent) -> None:
         key = self._focus_key(team, squad_id)
         self.engine.world.intents[key] = intent
-        self.engine.world.intents.pop(squad_id, None)
 
     def _updated_intent(
         self,
@@ -1738,12 +1725,9 @@ class MainWindow(QMainWindow):
     def _clear_navigation_intent(self, team: Team, squad_id: str) -> None:
         scoped_key = self._focus_key(team, squad_id)
         self._squad_approach_targets.pop(scoped_key, None)
-        self._squad_approach_targets.pop(squad_id, None)
         if self._team_has_fighter_squad(team, squad_id):
             self._squad_guidance_targets.pop(scoped_key, None)
-            self._squad_guidance_targets.pop(squad_id, None)
             self.engine.world.intents.pop(scoped_key, None)
-            self.engine.world.intents.pop(squad_id, None)
             for fighter in self.engine.world.fighters.values():
                 if fighter.team == team and fighter.squad_id == squad_id and fighter.vital.alive and fighter.state != "recalling":
                     self.engine.movement._clear_navigation_command(fighter)
@@ -2497,9 +2481,6 @@ class MainWindow(QMainWindow):
             scoped_key = self._focus_key(team, squad)
             self._squad_approach_targets.pop(scoped_key, None)
             self._squad_guidance_targets.pop(scoped_key, None)
-            # Backward compatibility for stale unscoped cache keys.
-            self._squad_approach_targets.pop(squad, None)
-            self._squad_guidance_targets.pop(squad, None)
             old = self._get_team_intent(team, squad)
             self._set_team_intent(
                 team,
@@ -2901,7 +2882,7 @@ class MainWindow(QMainWindow):
             return
         stale: list[str] = []
         for scoped_key, target_id in list(self._squad_approach_targets.items()):
-            team, squad = self._parse_team_squad_key(scoped_key, self.controlled_team)
+            team, squad = self._parse_team_squad_key(scoped_key)
             target_ship = self.engine.world.combat_entity(target_id)
             if target_ship is None or not target_ship.vital.alive:
                 stale.append(scoped_key)
@@ -2915,9 +2896,9 @@ class MainWindow(QMainWindow):
                 target_structure_id=None,
                 target_range_m=0.0,
             )
-        for squad in stale:
-            self._squad_approach_targets.pop(squad, None)
-            self._squad_guidance_targets.pop(squad, None)
+        for scoped_key in stale:
+            self._squad_approach_targets.pop(scoped_key, None)
+            self._squad_guidance_targets.pop(scoped_key, None)
 
     def issue_move_to(self, squad_id: str, target: Vector2) -> None:
         self._log_user_action("squad_move", squad=squad_id, x=target.x, y=target.y)
@@ -3249,8 +3230,6 @@ class MainWindow(QMainWindow):
         def apply() -> None:
             self.engine.world.squad_focus_queues.pop(focus_key, None)
             self.engine.world.squad_focus_updated_at.pop(focus_key, None)
-            self.engine.world.squad_prelocked_targets.pop(focus_key, None)
-            self.engine.world.squad_prelock_timers.pop(focus_key, None)
             if self._is_fighter_squad(squad):
                 self.engine.deployables.clear_fighter_squad_target(self.engine.world, self.controlled_team, squad)
                 return
@@ -3272,6 +3251,8 @@ class MainWindow(QMainWindow):
                 ship.combat.lock_timers.clear()
                 ship.combat.lock_deadlines.clear()
                 ship.combat.fire_delay_timers.clear()
+                ship.combat.prelocked_targets.clear()
+                ship.combat.prelock_timers.clear()
 
         self._enqueue_tick_op(apply)
         self.ui_state.selected_enemy_target = None
@@ -3558,10 +3539,13 @@ class MainWindow(QMainWindow):
             focus_key = self._focus_key(controlled_team, self.ui_state.selected_squad)
             queue = self.engine.world.squad_focus_queues.get(focus_key, [])
             in_prequeue = target_id in queue
-            prelocked_by_ship = self.engine.world.squad_prelocked_targets.get(focus_key, {})
-            prelock_timers_by_ship = self.engine.world.squad_prelock_timers.get(focus_key, {})
-            prelocked = any(target_id in targets for targets in prelocked_by_ship.values())
-            prelocking = any(target_id in timers for timers in prelock_timers_by_ship.values())
+            squad_members = [
+                ship
+                for ship in self.engine.world.ships.values()
+                if ship.team == controlled_team and ship.squad_id == self.ui_state.selected_squad
+            ]
+            prelocked = any(target_id in ship.combat.prelocked_targets for ship in squad_members)
+            prelocking = any(target_id in ship.combat.prelock_timers for ship in squad_members)
             if in_prequeue or prelocked or prelocking:
                 action_cancel_prefocus = QAction(
                     QCoreApplication.translate("eve_sim", '{squad} Cancel Pre-lock {ship}').format(
@@ -4065,8 +4049,6 @@ class MainWindow(QMainWindow):
             elif kind == CMD_SQUAD_CLEAR_FOCUS:
                 self.engine.world.squad_focus_queues.pop(focus_key, None)
                 self.engine.world.squad_focus_updated_at.pop(focus_key, None)
-                self.engine.world.squad_prelocked_targets.pop(focus_key, None)
-                self.engine.world.squad_prelock_timers.pop(focus_key, None)
                 if self._team_has_fighter_squad(team, squad):
                     self.engine.deployables.clear_fighter_squad_target(self.engine.world, team, squad)
                     return
@@ -4084,33 +4066,15 @@ class MainWindow(QMainWindow):
                     ship.combat.lock_timers.clear()
                     ship.combat.lock_deadlines.clear()
                     ship.combat.fire_delay_timers.clear()
+                    ship.combat.prelocked_targets.clear()
+                    ship.combat.prelock_timers.clear()
 
     def _discard_squad_prelock_target(self, focus_key: str, target_id: str) -> None:
-        prelocked_by_ship = self.engine.world.squad_prelocked_targets.get(focus_key)
-        if isinstance(prelocked_by_ship, dict):
-            for ship_id in list(prelocked_by_ship.keys()):
-                targets = prelocked_by_ship.get(ship_id)
-                if not isinstance(targets, set):
-                    prelocked_by_ship.pop(ship_id, None)
-                    continue
-                targets.discard(target_id)
-                if not targets:
-                    prelocked_by_ship.pop(ship_id, None)
-            if not prelocked_by_ship:
-                self.engine.world.squad_prelocked_targets.pop(focus_key, None)
-
-        timers_by_ship = self.engine.world.squad_prelock_timers.get(focus_key)
-        if isinstance(timers_by_ship, dict):
-            for ship_id in list(timers_by_ship.keys()):
-                ship_timers = timers_by_ship.get(ship_id)
-                if not isinstance(ship_timers, dict):
-                    timers_by_ship.pop(ship_id, None)
-                    continue
-                ship_timers.pop(target_id, None)
-                if not ship_timers:
-                    timers_by_ship.pop(ship_id, None)
-            if not timers_by_ship:
-                self.engine.world.squad_prelock_timers.pop(focus_key, None)
+        for ship in self.engine.world.ships.values():
+            if self._focus_key(ship.team, ship.squad_id) != focus_key:
+                continue
+            ship.combat.prelocked_targets.discard(target_id)
+            ship.combat.prelock_timers.pop(target_id, None)
 
     def _build_remote_ship_artifacts(
         self,
@@ -4482,6 +4446,15 @@ class MainWindow(QMainWindow):
                     for key, value in focus_updated.items()
                     if str(key)
                 }
+            leaders = snapshot.get("squad_leaders")
+            if isinstance(leaders, dict):
+                self.engine.world.squad_leaders = {str(key): str(value) for key, value in leaders.items()}
+            versions = snapshot.get("squad_leader_location_versions")
+            if isinstance(versions, dict):
+                self.engine.world.squad_leader_location_versions = {
+                    str(key): int(value) for key, value in versions.items()
+                }
+                self.engine.world.squad_leader_locations.clear()
         ships = snapshot.get("ships") if isinstance(snapshot, dict) else None
         if not isinstance(ships, dict):
             ships = {}
@@ -4491,6 +4464,7 @@ class MainWindow(QMainWindow):
             ship = self._ensure_remote_ship(str(ship_id), raw)
             ship.squad_id = str(raw.get("squad_id", ship.squad_id))
             ship.ship_group_id = str(raw.get("ship_group_id", getattr(ship, "ship_group_id", "")) or "")
+            ship.command_priority = int(raw.get("command_priority", getattr(ship, "command_priority", 0)) or 0)
             ship.team = Team.BLUE if str(raw.get("team", ship.team.value)) == "BLUE" else Team.RED
             pos = raw.get("position", {})
             vel = raw.get("velocity", {})
@@ -4502,8 +4476,12 @@ class MainWindow(QMainWindow):
             ship.nav.cloak.active = bool(raw.get("gate_cloak_active", ship.nav.cloak.active))
             ship.nav.cloak.expires_at = float(raw.get("gate_cloak_expires_at", ship.nav.cloak.expires_at) or 0.0)
             ship.nav.cloak.source = str(raw.get("gate_cloak_source", ship.nav.cloak.source) or "")
-            ship.nav.follow_hold_active = bool(raw.get("follow_hold_active", ship.nav.follow_hold_active))
-            ship.nav.follow_hold_leader_id = str(raw.get("follow_hold_leader_id", ship.nav.follow_hold_leader_id) or "") or None
+            ship.nav.squad_follow_state = str(raw.get("squad_follow_state", ship.nav.squad_follow_state) or "FORMATION_FOLLOW")
+            ship.nav.squad_follow_leader_id = str(raw.get("squad_follow_leader_id", ship.nav.squad_follow_leader_id) or "") or None
+            ship.nav.squad_follow_leader_location_version = int(
+                raw.get("squad_follow_leader_location_version", ship.nav.squad_follow_leader_location_version) or 0
+            )
+            ship.nav.squad_follow_warp_ready = bool(raw.get("squad_follow_warp_ready", ship.nav.squad_follow_warp_ready))
             ship.vital.shield = float(raw.get("shield", ship.vital.shield))
             ship.vital.armor = float(raw.get("armor", ship.vital.armor))
             ship.vital.structure = float(raw.get("structure", ship.vital.structure))
@@ -4532,6 +4510,18 @@ class MainWindow(QMainWindow):
                 }
             else:
                 ship.combat.projected_targets.clear()
+            prelocked_targets = raw.get("prelocked_targets")
+            ship.combat.prelocked_targets = (
+                {str(target_id) for target_id in prelocked_targets}
+                if isinstance(prelocked_targets, list)
+                else set()
+            )
+            prelock_timers = raw.get("prelock_timers")
+            ship.combat.prelock_timers = (
+                {str(target_id): float(timer) for target_id, timer in prelock_timers.items()}
+                if isinstance(prelock_timers, dict)
+                else {}
+            )
 
             module_cycle_timers = raw.get("module_cycle_timers")
             if isinstance(module_cycle_timers, dict):
@@ -4736,6 +4726,8 @@ class MainWindow(QMainWindow):
                 if stale_id not in seen_fighters:
                     self.engine.world.fighters.pop(stale_id, None)
 
+        refresh_global_squad_leaders(self.engine.world)
+
     @staticmethod
     def _ship_signature(raw: dict) -> tuple:
         raw_pos = raw.get("position")
@@ -4797,8 +4789,10 @@ class MainWindow(QMainWindow):
             bool(raw.get("gate_cloak_active", False)),
             round(float(raw.get("gate_cloak_expires_at", 0.0) or 0.0), 2),
             str(raw.get("gate_cloak_source", "") or ""),
-            bool(raw.get("follow_hold_active", False)),
-            str(raw.get("follow_hold_leader_id", "") or ""),
+            str(raw.get("squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW"),
+            str(raw.get("squad_follow_leader_id", "") or ""),
+            int(raw.get("squad_follow_leader_location_version", 0) or 0),
+            bool(raw.get("squad_follow_warp_ready", True)),
             bool(raw.get("deployed", True)),
             bool(raw.get("alive", False)),
             round(float(pos.get("x", 0.0)), 1),
@@ -4894,11 +4888,17 @@ class MainWindow(QMainWindow):
             elif ship.team == Team.RED:
                 alive_red += 1
         tick = self.engine.world.tick
+        mode = getattr(getattr(self.engine, "system_execution_mode", None), "value", "global_legacy")
+        effective_mode = str(getattr(self.engine, "last_effective_system_execution_mode", mode) or mode)
+        disabled_reason = str(getattr(self.engine, "parallel_disabled_reason", "") or "")
+        execution_text = f"Mode: {mode} / effective: {effective_mode}"
+        if disabled_reason:
+            execution_text += f" ({disabled_reason})"
         self.status.setText(
             f"{QCoreApplication.translate("eve_sim", 'Tick')}: {tick} | {QCoreApplication.translate("eve_sim", 'Ships')}: {total_ships} | "
             f"{QCoreApplication.translate("eve_sim", 'BLUE')}: {alive_blue} | {QCoreApplication.translate("eve_sim", 'RED')}: {alive_red} | "
             f"{self._status_tidi_text()} | {QCoreApplication.translate("eve_sim", 'Zoom')}: {self.canvas.zoom:.2f} | "
-            f"{QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f}"
+            f"{QCoreApplication.translate("eve_sim", 'Step ms')}: {self._step_ms_ema:.2f} | {execution_text}"
         )
 
     def _set_waiting_status(self, message: str) -> None:
@@ -4922,6 +4922,15 @@ class MainWindow(QMainWindow):
             "tick_rate": int(cfg.tick_rate),
             "physics_substeps": int(cfg.physics_substeps),
             "lockstep": bool(cfg.lockstep),
+            "isolate_systems": bool(cfg.isolate_systems),
+            "parallel_systems": bool(cfg.parallel_systems),
+            "parallel_system_workers": int(cfg.parallel_system_workers),
+            "parallel_system_timeout_sec": float(cfg.parallel_system_timeout_sec),
+            "parallel_system_preflight": bool(cfg.parallel_system_preflight),
+            "parallel_system_disable_after_failure": bool(cfg.parallel_system_disable_after_failure),
+            "parallel_system_worker_start_method": str(cfg.parallel_system_worker_start_method),
+            "parallel_system_strict_validation": bool(cfg.parallel_system_strict_validation),
+            "simulation_seed": int(cfg.simulation_seed),
             "tidi_min_factor": float(getattr(cfg, "tidi_min_factor", 0.1)),
             "detailed_logging": bool(cfg.detailed_logging),
             "hotspot_logging": bool(cfg.hotspot_logging),
@@ -5029,6 +5038,8 @@ class MainWindow(QMainWindow):
                 "drones": base.get("drones", {}),
                 "fighters": base.get("fighters", {}),
                 "removed_ship_ids": removed_ship_ids,
+                "squad_leaders": base.get("squad_leaders", {}),
+                "squad_leader_location_versions": base.get("squad_leader_location_versions", {}),
                 "squad_focus_queues": base.get("squad_focus_queues", {}),
                 "squad_focus_updated_at": base.get("squad_focus_updated_at", {}),
                 "partial": not full_sync,
@@ -5195,6 +5206,8 @@ class MainWindow(QMainWindow):
             self.lan_server.stop()
         if self.lan_client is not None:
             self.lan_client.close()
+        if hasattr(self.engine, "close"):
+            self.engine.close()
         super().closeEvent(event)
 
 

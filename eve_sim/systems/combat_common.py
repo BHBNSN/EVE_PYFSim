@@ -38,6 +38,7 @@ from ..remote_snapshot_signatures import (
 )
 from ..replay.schema import CombatEvent, CombatEventSink
 from ..sim_logging import log_sim_event
+from ..system_identity import normalize_system_namespace
 from ..timer_views import adopt_deadlines_from_remaining_view, deadline_remaining, sync_deadline_view
 from ..timing_wheel import EventType, TimingWheel
 from ..world import WorldState

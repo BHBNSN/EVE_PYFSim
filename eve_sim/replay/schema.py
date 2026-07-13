@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -19,6 +19,7 @@ class CombatEvent:
     rng_seed: int
     rng_counter: int
     payload: dict[str, Any] = field(default_factory=dict)
+    system_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -30,6 +31,7 @@ class CombatEvent:
             "module_id": None if self.module_id is None else str(self.module_id),
             "rng_seed": int(self.rng_seed),
             "rng_counter": int(self.rng_counter),
+            "system_id": str(self.system_id),
             "payload": deepcopy(self.payload),
         }
 
@@ -44,6 +46,7 @@ class CombatEvent:
             module_id=None if data.get("module_id") is None else str(data.get("module_id")),
             rng_seed=int(data.get("rng_seed", 0)),
             rng_counter=int(data.get("rng_counter", 0)),
+            system_id=str(data.get("system_id", "")),
             payload=deepcopy(data.get("payload", {}) or {}),
         )
 

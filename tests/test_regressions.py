@@ -471,18 +471,16 @@ class RegressionTests(unittest.TestCase):
         )
 
         combat._update_squad_prelocks(world, 0.0, {})
-        timers = world.squad_prelock_timers["BLUE:SQ1"]
-        fast_lock = timers[fast.ship_id][prefocus.ship_id]
-        slow_lock = timers[slow.ship_id][prefocus.ship_id]
+        fast_lock = fast.combat.prelock_timers[prefocus.ship_id]
+        slow_lock = slow.combat.prelock_timers[prefocus.ship_id]
         self.assertLess(fast_lock, slow_lock)
 
         combat._update_squad_prelocks(world, fast_lock + 0.05, {})
 
-        prelocked = world.squad_prelocked_targets["BLUE:SQ1"]
-        self.assertIn(prefocus.ship_id, prelocked[fast.ship_id])
-        self.assertNotIn(fast.ship_id, world.squad_prelock_timers["BLUE:SQ1"])
-        self.assertNotIn(prefocus.ship_id, prelocked.get(slow.ship_id, set()))
-        self.assertGreater(world.squad_prelock_timers["BLUE:SQ1"][slow.ship_id][prefocus.ship_id], 0.0)
+        self.assertIn(prefocus.ship_id, fast.combat.prelocked_targets)
+        self.assertNotIn(prefocus.ship_id, fast.combat.prelock_timers)
+        self.assertNotIn(prefocus.ship_id, slow.combat.prelocked_targets)
+        self.assertGreater(slow.combat.prelock_timers[prefocus.ship_id], 0.0)
 
     def test_logistics_fallback_repairs_shield_then_armor(self) -> None:
         logi = _make_ship(

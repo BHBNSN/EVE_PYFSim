@@ -8,6 +8,11 @@ from ..world import WorldState
 
 class LogisticsSystem:
     @staticmethod
+    def _ship_is_rejoining_leader(ship) -> bool:
+        state = str(getattr(getattr(ship, "nav", None), "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW")
+        return state in {"FOLLOW_LEADER_SYSTEM", "WARP_TO_LEADER"}
+
+    @staticmethod
     def _apply_repair(target, amount: float) -> None:
         remaining = max(0.0, float(amount))
         if remaining <= 0.0:
@@ -38,6 +43,8 @@ class LogisticsSystem:
 
         for ship in world.ships.values():
             if not ship.vital.alive:
+                continue
+            if self._ship_is_rejoining_leader(ship):
                 continue
             if ship.runtime is not None:
                 # Runtime-backed fits already apply remote repair effects through CombatSystem.

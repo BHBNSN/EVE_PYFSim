@@ -19,7 +19,7 @@ class UiState:
 
 @dataclass(slots=True)
 class UiPreferences:
-    config_version: int = 8
+    config_version: int = 9
     selected_squad: str = "BLUE-ALPHA"
     selected_map_id: str = "dual_system_crossroads"
     filter_team: Literal["ALL", "FRIENDLY", "ENEMY", "BLUE", "RED"] = "ALL"
@@ -33,6 +33,7 @@ class UiPreferences:
     engine_tick_rate: int = 1
     engine_physics_substeps: int = 1
     engine_lockstep: bool = True
+    engine_parallel_systems: bool = False
     engine_detailed_logging: bool = True
     engine_hotspot_logging: bool = False
     engine_detail_log_file: str = "logs/sim_detail.log"
@@ -65,7 +66,7 @@ class AreaCycleOverlay:
 
 
 class PreferencesStore:
-    CURRENT_VERSION = 8
+    CURRENT_VERSION = 9
 
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
@@ -182,6 +183,9 @@ class PreferencesStore:
                     1,
                 ),
                 engine_lockstep=self._read_bool(migrated, "engine_lockstep", defaults.engine_lockstep),
+                engine_parallel_systems=self._read_bool(
+                    migrated, "engine_parallel_systems", defaults.engine_parallel_systems
+                ),
                 engine_detailed_logging=self._read_bool(
                     migrated,
                     "engine_detailed_logging",
