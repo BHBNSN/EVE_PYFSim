@@ -3,7 +3,7 @@
 import heapq
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 class EventType(Enum):
     LOCK_COMPLETE = 0

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, wait
 from copy import deepcopy
-from dataclasses import asdict, fields
+from dataclasses import dataclass, fields
 import logging
 import multiprocessing
 import random
 import time
 
-from .agents import CommanderAgent, ShipAgent, refresh_global_squad_leaders
+from .agents import CommanderAgent, ShipAgent
 from .config import EngineConfig
+from .domain.events import TickDiagnostics, TickResult
+from .domain.squad_service import SquadLeadershipService
 from .fleet_setup import prewarm_runtime_base_cache, prewarm_world_base_cache
 from .sim_logging import get_sim_logger, log_sim_event
 from .system_identity import stable_system_seed
@@ -38,6 +40,15 @@ from .system_isolation import (
 from .world import WorldState
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationCommandPorts:
+    """Explicit command-side ports exposed only to the application composition root."""
+
+    deployables: DeployableSystem
+    module_metadata: CombatSystem
+    fit_runtime: CombatSystem
+
+
 class SimulationEngine:
     def __init__(self, world: WorldState, config: EngineConfig, combat_system: CombatSystem) -> None:
         self.world = world
@@ -45,6 +56,8 @@ class SimulationEngine:
         self._logger: logging.Logger = get_sim_logger(config)
         self.commanders: list[CommanderAgent] = []
         self.ship_agents: dict[str, ShipAgent] = {}
+        self.squad_leadership = SquadLeadershipService()
+        self._last_tick_events = []
 
         self.perception = PerceptionSystem()
         self.movement = MovementSystem()
@@ -75,7 +88,7 @@ class SimulationEngine:
             not bool(getattr(config, "isolate_systems", True))
             or not isinstance(combat_system, CombatSystem)
         ):
-            self.system_execution_mode = SystemExecutionMode.GLOBAL_LEGACY
+            self.system_execution_mode = SystemExecutionMode.GLOBAL_SERIAL
         elif bool(getattr(config, "parallel_systems", False)):
             self.system_execution_mode = SystemExecutionMode.SHARD_PROCESS
         else:
@@ -181,6 +194,17 @@ class SimulationEngine:
         self._dt = 1.0 / float(self._configured_tick_rate())
         self.last_step_budget_ms = self.nominal_tick_interval_ms()
 
+    def refresh_runtime_from_config(self) -> None:
+        """Apply mutable runtime configuration at an application-controlled boundary."""
+        self._logger = get_sim_logger(self.config)
+        self.combat.attach_logger(
+            self._logger,
+            self.config.detailed_logging,
+            self.config.log_merge_window_sec,
+            self.config.hotspot_logging,
+        )
+        self.refresh_timing_from_config()
+
     def nominal_tick_interval_ms(self) -> float:
         return 1000.0 / float(self._configured_tick_rate())
 
@@ -210,6 +234,25 @@ class SimulationEngine:
             return
         self.tidi_factor = max(self._configured_tidi_min_factor(), min(1.0, budget / elapsed))
 
+    def set_replica_tidi_factor(self, factor: float) -> None:
+        self.tidi_factor = max(0.0, min(1.0, float(factor)))
+
+    def current_tidi_factor(self) -> float:
+        return float(self.tidi_factor)
+
+    def runtime_diagnostics(self) -> dict[str, object]:
+        """Return a detached diagnostics payload for application queries and snapshots."""
+        return {
+            "tick_rate": int(self.config.tick_rate),
+            "execution_mode": self.system_execution_mode.value,
+            "effective_execution_mode": self.last_effective_system_execution_mode,
+            "parallel_disabled_reason": self.parallel_disabled_reason,
+            "parallel_disabled_at_tick": self.parallel_disabled_at_tick,
+            "parallel_failure_count": self.parallel_failure_count,
+            "last_step_ms": self.last_step_ms,
+            "tidi_factor": self.tidi_factor,
+        }
+
     def _log_hotspot(self, name: str, start_time: float, **fields) -> None:
         if not bool(getattr(self.config, "hotspot_logging", False)):
             return
@@ -226,19 +269,43 @@ class SimulationEngine:
     def register_commander(self, commander: CommanderAgent) -> None:
         self.commanders.append(commander)
 
+    def command_ports(self) -> SimulationCommandPorts:
+        return SimulationCommandPorts(
+            deployables=self.deployables,
+            module_metadata=self.combat,
+            fit_runtime=self.combat,
+        )
+
     def register_ship(self, ship_id: str) -> None:
         self.ship_agents[ship_id] = ShipAgent(agent_id=f"agent:{ship_id}", ship_id=ship_id)
         ship = self.world.ships.get(ship_id)
         if ship is not None:
             prewarm_runtime_base_cache(getattr(ship, "runtime", None))
 
-    def step(self) -> None:
+    def unregister_ship(self, ship_id: str) -> None:
+        self.ship_agents.pop(str(ship_id), None)
+
+    def subscribe_combat_events(self, sink) -> None:
+        previous_sink = getattr(self.combat, "_combat_event_sink", None)
+
+        def chained(event) -> None:
+            if previous_sink is not None:
+                previous_sink(event)
+            sink(event)
+
+        self.combat.attach_event_sink(chained)
+
+    def flush_pending_combat_events(self) -> None:
+        self.combat.flush_pending_events()
+
+    def step(self) -> TickResult:
         if self._closed:
             raise RuntimeError("SimulationEngine is closed")
         step_perf_started = time.perf_counter()
         previous_tick = int(self.world.tick)
         previous_now = float(self.world.now)
         self._isolated_commit_completed = False
+        self._last_tick_events = []
         self.world.tick += 1
 
         step_start = float(self.world.now)
@@ -263,16 +330,35 @@ class SimulationEngine:
                     for state_field in fields(WorldState):
                         setattr(self.world, state_field.name, getattr(authority_before_step, state_field.name))
                 raise
-            return
+            return self._tick_result()
 
         self.last_system_execution_plan = SystemExecutionPlan()
 
         self._step_global_systems(step_start, step_end, step_perf_started)
+        return self._tick_result()
+
+    def _tick_result(self) -> TickResult:
+        return TickResult(
+            tick=int(self.world.tick),
+            now=float(self.world.now),
+            events=tuple(self._last_tick_events),
+            transfers=tuple(self.last_system_transfers),
+            diagnostics=TickDiagnostics(
+                execution_mode=self.system_execution_mode.value,
+                effective_execution_mode=str(self.last_effective_system_execution_mode),
+                step_ms=float(self.last_step_ms),
+                tidi_factor=float(self.tidi_factor),
+                parallel_disabled_reason=self.parallel_disabled_reason,
+            ),
+        )
+
+    def _refresh_squad_leaders(self) -> None:
+        self._last_tick_events.extend(self.squad_leadership.refresh(self.world).events)
 
     def _step_global_systems(self, step_start: float, step_end: float, step_perf_started: float) -> None:
         self.shutdown_parallel_workers()
         self.last_system_transfers = []
-        refresh_global_squad_leaders(self.world)
+        self._refresh_squad_leaders()
 
         perf_started = time.perf_counter()
         self.perception.run(self.world)
@@ -331,7 +417,7 @@ class SimulationEngine:
         self._log_hotspot("engine.step_total", step_perf_started, tick=self.world.tick, external_dt=self._dt, slices=substep_count)
 
     def _should_run_isolated_systems(self) -> bool:
-        if self.system_execution_mode is SystemExecutionMode.GLOBAL_LEGACY:
+        if self.system_execution_mode is SystemExecutionMode.GLOBAL_SERIAL:
             return False
         if not isinstance(self.combat, CombatSystem):
             return False
@@ -463,7 +549,7 @@ class SimulationEngine:
 
     def _step_isolated_systems(self, step_start: float, step_end: float, step_perf_started: float) -> None:
         plan = self.last_system_execution_plan
-        refresh_global_squad_leaders(self.world)
+        self._refresh_squad_leaders()
         for commander in self.commanders:
             commander.think(self.world)
         if not plan.groups:
@@ -582,197 +668,3 @@ class SimulationEngine:
             groups=len(plan.groups),
             processes=bool(plan.use_processes),
         )
-
-    def snapshot(self) -> dict:
-        ships = {}
-        for ship_id, ship in self.world.ships.items():
-            module_states: dict[str, str] = {}
-            if ship.runtime is not None:
-                module_states = {
-                    module.module_id: module.normalized_state().value
-                    for module in ship.runtime.modules
-                }
-            ships[ship_id] = {
-                "ship_id": ship_id,
-                "team": ship.team.value,
-                "squad_id": ship.squad_id,
-                "ship_group_id": str(getattr(ship, "ship_group_id", "") or ""),
-                "command_priority": int(getattr(ship, "command_priority", 0) or 0),
-                "ship_name": ship.fit.ship_name,
-                "alive": ship.vital.alive,
-                "position": {"x": ship.nav.position.x, "y": ship.nav.position.y},
-                "velocity": {"x": ship.nav.velocity.x, "y": ship.nav.velocity.y},
-                "facing_deg": ship.nav.facing_deg,
-                "system_id": str(getattr(ship.nav, "system_id", "") or ""),
-                "gate_target_structure_id": str(getattr(getattr(ship.nav, "gate", None), "target_structure_id", "") or ""),
-                "gate_cloak_active": bool(getattr(getattr(ship.nav, "cloak", None), "active", False)),
-                "gate_cloak_expires_at": float(getattr(getattr(ship.nav, "cloak", None), "expires_at", 0.0) or 0.0),
-                "gate_cloak_source": str(getattr(getattr(ship.nav, "cloak", None), "source", "") or ""),
-                "squad_follow_state": str(getattr(ship.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW"),
-                "squad_follow_leader_id": str(getattr(ship.nav, "squad_follow_leader_id", "") or ""),
-                "squad_follow_leader_location_version": int(
-                    getattr(ship.nav, "squad_follow_leader_location_version", 0) or 0
-                ),
-                "squad_follow_warp_ready": bool(getattr(ship.nav, "squad_follow_warp_ready", True)),
-                "shield": ship.vital.shield,
-                "armor": ship.vital.armor,
-                "structure": ship.vital.structure,
-                "shield_max": ship.vital.shield_max,
-                "armor_max": ship.vital.armor_max,
-                "structure_max": ship.vital.structure_max,
-                "cap": ship.vital.cap,
-                "cap_max": ship.vital.cap_max,
-                "target": ship.combat.current_target,
-                "projected_targets": {k: v for k, v in ship.combat.projected_targets.items()},
-                "prelocked_targets": sorted(str(target_id) for target_id in ship.combat.prelocked_targets),
-                "prelock_timers": {k: float(v) for k, v in ship.combat.prelock_timers.items()},
-                "module_cycle_timers": {k: float(v) for k, v in ship.combat.module_cycle_timers.items()},
-                "ecm_jam_sources": {k: float(v) for k, v in ship.combat.ecm_jam_sources.items()},
-                "ecm_last_attempt_target": ship.combat.ecm_last_attempt_target,
-                "ecm_last_attempt_module": ship.combat.ecm_last_attempt_module,
-                "ecm_last_attempt_success": ship.combat.ecm_last_attempt_success,
-                "ecm_last_attempt_chance": float(ship.combat.ecm_last_attempt_chance),
-                "ecm_last_attempt_at": float(ship.combat.ecm_last_attempt_at),
-                "ecm_last_attempt_target_by_module": {k: str(v) for k, v in ship.combat.ecm_last_attempt_target_by_module.items()},
-                "ecm_last_attempt_success_by_module": {k: bool(v) for k, v in ship.combat.ecm_last_attempt_success_by_module.items()},
-                "ecm_last_attempt_at_by_module": {k: float(v) for k, v in ship.combat.ecm_last_attempt_at_by_module.items()},
-                "module_states": module_states,
-            }
-        return {
-            "tick": self.world.tick,
-            "now": self.world.now,
-            "ships": ships,
-            "drones": {
-                drone_id: {
-                    "ship_id": drone_id,
-                    "owner_ship_id": drone.owner_ship_id,
-                    "team": drone.team.value,
-                    "squad_id": drone.squad_id,
-                    "type_name": drone.definition.type_name,
-                    "group_name": drone.definition.group_name,
-                    "max_velocity": float(drone.definition.max_velocity),
-                    "state": drone.state,
-                    "target_id": drone.target_id,
-                    "connected": bool(drone.connected),
-                    "target_command_at": float(drone.target_command_at),
-                    "alive": drone.vital.alive,
-                    "is_sentry": bool(drone.definition.is_sentry),
-                    "position": {"x": drone.nav.position.x, "y": drone.nav.position.y},
-                    "velocity": {"x": drone.nav.velocity.x, "y": drone.nav.velocity.y},
-                    "facing_deg": drone.nav.facing_deg,
-                    "system_id": str(getattr(drone.nav, "system_id", "") or ""),
-                    "shield": drone.vital.shield,
-                    "armor": drone.vital.armor,
-                    "structure": drone.vital.structure,
-                    "shield_max": drone.vital.shield_max,
-                    "armor_max": drone.vital.armor_max,
-                    "structure_max": drone.vital.structure_max,
-                    "cycle_timer": float(drone.cycle_timer),
-                    "ewar_cycle_timer": float(drone.ewar_cycle_timer),
-                }
-                for drone_id, drone in self.world.drones.items()
-            },
-            "fighters": {
-                fighter_id: {
-                    "ship_id": fighter_id,
-                    "owner_ship_id": fighter.owner_ship_id,
-                    "team": fighter.team.value,
-                    "squad_id": fighter.squad_id,
-                    "owner_squad_id": fighter.owner_squad_id,
-                    "type_name": fighter.definition.type_name,
-                    "group_name": fighter.definition.group_name,
-                    "slot_kind": fighter.definition.slot_kind,
-                    "squadron_size": int(fighter.definition.squadron_size),
-                    "max_velocity": float(fighter.definition.max_velocity),
-                    "state": fighter.state,
-                    "target_id": fighter.target_id,
-                    "connected": bool(fighter.connected),
-                    "target_command_at": float(fighter.target_command_at),
-                    "alive": fighter.vital.alive,
-                    "position": {"x": fighter.nav.position.x, "y": fighter.nav.position.y},
-                    "velocity": {"x": fighter.nav.velocity.x, "y": fighter.nav.velocity.y},
-                    "facing_deg": fighter.nav.facing_deg,
-                    "system_id": str(getattr(fighter.nav, "system_id", "") or ""),
-                    "shield": fighter.vital.shield,
-                    "armor": fighter.vital.armor,
-                    "structure": fighter.vital.structure,
-                    "shield_max": fighter.vital.shield_max,
-                    "armor_max": fighter.vital.armor_max,
-                    "structure_max": fighter.vital.structure_max,
-                    "ability_cycle_timers": {k: float(v) for k, v in fighter.ability_cycle_timers.items()},
-                    "ability_ammo_remaining": {k: int(v) for k, v in fighter.ability_ammo_remaining.items()},
-                    "ability_reload_timers": {k: float(v) for k, v in fighter.ability_reload_timers.items()},
-                    "pending_manual_abilities": sorted(str(k) for k in fighter.pending_manual_abilities),
-                    "mwd_active_timer": float(fighter.mwd_active_timer),
-                    "mwd_cooldown_timer": float(fighter.mwd_cooldown_timer),
-                }
-                for fighter_id, fighter in self.world.fighters.items()
-            },
-            "projectiles": {
-                projectile_id: {
-                    "projectile_id": projectile.projectile_id,
-                    "kind": projectile.kind,
-                    "source_ship_id": projectile.source_ship_id,
-                    "source_module_id": projectile.source_module_id,
-                    "team": projectile.team.value,
-                    "position": {"x": projectile.position.x, "y": projectile.position.y},
-                    "velocity": {"x": projectile.velocity.x, "y": projectile.velocity.y},
-                    "system_id": str(getattr(projectile, "system_id", "") or ""),
-                    "target_ship_id": projectile.target_ship_id,
-                    "speed": float(projectile.speed),
-                    "max_speed": float(projectile.max_speed),
-                    "distance_traveled": float(projectile.distance_traveled),
-                    "flight_time": float(projectile.flight_time),
-                    "age": float(projectile.age),
-                    "blast_radius": float(projectile.blast_radius),
-                }
-                for projectile_id, projectile in self.world.projectiles.items()
-            },
-            "projectile_blasts": {
-                blast_id: {
-                    "blast_id": blast.blast_id,
-                    "kind": blast.kind,
-                    "position": {"x": blast.position.x, "y": blast.position.y},
-                    "system_id": str(getattr(blast, "system_id", "") or ""),
-                    "radius_m": float(blast.radius_m),
-                    "expires_at": float(blast.expires_at),
-                }
-                for blast_id, blast in self.world.projectile_blasts.items()
-            },
-            "bubble_fields": {
-                field_id: {
-                    "field_id": field.field_id,
-                    "kind": field.kind,
-                    "interdiction_kind": field.interdiction_kind,
-                    "source_ship_id": field.source_ship_id,
-                    "source_module_id": field.source_module_id,
-                    "team": field.team.value,
-                    "position": {"x": field.position.x, "y": field.position.y},
-                    "system_id": str(getattr(field, "system_id", "") or ""),
-                    "radius_m": float(field.radius_m),
-                    "expires_at": float(field.expires_at),
-                    "blocks_warp": bool(field.blocks_warp),
-                    "speed_factor_mult": float(field.speed_factor_mult),
-                    "anchor_ship_id": field.anchor_ship_id,
-                    "alive": bool(field.alive),
-                }
-                for field_id, field in self.world.bubble_fields.items()
-            },
-            "intents": {k: asdict(v) for k, v in self.world.intents.items()},
-            "squad_leaders": {k: str(v) for k, v in self.world.squad_leaders.items()},
-            "squad_leader_location_versions": {
-                k: int(v) for k, v in self.world.squad_leader_location_versions.items()
-            },
-            "squad_propulsion_commands": {k: bool(v) for k, v in self.world.squad_propulsion_commands.items()},
-            "squad_leader_speed_limits": {k: float(v) for k, v in self.world.squad_leader_speed_limits.items()},
-            "squad_focus_queues": {k: list(v) for k, v in self.world.squad_focus_queues.items()},
-            "squad_focus_updated_at": {k: float(v) for k, v in self.world.squad_focus_updated_at.items()},
-            "simulation_metadata": {
-                "system_execution_mode": self.system_execution_mode.value,
-                "effective_system_execution_mode": self.last_effective_system_execution_mode,
-                "parallel_disabled_reason": self.parallel_disabled_reason,
-                "parallel_disabled_at_tick": self.parallel_disabled_at_tick,
-                "parallel_failure_count": self.parallel_failure_count,
-                "engine_config": asdict(self.config),
-            },
-        }

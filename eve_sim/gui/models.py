@@ -71,28 +71,12 @@ class PreferencesStore:
     def __init__(self) -> None:
         self.path = Path.home() / ".eve_sim_gui_config.json"
 
-    def _migrate_data(self, data: dict[str, object]) -> dict[str, object]:
-        migrated = dict(data)
-        raw_version = migrated.get("config_version", 1)
-        version = int(raw_version) if isinstance(raw_version, (int, float, str)) else 1
-        if version < 2:
-            legacy_team = str(migrated.get("filter_team", "ALL") or "ALL").upper()
-            legacy_enemy_only = bool(migrated.get("filter_enemy_only", False))
-            if legacy_enemy_only:
-                migrated["filter_team"] = "ENEMY"
-            elif legacy_team in ("FRIENDLY", "ENEMY", "ALL", "BLUE", "RED"):
-                migrated["filter_team"] = legacy_team
-            else:
-                migrated["filter_team"] = "ALL"
-        if version < 8:
-            try:
-                legacy_tick_rate = int(float(migrated.get("engine_tick_rate", 30)))
-            except Exception:
-                legacy_tick_rate = 30
-            if legacy_tick_rate == 30:
-                migrated["engine_tick_rate"] = 1
-        migrated["config_version"] = self.CURRENT_VERSION
-        return migrated
+    def _validated_data(self, data: dict[str, object]) -> dict[str, object]:
+        try:
+            version = int(data.get("config_version", -1))
+        except (TypeError, ValueError):
+            return {}
+        return dict(data) if version == self.CURRENT_VERSION else {}
 
     @staticmethod
     def _read_str(data: dict[str, object], key: str, default: str) -> str:
@@ -161,53 +145,53 @@ class PreferencesStore:
             if not self.path.exists():
                 return UiPreferences()
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            migrated = self._migrate_data(data if isinstance(data, dict) else {})
+            stored = self._validated_data(data if isinstance(data, dict) else {})
             defaults = UiPreferences()
             return UiPreferences(
                 config_version=self.CURRENT_VERSION,
-                selected_squad=self._read_str(migrated, "selected_squad", defaults.selected_squad),
-                selected_map_id=self._read_str(migrated, "selected_map_id", defaults.selected_map_id),
-                filter_team=self._read_filter_team(migrated, defaults.filter_team),
-                filter_role=self._read_str(migrated, "filter_role", defaults.filter_role),
-                filter_alive=self._read_str(migrated, "filter_alive", defaults.filter_alive),
-                filter_squad=self._read_str(migrated, "filter_squad", defaults.filter_squad),
-                sort_key=self._read_str(migrated, "sort_key", defaults.sort_key),
-                sort_order=self._read_str(migrated, "sort_order", defaults.sort_order),
-                zoom=self._read_float_or_none(migrated, "zoom", defaults.zoom),
-                language=self._read_str(migrated, "language", defaults.language),
-                engine_tick_rate=self._read_int(migrated, "engine_tick_rate", defaults.engine_tick_rate, 1),
+                selected_squad=self._read_str(stored, "selected_squad", defaults.selected_squad),
+                selected_map_id=self._read_str(stored, "selected_map_id", defaults.selected_map_id),
+                filter_team=self._read_filter_team(stored, defaults.filter_team),
+                filter_role=self._read_str(stored, "filter_role", defaults.filter_role),
+                filter_alive=self._read_str(stored, "filter_alive", defaults.filter_alive),
+                filter_squad=self._read_str(stored, "filter_squad", defaults.filter_squad),
+                sort_key=self._read_str(stored, "sort_key", defaults.sort_key),
+                sort_order=self._read_str(stored, "sort_order", defaults.sort_order),
+                zoom=self._read_float_or_none(stored, "zoom", defaults.zoom),
+                language=self._read_str(stored, "language", defaults.language),
+                engine_tick_rate=self._read_int(stored, "engine_tick_rate", defaults.engine_tick_rate, 1),
                 engine_physics_substeps=self._read_int(
-                    migrated,
+                    stored,
                     "engine_physics_substeps",
                     defaults.engine_physics_substeps,
                     1,
                 ),
-                engine_lockstep=self._read_bool(migrated, "engine_lockstep", defaults.engine_lockstep),
+                engine_lockstep=self._read_bool(stored, "engine_lockstep", defaults.engine_lockstep),
                 engine_parallel_systems=self._read_bool(
-                    migrated, "engine_parallel_systems", defaults.engine_parallel_systems
+                    stored, "engine_parallel_systems", defaults.engine_parallel_systems
                 ),
                 engine_detailed_logging=self._read_bool(
-                    migrated,
+                    stored,
                     "engine_detailed_logging",
                     defaults.engine_detailed_logging,
                 ),
                 engine_hotspot_logging=self._read_bool(
-                    migrated,
+                    stored,
                     "engine_hotspot_logging",
                     defaults.engine_hotspot_logging,
                 ),
                 engine_detail_log_file=self._read_str(
-                    migrated,
+                    stored,
                     "engine_detail_log_file",
                     defaults.engine_detail_log_file,
                 ),
                 engine_hotspot_log_file=self._read_str(
-                    migrated,
+                    stored,
                     "engine_hotspot_log_file",
                     defaults.engine_hotspot_log_file,
                 ),
                 engine_log_merge_window_sec=self._read_float(
-                    migrated,
+                    stored,
                     "engine_log_merge_window_sec",
                     defaults.engine_log_merge_window_sec,
                     0.1,

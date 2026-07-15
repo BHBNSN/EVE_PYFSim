@@ -16,15 +16,11 @@ from PySide6.QtWidgets import (
 from .fleet_setup_dialog import FleetSetupDialog
 from .language_controls import language_icon_label
 from .main_window import MainWindow
-from ..agents import CommanderAgent
+from ..application import MatchApplicationFactory
 from ..config import UiConfig
-from ..fleet_setup import build_world_from_manual_setup
 from ..i18n import detect_system_language, install_language, language_options, normalize_language
 from ..lan_session import ClientLanSession, HostLanSession
 from ..models import Team
-from ..pyfa_bridge import PyfaBridge
-from ..simulation_engine import SimulationEngine
-from ..systems import CombatSystem
 
 
 class _StartupModeDialog(QDialog):
@@ -178,27 +174,17 @@ def run_gui() -> None:
         if lan_client is not None:
             lan_client.close()
         return
-    pyfa = PyfaBridge()
     cfg = setup_dialog.to_engine_config()
     selected_map = setup_dialog.selected_map_definition()
-    world = build_world_from_manual_setup(manual_setup, map_definition=selected_map)
-    engine = SimulationEngine(world=world, config=cfg, combat_system=CombatSystem(pyfa))
-
-    blue_squads = sorted({s.squad_id for s in world.ships.values() if s.team == Team.BLUE})
-    red_squads = sorted({s.squad_id for s in world.ships.values() if s.team == Team.RED})
-    blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=blue_squads)
-    red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=red_squads)
-    engine.register_commander(blue_commander)
-    engine.register_commander(red_commander)
-    for ship_id in world.ships:
-        engine.register_ship(ship_id)
+    match = MatchApplicationFactory.from_manual_setup(
+        manual_setup,
+        cfg,
+        map_definition=selected_map,
+    )
 
     win = MainWindow(
-        engine=engine,
+        application=match,
         ui_cfg=UiConfig(),
-        blue_commander=blue_commander,
-        red_commander=red_commander,
-        manual_setup=manual_setup,
         network_mode=network_mode,
         controlled_team=controlled_team,
         lan_server=lan_server,

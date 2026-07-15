@@ -42,13 +42,11 @@ def normalized_snapshot_projection_signature(
 
 def projected_snapshot_module_signature(
     snapshot: Mapping[str, Any],
-    *,
-    legacy_builder: Callable[[Mapping[str, Any]], tuple[Any, ...]],
 ) -> tuple[Any, ...]:
     direct_signature = normalize_projection_effect_signature(snapshot.get("pyfa_projection_module_signature"))
-    if direct_signature is not None:
-        return direct_signature
-    return legacy_builder(snapshot)
+    if direct_signature is None:
+        raise ValueError("projected snapshot requires pyfa_projection_module_signature")
+    return direct_signature
 
 
 def projected_snapshot_list_signature(

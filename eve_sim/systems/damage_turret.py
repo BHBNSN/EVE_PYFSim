@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+from ..math2d import Vector2
+from ..models import ShipProfile
+from ..world import WorldState
+from .constants import REPAIR_QUEUE_LAYERS
+from .models import CycleTargetSnapshot, _apply_damage_sequence, _scale_damage, _sum_damage
 
 
 class DamageTurretMixin:
@@ -184,7 +188,7 @@ class DamageTurretMixin:
                     },
                 )
         if alive_before and not target.vital.alive:
-            dirty_layers.update(_REPAIR_QUEUE_LAYERS)
+            dirty_layers.update(REPAIR_QUEUE_LAYERS)
         if dirty_layers:
             self._mark_team_repair_queues_dirty(target.team, *dirty_layers)
 

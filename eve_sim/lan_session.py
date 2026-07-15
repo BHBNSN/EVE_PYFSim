@@ -36,8 +36,7 @@ def _encode_packet(packet_type: str, payload: dict[str, Any], packet_id: int) ->
         "version": _PROTOCOL_VERSION,
         "id": int(packet_id),
         "ts": float(time.time()),
-        # Keep legacy field name for backward compatibility.
-        "type": str(packet_type),
+        "kind": str(packet_type),
         "payload": payload,
     }
     return (json.dumps(envelope, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -52,18 +51,17 @@ def _decode_packet(line: bytes) -> tuple[str, dict[str, Any]] | None:
         return None
 
     protocol = raw.get("protocol")
-    if protocol is not None and str(protocol) != _PROTOCOL_NAME:
+    if str(protocol or "") != _PROTOCOL_NAME:
         return None
 
     version = raw.get("version")
-    if version is not None:
-        try:
-            if int(version) > _PROTOCOL_VERSION:
-                return None
-        except Exception:
+    try:
+        if int(version) != _PROTOCOL_VERSION:
             return None
+    except (TypeError, ValueError):
+        return None
 
-    packet_type = raw.get("type", raw.get("kind"))
+    packet_type = raw.get("kind")
     payload = raw.get("payload")
     if not isinstance(packet_type, str) or not packet_type:
         return None

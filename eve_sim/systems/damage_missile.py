@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+from ..models import ProjectileEntity, ShipProfile
 
 
 class DamageMissileMixin:

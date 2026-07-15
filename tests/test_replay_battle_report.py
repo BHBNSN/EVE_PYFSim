@@ -7,7 +7,7 @@ from eve_sim.math2d import Vector2
 from eve_sim.models import CombatState, FitDescriptor, NavigationState, QualityLevel, QualityState, ShipEntity, ShipProfile, Team, VitalState
 from eve_sim.pyfa_bridge import PyfaBridge
 from eve_sim.replay import CombatEvent, ReplayPlayer, ReplayRecorder
-from eve_sim.replay.snapshot_mapper import apply_snapshot_to_world
+from eve_sim.serialization import SnapshotLoader
 from eve_sim.systems import CombatSystem
 from eve_sim.world import WorldState
 
@@ -239,9 +239,9 @@ def test_battle_report_service_aggregates_event_stream() -> None:
     ]
 
 
-def test_replay_snapshot_mapper_rebuilds_display_world() -> None:
+def test_snapshot_loader_rebuilds_display_world() -> None:
     world = WorldState()
-    apply_snapshot_to_world(
+    SnapshotLoader().apply_replica(
         world,
         {
             "tick": 12,

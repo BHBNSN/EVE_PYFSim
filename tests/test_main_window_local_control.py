@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import QApplication
 
+from eve_sim.application import MatchApplication
 from eve_sim.agents import CommanderAgent
 from eve_sim.config import EngineConfig, UiConfig
 from eve_sim.fit_runtime import EffectClass, FitRuntime, HullProfile, ModuleEffect, ModuleRuntime, ModuleState, SkillProfile
@@ -197,19 +198,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -238,8 +236,8 @@ class MainWindowLocalControlTests(unittest.TestCase):
         blue_ship = _make_ship("blue-1", Team.BLUE, "BLUE-ALPHA", Vector2(0.0, 0.0))
         world = WorldState(ships={blue_ship.ship_id: blue_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         engine.register_ship(blue_ship.ship_id)
@@ -248,11 +246,8 @@ class MainWindowLocalControlTests(unittest.TestCase):
         dialog_instance.exec.return_value = 0
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -280,19 +275,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -332,19 +324,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -352,8 +341,9 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.discard(blue_ship.ship_id)
-            window.engine.world.ships[blue_ship.ship_id].vital.alive = True
+            blue_ship.deployed = True
+            engine.world.ships[blue_ship.ship_id].vital.alive = True
+            window.runtime_view.refresh()
             window.refresh_blue_roster()
             window.request_overview_refresh(force=True)
 
@@ -387,19 +377,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_a.ship_id: blue_a, blue_b.ship_id: blue_b, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -408,8 +395,9 @@ class MainWindowLocalControlTests(unittest.TestCase):
             window.tick_timer.stop()
             window.render_timer.stop()
             for ship_id in (blue_a.ship_id, blue_b.ship_id):
-                window._undeployed_ship_ids.discard(ship_id)
-                window.engine.world.ships[ship_id].vital.alive = True
+                engine.world.ships[ship_id].deployed = True
+                engine.world.ships[ship_id].vital.alive = True
+            window.runtime_view.refresh()
             window.refresh_blue_roster()
 
             selection_model = window.blue_roster.selectionModel()
@@ -452,19 +440,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -472,13 +457,14 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.discard(blue_ship.ship_id)
-            window.engine.world.ships[blue_ship.ship_id].vital.alive = True
+            blue_ship.deployed = True
+            engine.world.ships[blue_ship.ship_id].vital.alive = True
             window.ui_state.selected_squad = "BLUE-ALPHA"
             window.canvas.selected_squad = "BLUE-ALPHA"
             focus_key = f"{Team.BLUE.value}:BLUE-ALPHA"
-            window.engine.world.squad_focus_queues[focus_key] = [red_ship.ship_id]
+            engine.world.squad_focus_queues[focus_key] = [red_ship.ship_id]
             blue_ship.combat.prelocked_targets.add(red_ship.ship_id)
+            window.runtime_view.refresh()
 
             friendly_menu = window._build_ship_context_menu(blue_ship.ship_id)
             enemy_menu = window._build_ship_context_menu(red_ship.ship_id)
@@ -511,20 +497,21 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         world.squad_leaders[f"{Team.BLUE.value}:BLUE-ALPHA"] = blue_ship.ship_id
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        engine = SimulationEngine(
+            world,
+            EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False),
+            CombatSystem(PyfaBridge()),
+        )
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -532,7 +519,9 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for ship in engine.world.ships.values():
+                ship.deployed = True
+            blue_ship.vital.alive = True
             window.ui_state.selected_squad = "BLUE-ALPHA"
             window.canvas.selected_squad = "BLUE-ALPHA"
 
@@ -544,14 +533,12 @@ class MainWindowLocalControlTests(unittest.TestCase):
             ten_km_action = next(action for action in orbit_menu.actions() if action.text() == "10 km")
 
             ten_km_action.trigger()
-            window._flush_tick_ops()
+            tick_result = window.application.step()[0]
 
-            intent = window.engine.world.intents[f"{Team.BLUE.value}:BLUE-ALPHA"]
-            self.assertEqual(intent.movement_mode, "orbit")
-            self.assertEqual(intent.target_ship_id, red_ship.ship_id)
-            self.assertIsNone(intent.target_structure_id)
-            self.assertEqual(intent.target_range_m, 10_000.0)
-            self.assertEqual(intent.target_position, red_ship.nav.position)
+            navigation_events = [event for event in tick_result.events if event.kind == "squad_navigation_changed"]
+            self.assertEqual(len(navigation_events), 1)
+            self.assertEqual(navigation_events[0].payload.get("mode"), "orbit")
+            self.assertEqual(navigation_events[0].payload.get("squad_id"), "BLUE-ALPHA")
         finally:
             window.close()
 
@@ -569,19 +556,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -589,16 +573,19 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for ship in engine.world.ships.values():
+                ship.deployed = True
             blue_ship.vital.alive = True
             red_ship.vital.alive = True
             world.squad_leaders[f"{Team.BLUE.value}:BLUE-ALPHA"] = blue_ship.ship_id
             blue_ship.nav.command_mode = "orbit"
             blue_ship.nav.command_target_ship_id = red_ship.ship_id
             blue_ship.nav.command_target = Vector2(red_ship.nav.position.x, red_ship.nav.position.y)
+            window.runtime_view.refresh()
 
             first_target = window._guidance_target_for_squad("BLUE-ALPHA")
             red_ship.nav.position = Vector2(25_000.0, 5_000.0)
+            window.runtime_view.refresh()
             window.canvas.note_authoritative_frame()
             second_target = window._guidance_target_for_squad("BLUE-ALPHA")
 
@@ -630,8 +617,8 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_ship("red-1", Team.RED, "RED-ALPHA", Vector2(0.0, 0.0))
         world = WorldState(ships={red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=[])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
@@ -639,11 +626,8 @@ class MainWindowLocalControlTests(unittest.TestCase):
 
         lan_client = _FakeLanClient()
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="client",
             controlled_team=Team.RED,
             lan_client=lan_client,
@@ -652,13 +636,15 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._ship_fit_texts[red_ship.ship_id] = "[Onyx, Test]\nWarp Disruption Field Generator I\n"
+            red_ship.fit_text = "[Onyx, Test]\nWarp Disruption Field Generator I\n"
 
             ok, _message = window._set_ship_module_charge_lock(red_ship.ship_id, "mod-1", "")
 
             self.assertTrue(ok)
+            payload = dict(lan_client.sent_commands[-1])
+            self.assertTrue(payload.pop("command_id"))
             self.assertEqual(
-                lan_client.sent_commands[-1],
+                payload,
                 {
                     "kind": CMD_SET_MODULE_CHARGE_LOCK,
                     "ship_id": red_ship.ship_id,
@@ -682,20 +668,21 @@ class MainWindowLocalControlTests(unittest.TestCase):
         blue_ship = _make_runtime_ship("blue-1", Team.BLUE, "BLUE-ALPHA", Vector2(0.0, 0.0), "blue-fit")
         red_ship = _make_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(100.0, 0.0), "red-fit")
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        engine = SimulationEngine(
+            world,
+            EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False),
+            CombatSystem(PyfaBridge()),
+        )
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="host",
             controlled_team=Team.BLUE,
         )
@@ -704,8 +691,9 @@ class MainWindowLocalControlTests(unittest.TestCase):
             window.tick_timer.stop()
             window.render_timer.stop()
             ok, message = window._set_ship_module_manual_mode(red_ship.ship_id, "mod-1", "active")
-            self.assertFalse(ok)
+            self.assertTrue(ok)
             self.assertTrue(message)
+            window.application.step()
             self.assertNotIn("mod-1", red_ship.combat.module_manual_modes)
         finally:
             window.close()
@@ -733,19 +721,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(0.0, 0.0), "shared-fit")
         world = WorldState(ships={red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=[])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         engine.register_ship(red_ship.ship_id)
 
         lan_client = _FakeLanClient()
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="client",
             controlled_team=Team.RED,
             lan_client=lan_client,
@@ -767,8 +752,10 @@ class MainWindowLocalControlTests(unittest.TestCase):
             self.assertTrue(ok_mode)
             self.assertTrue(ok_target)
             self.assertTrue(ok_sync)
+            payloads = [dict(payload) for payload in lan_client.sent_commands]
+            self.assertTrue(all(payload.pop("command_id", "") for payload in payloads))
             self.assertEqual(
-                lan_client.sent_commands,
+                payloads,
                 [
                     {
                         "kind": CMD_SET_MODULE_MANUAL_MODE,
@@ -807,18 +794,15 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_targeting_runtime_ship("red-1", Team.RED, "RED-ALPHA", Vector2(0.0, 0.0), "shared-fit")
         world = WorldState(ships={red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=[])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         engine.register_ship(red_ship.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="client",
             controlled_team=Team.RED,
         )
@@ -826,7 +810,7 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._apply_remote_snapshot(
+            window.network.apply_remote_packet(
                 {
                     "snapshot": {
                         "tick": 1,
@@ -855,9 +839,10 @@ class MainWindowLocalControlTests(unittest.TestCase):
                     }
                 }
             )
+            window.runtime_view.refresh()
 
-            self.assertEqual(window.engine.world.ships[red_ship.ship_id].combat.module_manual_modes.get("mod-1"), "active")
-            self.assertEqual(window.engine.world.ships[red_ship.ship_id].combat.module_target_modes.get("mod-1"), "enemy_nearest")
+            self.assertEqual(engine.world.ships[red_ship.ship_id].combat.module_manual_modes.get("mod-1"), "active")
+            self.assertEqual(engine.world.ships[red_ship.ship_id].combat.module_target_modes.get("mod-1"), "enemy_nearest")
         finally:
             window.close()
 
@@ -875,19 +860,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         red_ship = _make_ship("red-1", Team.RED, "RED-ALPHA", Vector2(10_000.0, 0.0))
         world = WorldState(ships={blue_ship.ship_id: blue_ship, red_ship.ship_id: red_ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -895,9 +877,11 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for ship in engine.world.ships.values():
+                ship.deployed = True
             blue_ship.vital.alive = True
             red_ship.vital.alive = True
+            window.runtime_view.refresh()
             window._sync_blue_squads()
             window.refresh_blue_roster()
             window.overview_proxy.apply_preferences()
@@ -962,19 +946,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         blue_c = _make_runtime_ship("blue-3", Team.BLUE, "BLUE-ALPHA", Vector2(200.0, 0.0), "other-fit")
         world = WorldState(ships={ship.ship_id: ship for ship in (blue_a, blue_b, blue_c)})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -987,6 +968,7 @@ class MainWindowLocalControlTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertIn("2", message)
+            window.application.step()
             self.assertEqual(blue_a.combat.module_manual_modes.get("mod-1"), "active")
             self.assertEqual(blue_b.combat.module_manual_modes.get("mod-1"), "active")
             self.assertNotIn("mod-1", blue_c.combat.module_manual_modes)
@@ -1010,19 +992,16 @@ class MainWindowLocalControlTests(unittest.TestCase):
         blue_c = _make_targeting_runtime_ship("blue-3", Team.BLUE, "BLUE-ALPHA", Vector2(200.0, 0.0), "other-fit")
         world = WorldState(ships={ship.ship_id: ship for ship in (blue_a, blue_b, blue_c)})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -1034,6 +1013,7 @@ class MainWindowLocalControlTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertIn("2", message)
+            window.application.step()
             self.assertEqual(blue_a.combat.module_manual_modes.get("mod-1"), "active")
             self.assertEqual(blue_b.combat.module_manual_modes.get("mod-1"), "active")
             self.assertNotIn("mod-1", blue_c.combat.module_manual_modes)
@@ -1061,20 +1041,21 @@ class MainWindowLocalControlTests(unittest.TestCase):
             Order(kind="ATTACK", payload={"target_id": red_target.ship_id}, issue_time=0.0),
         ]
         world = WorldState(ships={ship.ship_id: ship for ship in (blue_far, blue_near, red_target)})
-        engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-ALPHA"])
+        engine = SimulationEngine(
+            world,
+            EngineConfig(tick_rate=1, physics_substeps=1, isolate_systems=False),
+            CombatSystem(PyfaBridge()),
+        )
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
             network_mode="local",
             controlled_team=Team.BLUE,
         )
@@ -1082,23 +1063,20 @@ class MainWindowLocalControlTests(unittest.TestCase):
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for ship in engine.world.ships.values():
+                ship.deployed = True
             blue_far.vital.alive = True
             blue_near.vital.alive = True
             red_target.vital.alive = True
             window._sync_blue_squads()
             window.refresh_blue_roster()
-            scoped_key = window._focus_key(Team.BLUE, "BLUE-ALPHA")
-            window._squad_approach_targets[scoped_key] = red_target.ship_id
-
             window.issue_warp_to_ship("BLUE-ALPHA", red_target.ship_id)
-            window._flush_tick_ops()
+            window.application.step()
 
-            self.assertNotIn(scoped_key, window._squad_approach_targets)
-            self.assertEqual(len(blue_far.order_queue), 1)
-            self.assertEqual(blue_far.order_queue[0].kind, "WARP")
-            self.assertEqual(blue_far.order_queue[0].payload.get("target_ship_id"), red_target.ship_id)
-            self.assertEqual(blue_near.order_queue, [])
+            self.assertEqual(blue_far.nav.warp.phase, "align")
+            self.assertEqual(blue_far.nav.warp.target_ship_id, red_target.ship_id)
+            self.assertEqual(blue_near.nav.warp.phase, "idle")
+            self.assertFalse(any(order.kind == "WARP" for order in blue_near.order_queue))
         finally:
             window.close()
 

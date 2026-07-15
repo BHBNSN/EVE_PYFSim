@@ -212,7 +212,7 @@ class ShipStatusDialogTests(unittest.TestCase):
             return True, f"sync:{module_id}:{target_mode}:{mode}"
 
         dialog = ShipStatusDialog(
-            engine=engine,
+            runtime_view=engine,
             ship_id=ship.ship_id,
             language_getter=lambda: "zh_CN",
             fit_text_getter=lambda _ship_id: fit_text,
@@ -224,6 +224,10 @@ class ShipStatusDialogTests(unittest.TestCase):
             module_mode_getter=lambda _ship_id, module_id: local_module_modes.get(module_id, "auto"),
             module_mode_setter=module_mode_setter or default_module_mode_setter,
             module_control_sync_setter=module_control_sync_setter or default_module_control_sync_setter,
+            module_target_rules_getter=lambda _ship_id, _module_id: (
+                ("weapon_focus_prefocus", "enemy_nearest", "enemy_random"),
+                "weapon_focus_prefocus",
+            ),
         )
         dialog.timer.stop()
         dialog._test_module_target_modes = local_target_modes
@@ -271,7 +275,7 @@ class ShipStatusDialogTests(unittest.TestCase):
 
         dialog = self._make_dialog(other_ships=[outgoing_locked, outgoing_locking, incoming_locked, incoming_locking])
         try:
-            ship = dialog.engine.world.ships["blue-1"]
+            ship = dialog.runtime_view.world.ships["blue-1"]
             ship.combat.lock_targets = {"red-1", "red-2"}
             ship.combat.lock_timers["red-3"] = 2.5
             dialog.tabs.setCurrentIndex(3)
@@ -288,7 +292,7 @@ class ShipStatusDialogTests(unittest.TestCase):
     def test_status_dialog_uses_live_effective_profile_instead_of_cached_pyfa_base_profile(self) -> None:
         dialog = self._make_dialog()
         try:
-            ship = dialog.engine.world.ships["blue-1"]
+            ship = dialog.runtime_view.world.ships["blue-1"]
             assert ship.runtime is not None
             ship.runtime.diagnostics["pyfa_base_profile"] = replace(
                 ship.runtime.diagnostics["pyfa_base_profile"],
@@ -483,7 +487,7 @@ class ShipStatusDialogTests(unittest.TestCase):
         world = WorldState(ships={ship.ship_id: ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
         canvas = BattleCanvas(
-            engine=engine,
+            runtime_view=engine,
             ui_cfg=UiConfig(),
             on_issue_move=lambda *_args: None,
             on_issue_approach=lambda *_args: None,
@@ -541,7 +545,7 @@ class ShipStatusDialogTests(unittest.TestCase):
         )
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
         canvas = BattleCanvas(
-            engine=engine,
+            runtime_view=engine,
             ui_cfg=UiConfig(),
             on_issue_move=lambda *_args: None,
             on_issue_approach=lambda *_args: None,
@@ -572,7 +576,7 @@ class ShipStatusDialogTests(unittest.TestCase):
 
     def test_battle_canvas_zoom_uses_normalized_minimum(self) -> None:
         canvas = BattleCanvas(
-            engine=SimulationEngine(WorldState(), EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge())),
+            runtime_view=SimulationEngine(WorldState(), EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge())),
             ui_cfg=UiConfig(),
             on_issue_move=lambda *_args: None,
             on_issue_approach=lambda *_args: None,
@@ -609,7 +613,7 @@ class ShipStatusDialogTests(unittest.TestCase):
         world = WorldState(ships={ship.ship_id: ship})
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
         canvas = BattleCanvas(
-            engine=engine,
+            runtime_view=engine,
             ui_cfg=UiConfig(),
             on_issue_move=lambda *_args: None,
             on_issue_approach=lambda *_args: None,
@@ -669,7 +673,7 @@ class ShipStatusDialogTests(unittest.TestCase):
         world.now = 10.0
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
         canvas = BattleCanvas(
-            engine=engine,
+            runtime_view=engine,
             ui_cfg=UiConfig(),
             on_issue_move=lambda *_args: None,
             on_issue_approach=lambda *_args: None,
@@ -726,7 +730,7 @@ class ShipStatusDialogTests(unittest.TestCase):
         )
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=1), CombatSystem(PyfaBridge()))
         canvas = BattleCanvas(
-            engine=engine,
+            runtime_view=engine,
             ui_cfg=UiConfig(),
             on_issue_move=lambda *_args: None,
             on_issue_approach=lambda *_args: None,

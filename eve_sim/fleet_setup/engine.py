@@ -1,13 +1,11 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from collections import Counter
 from copy import deepcopy
-import hashlib
 import importlib
 import math
 import random
-import re
 from pathlib import Path
 import sqlite3
 import sys
@@ -3306,26 +3304,8 @@ def _normalized_snapshot_projection_signature(snapshot: dict[str, Any]) -> tuple
     return shared_normalized_snapshot_projection_signature(snapshot, bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M)
 
 
-def _projected_snapshot_legacy_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
-    blueprint_raw = snapshot.get("blueprint")
-    blueprint: dict[str, Any] = blueprint_raw if isinstance(blueprint_raw, dict) else {}
-    state_raw = snapshot.get("state_by_module_id")
-    state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
-    command_raw = snapshot.get("command_booster_snapshots")
-    command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
-    return (
-        "legacy_source",
-        _runtime_blueprint_signature(blueprint),
-        _module_state_signature({str(module_id): str(state) for module_id, state in state_by_module_id.items()}),
-        tuple(sorted(_command_snapshot_signature(command_snapshot) for command_snapshot in command_snapshots)),
-    )
-
-
 def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
-    return shared_projected_snapshot_module_signature(
-        snapshot,
-        legacy_builder=_projected_snapshot_legacy_module_signature,
-    )
+    return shared_projected_snapshot_module_signature(snapshot)
 
 
 def _normalized_projected_source_snapshots(
@@ -3953,6 +3933,7 @@ def build_world_from_manual_setup(
                 ignore_order_probability=quality.ignore_order_probability,
                 formation_jitter=quality.formation_jitter,
             ),
+            fit_text=setup.fit_text,
             drone_bay=list(drone_bay),
             fighter_bay=list(fighter_bay),
             deployable_control=deepcopy(deployable_control),

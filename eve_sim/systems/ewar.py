@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+import random
+
+from ..fit_runtime import EffectClass
+from ..models import ShipProfile
+from ..world import WorldState
 
 
 class EwarMixin:

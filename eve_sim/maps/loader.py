@@ -97,7 +97,6 @@ def deserialize_map_definition(payload: dict[str, object]) -> MapDefinition:
             MapSystemDefinition(
                 system_id=system_id,
                 name=str(raw_system.get("name", system_id) or system_id),
-                origin=_vector_from_payload(raw_system.get("origin")),
                 radius_m=max(1_000.0, float(raw_system.get("radius_m", 1_000.0) or 1_000.0)),
                 buildings=buildings,
                 spawn_anchors=spawn_anchors,

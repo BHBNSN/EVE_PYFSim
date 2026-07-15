@@ -5,20 +5,20 @@ from typing import Callable
 from PySide6.QtCore import Qt, QCoreApplication
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from ..simulation_engine import SimulationEngine
+from .adapters.runtime_view import WorldViewSource
 from .system_graph_canvas import SystemGraphCanvas
 
 
 class SystemGraphWindow(QWidget):
     def __init__(
         self,
-        engine: SimulationEngine,
+        runtime_view: WorldViewSource,
         current_system_getter: Callable[[], str],
         jump_to_system: Callable[[str], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.engine = engine
+        self.runtime_view = runtime_view
         self.current_system_getter = current_system_getter
         self.jump_to_system = jump_to_system
         self.setWindowTitle(QCoreApplication.translate("eve_sim", "System Map"))
@@ -26,7 +26,7 @@ class SystemGraphWindow(QWidget):
 
         layout = QVBoxLayout(self)
         self.canvas = SystemGraphCanvas(
-            lambda: getattr(self.engine.world, "map_definition", None),
+            lambda: getattr(self.runtime_view.world, "map_definition", None),
             self.current_system_getter,
             self.jump_to_system,
             self,

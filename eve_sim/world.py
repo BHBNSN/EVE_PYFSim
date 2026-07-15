@@ -42,10 +42,6 @@ class WorldState:
     projectile_blasts: dict[str, ProjectileBlast] = field(default_factory=dict)
     bubble_fields: dict[str, BubbleField] = field(default_factory=dict)
 
-    @property
-    def beacons(self) -> dict[str, StructureEntity]:
-        return self.structures
-
     def combat_entity(self, entity_id: str | None):
         key = str(entity_id or "").strip()
         if not key:

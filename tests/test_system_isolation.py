@@ -12,13 +12,13 @@ import pytest
 import eve_sim.simulation_engine as simulation_engine_module
 
 from eve_sim.config import EngineConfig
-from eve_sim.agents import (
+from eve_sim.agents import ShipAgent
+from eve_sim.domain.squad_follow_service import (
     FOLLOW_LEADER_SYSTEM,
     FORMATION_FOLLOW,
     WARP_TO_LEADER,
-    ShipAgent,
-    refresh_global_squad_leaders,
 )
+from eve_sim.domain.squad_service import SquadLeadershipService
 from eve_sim.math2d import Vector2
 from eve_sim.models import (
     BubbleField,
@@ -41,6 +41,7 @@ from eve_sim.models import (
     VitalState,
 )
 from eve_sim.pyfa_bridge import PyfaBridge
+from eve_sim.serialization import SnapshotBuilder
 from eve_sim.simulation_engine import SimulationEngine
 from eve_sim.system_isolation import (
     DuplicateEntityIdError,
@@ -447,7 +448,7 @@ def test_legacy_world_requires_explicit_global_mode() -> None:
         CombatSystem(PyfaBridge()),
     )
     legacy_engine.step()
-    assert legacy_engine.system_execution_mode is SystemExecutionMode.GLOBAL_LEGACY
+    assert legacy_engine.system_execution_mode is SystemExecutionMode.GLOBAL_SERIAL
     assert legacy_world.tick == 1
 
 
@@ -785,7 +786,7 @@ def test_same_squad_shards_read_one_global_leader() -> None:
         squad_leaders={"BLUE:A": alpha.ship_id},
         squad_focus_queues={"BLUE:A": [target.ship_id]},
     )
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
 
     alpha_task = build_system_shard(world, "alpha", {})
     beta_task = build_system_shard(world, "beta", {})
@@ -885,11 +886,11 @@ def test_leader_system_change_increments_version_and_clears_focus() -> None:
         squad_focus_queues={"BLUE:A": [target.ship_id]},
         squad_focus_updated_at={"BLUE:A": 1.0},
     )
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
     initial_version = world.squad_leader_location_versions["BLUE:A"]
 
     leader.nav.system_id = "beta"
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
 
     assert world.squad_leader_location_versions["BLUE:A"] == initial_version + 1
     assert "BLUE:A" not in world.squad_focus_queues
@@ -910,7 +911,7 @@ def test_dead_leader_is_replaced_deterministically_by_local_same_group() -> None
         squad_leaders={"BLUE:A": dead.ship_id},
     )
 
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
 
     assert world.squad_leaders["BLUE:A"] == local_same.ship_id
 
@@ -931,7 +932,7 @@ def test_cross_system_member_routes_to_global_leader_and_drops_combat() -> None:
         squad_leaders={"BLUE:A": leader.ship_id},
         squad_focus_queues={"BLUE:A": [enemy.ship_id]},
     )
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
     agent = ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id)
 
     agent.think(world)
@@ -951,7 +952,7 @@ def test_same_system_follow_warp_uses_170_150_km_hysteresis() -> None:
         ships={leader.ship_id: leader, follower.ship_id: follower},
         squad_leaders={"BLUE:A": leader.ship_id},
     )
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
     agent = ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id)
 
     agent.think(world)
@@ -981,7 +982,7 @@ def test_same_system_follow_waits_for_existing_warp_to_finish() -> None:
         ships={leader.ship_id: leader, follower.ship_id: follower},
         squad_leaders={"BLUE:A": leader.ship_id},
     )
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
 
     ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id).think(world)
 
@@ -1002,14 +1003,14 @@ def test_leader_system_change_cancels_old_local_warp_and_replans_gate() -> None:
         },
         squad_leaders={"BLUE:A": leader.ship_id},
     )
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
     agent = ShipAgent(agent_id="agent:follower", ship_id=follower.ship_id)
     agent.think(world)
     old_version = follower.nav.squad_follow_leader_location_version
     assert follower.nav.warp.target_ship_id == leader.ship_id
 
     leader.nav.system_id = "beta"
-    refresh_global_squad_leaders(world)
+    SquadLeadershipService().refresh(world)
     agent.think(world)
 
     assert follower.nav.squad_follow_state == FOLLOW_LEADER_SYSTEM
@@ -1136,6 +1137,7 @@ def test_parallel_systems_true_runs_real_process_pool(tmp_path) -> None:
             from eve_sim.math2d import Vector2
             from eve_sim.models import CombatState, FitDescriptor, NavigationState, QualityLevel, QualityState, ShipEntity, Team, VitalState
             from eve_sim.pyfa_bridge import PyfaBridge
+            from eve_sim.serialization import SnapshotBuilder
             from eve_sim.simulation_engine import SimulationEngine
             from eve_sim.system_isolation import SystemExecutionMode
             from eve_sim.systems import CombatSystem
@@ -1197,8 +1199,8 @@ def test_parallel_systems_true_runs_real_process_pool(tmp_path) -> None:
                     serial_engine.step()
                 assert engine.last_system_execution_plan.use_processes
                 assert engine.last_system_parallel_error is None
-                parallel_snapshot = engine.snapshot()
-                serial_snapshot = serial_engine.snapshot()
+                parallel_snapshot = SnapshotBuilder().build(world)
+                serial_snapshot = SnapshotBuilder().build(serial_world)
                 for key in (
                         "ships", "drones", "fighters", "projectiles", "projectile_blasts",
                         "bubble_fields", "intents", "squad_leaders",

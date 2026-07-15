@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+from ..fit_runtime import EffectClass, ModuleEffect, ModuleState
+from ..math2d import Vector2
+from ..models import BubbleField
+from ..system_identity import normalize_system_namespace
+from ..world import WorldState
+from .models import DamageTuple, _layer_effective_damage, _scale_damage, _sum_damage
 
 
 class BubblesMixin:
@@ -134,7 +139,7 @@ class BubblesMixin:
         if radius_m <= 0.0 or duration_sec <= 0.0 or self._bubble_follows_owner(effect):
             return
         system_id = str(getattr(source.nav, "system_id", "") or "")
-        namespace = normalize_system_namespace(system_id or self._system_id or "legacy")
+        namespace = normalize_system_namespace(system_id or self._system_id or "global")
         self._bubble_seq += 1
         field_id = f"bubble:{namespace}:{self._bubble_seq}"
         shield_max = max(0.0, float(effect.local_add.get("bubble_shield_hp", 0.0) or 0.0))

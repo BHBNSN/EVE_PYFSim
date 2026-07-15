@@ -1,96 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-from copy import deepcopy
-import json
-import math
-from pathlib import Path
-import random
-import time
-from typing import Any, Callable, Literal, cast
+from typing import Callable
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QHBoxLayout,
-    QHeaderView,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMenu,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QSpinBox,
-    QSplitter,
-    QStyledItemDelegate,
-    QTableView,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QTimer, Qt, QCoreApplication
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QComboBox, QStyledItemDelegate, QWidget
 
-from ..agents import CommanderAgent
-from ..config import EngineConfig, UiConfig
-from ..fleet_setup import (
-    ManualShipSetup,
-    ParsedModuleSpec,
-    build_world_from_manual_setup,
-    EftFitParser,
-    RuntimeFromEftFactory,
-    recompute_profile_from_pyfa_runtime,
-    get_charge_options_for_module,
-    get_fit_backend_status,
-    get_common_chargeable_modules,
-    get_module_reload_time_sec,
-    resolve_module_type_name,
-    get_type_display_name,
-)
-from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-
-from ..lan_session import ClientLanSession, HostLanSession
-from ..lan_commands import (
-    CMD_INDUCE_FLEET_AT,
-    CMD_INDUCE_SQUAD_AT,
-    CMD_SQUAD_APPROACH,
-    CMD_SQUAD_ATTACK,
-    CMD_SQUAD_CANCEL_PREFOCUS,
-    CMD_SQUAD_CLEAR_FOCUS,
-    CMD_SQUAD_LEADER_SPEED_LIMIT,
-    CMD_SQUAD_MOVE,
-    CMD_SQUAD_PREFOCUS,
-    CMD_SQUAD_PROPULSION,
-    CMD_SYNC_SETUP,
-    SQUAD_FOCUS_COMMANDS,
-)
-from ..math2d import Vector2
-from ..models import (
-    CombatState,
-    FitDescriptor,
-    FleetIntent,
-    NavigationState,
-    QualityLevel,
-    QualityState,
-    ShipEntity,
-    ShipProfile,
-    Team,
-    VitalState,
-)
-from ..pyfa_bridge import PyfaBridge
-from ..sim_logging import get_sim_logger, log_sim_event
-from ..simulation_engine import SimulationEngine
-from ..systems import CombatSystem
-
-
-
+from ..models import QualityLevel, Team
 from .models import SetupRow, UiPreferences
 class FleetSetupTableModel(QAbstractTableModel):
     HEADERS = [

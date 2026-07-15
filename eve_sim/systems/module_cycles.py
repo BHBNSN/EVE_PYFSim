@@ -1,6 +1,27 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+from dataclasses import replace
+import math
+import random
+from typing import Any
+
+from ..combat_control_workset import (
+    enqueue_control_signal_modules,
+    ensure_ship_module_decision_pending,
+    module_keeps_decision_pending,
+    runtime_controlled_entry_lookup,
+    runtime_controlled_module_ids,
+    ship_candidate_module_ids,
+)
+from ..fit_runtime import EffectClass, ModuleState
+from ..module_control import normalize_module_manual_mode, normalize_module_target_mode
+from ..models import ShipProfile, Team
+from ..squad_identity import squad_key
+from ..timer_views import sync_deadline_view
+from ..timing_wheel import EventType
+from ..world import WorldState
+from .constants import REPAIR_QUEUE_LAYERS
+from .models import CycleTargetSnapshot, ModuleDecisionRule, ModuleStaticMetadata
 
 
 class ModuleCyclesMixin:
@@ -309,38 +330,7 @@ class ModuleCyclesMixin:
         sync_deadline_view(ship.combat.module_ammo_reload_deadlines, ship.combat.module_ammo_reload_timers, now)
         sync_deadline_view(ship.combat.module_reactivation_deadlines, ship.combat.module_reactivation_timers, now)
 
-    def _adopt_legacy_timer_views(self, ship, now: float) -> None:
-        for target_id, deadline in adopt_deadlines_from_remaining_view(
-            ship.combat.lock_deadlines,
-            ship.combat.lock_timers,
-            now,
-        ).items():
-            self._schedule_lock_deadline(ship, target_id, deadline=deadline, now=now)
-
-        for module_id, deadline in adopt_deadlines_from_remaining_view(
-            ship.combat.module_cycle_deadlines,
-            ship.combat.module_cycle_timers,
-            now,
-        ).items():
-            self._schedule_module_cycle_deadline(ship, module_id, deadline=deadline, now=now)
-
-        for module_id, deadline in adopt_deadlines_from_remaining_view(
-            ship.combat.module_ammo_reload_deadlines,
-            ship.combat.module_ammo_reload_timers,
-            now,
-        ).items():
-            self._schedule_module_reload_deadline(ship, module_id, deadline=deadline, now=now)
-
-        for module_id, deadline in adopt_deadlines_from_remaining_view(
-            ship.combat.module_reactivation_deadlines,
-            ship.combat.module_reactivation_timers,
-            now,
-        ).items():
-            self._schedule_module_reactivation_deadline(ship, module_id, deadline=deadline, now=now)
-
     def _prepare_ship_timer_views(self, ship, now: float) -> None:
-        self._sync_timer_views_for_ship(ship, now)
-        self._adopt_legacy_timer_views(ship, now)
         self._sync_timer_views_for_ship(ship, now)
 
     @staticmethod
@@ -702,7 +692,7 @@ class ModuleCyclesMixin:
         self._clamp_ship_layer_hp(ship)
         changed_layers = [
             layer
-            for layer in _REPAIR_QUEUE_LAYERS
+            for layer in REPAIR_QUEUE_LAYERS
             if abs(self._ship_layer_values(ship, layer)[0] - previous_values[layer][0]) > 1e-6
             or abs(self._ship_layer_values(ship, layer)[1] - previous_values[layer][1]) > 1e-6
         ]
@@ -920,7 +910,7 @@ class ModuleCyclesMixin:
             return False
 
         if rule.target_mode == "weapon_focus_prefocus":
-            focus_queue = world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), [])
+            focus_queue = world.squad_focus_queues.get(squad_key(source.team, source.squad_id), [])
             if not focus_queue:
                 return False
             allowed_ids: set[str] = {str(focus_queue[0])}
@@ -1027,7 +1017,7 @@ class ModuleCyclesMixin:
         return min(candidates, key=lambda ally: source.nav.position.distance_to(ally.nav.position)).ship_id
 
     def _select_weapon_focus_target(self, world: WorldState, source, module, existing_target_id: str | None) -> str | None:
-        focus_queue = world.squad_focus_queues.get(self._focus_key(source.team, source.squad_id), [])
+        focus_queue = world.squad_focus_queues.get(squad_key(source.team, source.squad_id), [])
         if not focus_queue:
             return None
 
@@ -1369,7 +1359,7 @@ class ModuleCyclesMixin:
             all_controlled_entries = self._runtime_module_buckets(runtime).controlled_entries
             if not all_controlled_entries:
                 continue
-            focus_key = self._focus_key(ship.team, ship.squad_id)
+            focus_key = squad_key(ship.team, ship.squad_id)
             focus_queue = tuple(str(target_id) for target_id in world.squad_focus_queues.get(focus_key, []))
             has_focus_queue = bool(focus_queue)
             propulsion_active = bool(ship.nav.propulsion_command_active)
@@ -1784,14 +1774,10 @@ class ModuleCyclesMixin:
 
         return pyfa_remote_inputs_dirty
 
-    @staticmethod
-    def _focus_key(team, squad_id: str) -> str:
-        return f"{team.value}:{squad_id}"
-
     def _changed_focus_queues(self, world: WorldState) -> set[str]:
         changed: set[str] = set()
         active_focus_keys: set[str] = {
-            self._focus_key(ship.team, ship.squad_id)
+            squad_key(ship.team, ship.squad_id)
             for ship in world.ships.values()
             if ship.vital.alive
         }
@@ -1815,7 +1801,7 @@ class ModuleCyclesMixin:
                 ship.combat.prelocked_targets.clear()
                 ship.combat.prelock_timers.clear()
                 continue
-            focus_key = self._focus_key(ship.team, ship.squad_id)
+            focus_key = squad_key(ship.team, ship.squad_id)
             queue = world.squad_focus_queues.get(focus_key, [])
             seen: set[str] = set()
             cleaned: list[str] = []

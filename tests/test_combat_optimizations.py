@@ -17,7 +17,9 @@ from eve_sim.gui.dialogs import ShipStatusDialog
 from eve_sim.math2d import Vector2
 from eve_sim.models import BubbleField, CombatState, FitDescriptor, NavigationState, Order, ProjectileEntity, QualityLevel, QualityState, ShipEntity, Team, VitalState
 from eve_sim.pyfa_bridge import PyfaBridge
+from eve_sim.serialization import SnapshotBuilder
 from eve_sim.simulation_engine import SimulationEngine
+from eve_sim.squad_identity import squad_key
 from eve_sim.systems import CombatSystem, MovementSystem, PerceptionSystem
 from eve_sim.systems.models import CycleTargetSnapshot
 from eve_sim.world import WorldState
@@ -846,8 +848,8 @@ class CombatOptimizationTests(unittest.TestCase):
             runtime.diagnostics["pyfa_base_profile"] = replace(base_profiles[runtime.fit_key])
             return runtime, replace(base_profiles[runtime.fit_key])
 
-        with patch("eve_sim.systems.combat_core.get_runtime_resolve_cache_key", side_effect=fake_cache_key), patch(
-            "eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime",
+        with patch("eve_sim.systems.runtime_projection.get_runtime_resolve_cache_key", side_effect=fake_cache_key), patch(
+            "eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime",
             side_effect=fake_resolve,
         ):
             for step_index, step_dt in enumerate(step_dts):
@@ -1052,8 +1054,8 @@ class CombatOptimizationTests(unittest.TestCase):
             runtime.diagnostics["pyfa_runtime_resolve_cache"] = "miss"
             return runtime, replace(shared_profile)
 
-        with patch("eve_sim.systems.combat_core.get_runtime_resolve_cache_key", side_effect=fake_cache_key), patch(
-            "eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime",
+        with patch("eve_sim.systems.runtime_projection.get_runtime_resolve_cache_key", side_effect=fake_cache_key), patch(
+            "eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime",
             side_effect=fake_resolve,
         ):
             engine._dt = 1.0
@@ -1222,7 +1224,7 @@ Remote Sensor Dampener II
         source.runtime.diagnostics.pop("pyfa_base_profile", None)
         target.runtime.diagnostics.pop("pyfa_base_profile", None)
 
-        with patch("eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime", return_value=None):
+        with patch("eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime", return_value=None):
             engine.step()
             first_scan = target.profile.scan_resolution
             engine.step()
@@ -1378,8 +1380,8 @@ Remote Sensor Dampener II
             runtime.diagnostics["pyfa_runtime_resolve_cache"] = "miss"
             return runtime, replace(base_profiles[runtime.fit_key])
 
-        with patch("eve_sim.systems.combat_core.get_runtime_resolve_cache_key", side_effect=fake_cache_key), patch(
-            "eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime",
+        with patch("eve_sim.systems.runtime_projection.get_runtime_resolve_cache_key", side_effect=fake_cache_key), patch(
+            "eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime",
             side_effect=fake_resolve,
         ), patch.object(
             combat,
@@ -1815,7 +1817,7 @@ Remote Sensor Dampener II
             CombatSystem(PyfaBridge()),
         )
 
-        snapshot = engine.snapshot()
+        snapshot = SnapshotBuilder().build(world)
 
         self.assertEqual(snapshot["ships"][ship.ship_id]["module_states"]["passive-a"], "ONLINE")
 
@@ -2159,7 +2161,7 @@ Remote Sensor Dampener II
             return runtime, replace(neutral_profile, max_speed=speed)
 
         module.state = ModuleState.ONLINE
-        with patch("eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
+        with patch("eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
             engine.step()
 
         self.assertAlmostEqual(ship.profile.max_speed, neutral_speed)
@@ -2208,7 +2210,7 @@ Remote Sensor Dampener II
         expected_speed_after_step = boosted_speed * math.exp(-1.0 / expected_tau)
 
         module.state = ModuleState.ONLINE
-        with patch("eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
+        with patch("eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
             engine.step()
 
         self.assertAlmostEqual(ship.profile.max_speed, neutral_speed)
@@ -2236,7 +2238,7 @@ Remote Sensor Dampener II
         module = source.runtime.modules[0]
         module.state = ModuleState.ACTIVE
         source.combat.lock_targets.add(target.ship_id)
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         source.combat.projected_targets[module.module_id] = target.ship_id
         snapshot_key = engine.combat._module_cycle_snapshot_key(source.ship_id, module.module_id)
         engine.combat._module_cycle_target_snapshots[snapshot_key] = {
@@ -2257,7 +2259,7 @@ Remote Sensor Dampener II
                 return runtime, replace(base, warp_scramble_status=0.0)
             return runtime, base
 
-        with patch("eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
+        with patch("eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
             engine.step()
             self.assertAlmostEqual(target.profile.warp_scramble_status, 2.0)
             module.state = ModuleState.OFFLINE
@@ -2503,7 +2505,7 @@ Small Auxiliary Thrusters II
         target.nav.position = Vector2(1_000.0, 0.0)
         source.combat.lock_targets.add(target.ship_id)
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         engine = self._make_engine(world, physics_substeps=1)
 
         for module in source.runtime.modules:
@@ -2562,7 +2564,7 @@ Small Auxiliary Thrusters II
             profile = replace(neutral_profile, max_speed=boosted_speed if any_active else neutral_profile.max_speed)
             return fresh_runtime, profile
 
-        with patch("eve_sim.systems.combat_core.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
+        with patch("eve_sim.systems.runtime_projection.resolve_runtime_from_pyfa_runtime", side_effect=fake_resolve):
             engine.step()
             runtime_module = ship.runtime.modules[0]
             self.assertEqual(runtime_module.state, ModuleState.ACTIVE)
@@ -2598,7 +2600,7 @@ Small Auxiliary Thrusters II
         self.assertFalse(combat._update_module_states(world, 0.25))
         self.assertEqual(combat._ship_candidate_control_entries(source, runtime), ())
 
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         combat._enqueue_ship_control_signal_modules(world, source, runtime, focus_changed=True)
 
         self.assertEqual(
@@ -2619,7 +2621,7 @@ Small Auxiliary Thrusters II
         )
         source.combat.lock_targets.add(target.ship_id)
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         engine = self._make_engine(world, physics_substeps=4)
 
         with patch.object(CombatSystem, "_sample_weapon_fire_delay", return_value=0.0):
@@ -2644,7 +2646,7 @@ Small Auxiliary Thrusters II
             team=Team.RED,
         )
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         engine = self._make_engine(world, physics_substeps=4)
 
         with patch.object(CombatSystem, "_sample_weapon_fire_delay", return_value=0.0):
@@ -2761,7 +2763,7 @@ Small Auxiliary Thrusters II
         source.combat.lock_targets.add(target.ship_id)
         attacker.combat.lock_targets.add(target.ship_id)
         world = WorldState(ships={source.ship_id: source, target.ship_id: target, attacker.ship_id: attacker})
-        world.squad_focus_queues[CombatSystem._focus_key(attacker.team, attacker.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(attacker.team, attacker.squad_id)] = [target.ship_id]
         engine = self._make_engine(world, physics_substeps=1)
 
         with patch.object(CombatSystem, "_sample_weapon_fire_delay", return_value=0.0):
@@ -3214,7 +3216,7 @@ Heavy Gremlin Compact Energy Neutralizer
         target.nav.position = Vector2(10_000.0, 0.0)
         source.combat.lock_targets.add(target.ship_id)
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         engine = self._make_engine(world, physics_substeps=1)
 
         observed_projectiles = False
@@ -3875,6 +3877,7 @@ Heavy Gremlin Compact Energy Neutralizer
                 "state_by_module_id": {"mod-1": "ACTIVE"},
                 "projection_range": 25_000.0,
                 "pyfa_projection_key_mode": "exact_range",
+                "pyfa_projection_module_signature": ("test-projected-source", label),
             }
 
         snapshot_a = make_snapshot("source-a")
@@ -4007,7 +4010,7 @@ Heavy Gremlin Compact Energy Neutralizer
         target.nav.position = Vector2(1_000.0, 0.0)
         world = WorldState(ships={source.ship_id: source, target.ship_id: target})
         combat = CombatSystem(PyfaBridge())
-        world.squad_focus_queues[CombatSystem._focus_key(source.team, source.squad_id)] = [target.ship_id]
+        world.squad_focus_queues[squad_key(source.team, source.squad_id)] = [target.ship_id]
         engine = SimulationEngine(world, EngineConfig(tick_rate=1, physics_substeps=4, isolate_systems=False), combat)
         for ship_id in world.ships:
             engine.register_ship(ship_id)

@@ -10,6 +10,7 @@ from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
+from eve_sim.application import MatchApplication
 from eve_sim.agents import CommanderAgent
 from eve_sim.config import EngineConfig, UiConfig
 from eve_sim.fleet_setup import build_world_from_manual_setup
@@ -364,20 +365,19 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = ship.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
         engine.register_ship(ship.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
-            window._undeployed_ship_ids.clear()
+            for candidate in engine.world.ships.values():
+                candidate.deployed = True
             ship.vital.alive = True
+            window.runtime_view.refresh()
             window.request_overview_refresh(force=True)
             index = window.overview_proxy.index(0, 0)
             self.assertTrue(index.isValid())
@@ -408,22 +408,21 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = leader.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
         engine.register_ship(leader.ship_id)
         engine.register_ship(follower.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for candidate in engine.world.ships.values():
+                candidate.deployed = True
+            window.runtime_view.refresh()
             self.assertTrue(window._is_ship_visible(leader.ship_id))
             self.assertFalse(window._is_ship_visible(follower.ship_id))
             window.request_overview_refresh(force=True)
@@ -450,21 +449,19 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = ship.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
         engine.register_ship(ship.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for candidate in engine.world.ships.values():
+                candidate.deployed = True
             ship.vital.alive = True
             window.request_overview_refresh(force=True)
             structure_id = "alpha_gate_to_beta"
@@ -496,16 +493,13 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = ship.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
         engine.register_ship(ship.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
@@ -537,16 +531,13 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = ship.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
         engine.register_ship(ship.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
             initial_language="zh_CN",
         )
         try:
@@ -573,15 +564,12 @@ class MapSystemTests(unittest.TestCase):
         world.structures = build_world_from_manual_setup([], map_definition=map_definition).structures
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
@@ -611,14 +599,11 @@ class MapSystemTests(unittest.TestCase):
         map_definition = _dual_gate_test_map()
         world = build_world_from_manual_setup([], map_definition=map_definition)
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
@@ -636,14 +621,11 @@ class MapSystemTests(unittest.TestCase):
         map_definition = load_map_definition("dual_system_crossroads")
         world = build_world_from_manual_setup([], map_definition=map_definition)
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
@@ -680,27 +662,30 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = ship.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
         engine.register_ship(ship.ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
-            window._set_team_propulsion_state(Team.BLUE, "BLUE-ALPHA", True)
+            for candidate in engine.world.ships.values():
+                candidate.deployed = True
+            ship.vital.alive = True
+            window.command_adapter.propulsion(Team.BLUE, "BLUE-ALPHA", True)
+            window.application.step()
             window.issue_warp_to_beacon("BLUE-ALPHA", "alpha_gate_to_beta")
+            window.application.step()
             self.assertFalse(window._get_squad_propulsion_state("BLUE-ALPHA"))
 
-            window._set_team_propulsion_state(Team.BLUE, "BLUE-ALPHA", True)
+            window.command_adapter.propulsion(Team.BLUE, "BLUE-ALPHA", True)
+            window.application.step()
             window.issue_use_gate("BLUE-ALPHA", "alpha_gate_to_beta")
+            window.application.step()
             self.assertFalse(window._get_squad_propulsion_state("BLUE-ALPHA"))
         finally:
             window.close()
@@ -714,15 +699,12 @@ class MapSystemTests(unittest.TestCase):
         map_definition = load_map_definition("dual_system_crossroads")
         world = build_world_from_manual_setup([], map_definition=map_definition)
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
+        commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
         engine.register_commander(commander)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=commander,
-            red_commander=CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=[]),
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
@@ -747,8 +729,8 @@ class MapSystemTests(unittest.TestCase):
             map_id="large-map",
             name="Large Map",
             systems=[
-                MapSystemDefinition(system_id="alpha", name="Alpha", origin=Vector2(0.0, 0.0), radius_m=30.0 * 149_597_870_700.0),
-                MapSystemDefinition(system_id="beta", name="Beta", origin=Vector2(80.0 * 149_597_870_700.0, 0.0), radius_m=30.0 * 149_597_870_700.0),
+                MapSystemDefinition(system_id="alpha", name="Alpha", radius_m=30.0 * 149_597_870_700.0),
+                MapSystemDefinition(system_id="beta", name="Beta", radius_m=30.0 * 149_597_870_700.0),
             ],
         )
         world = WorldState(map_id=large_map.map_id, map_name=large_map.name, map_definition=large_map)
@@ -763,24 +745,23 @@ class MapSystemTests(unittest.TestCase):
         world.squad_leaders["BLUE:BLUE-ALPHA"] = alpha_leader.ship_id
 
         engine = SimulationEngine(world=world, config=EngineConfig(), combat_system=CombatSystem(PyfaBridge()))
-        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE, squad_ids=["BLUE-ALPHA"])
-        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED, squad_ids=["RED-BETA"])
+        blue_commander = CommanderAgent(agent_id="cmd-blue", team=Team.BLUE)
+        red_commander = CommanderAgent(agent_id="cmd-red", team=Team.RED)
         engine.register_commander(blue_commander)
         engine.register_commander(red_commander)
         for ship_id in world.ships:
             engine.register_ship(ship_id)
 
         window = MainWindow(
-            engine=engine,
+            application=MatchApplication.from_engine(engine),
             ui_cfg=UiConfig(),
-            blue_commander=blue_commander,
-            red_commander=red_commander,
-            manual_setup=[],
         )
         try:
             window.tick_timer.stop()
             window.render_timer.stop()
-            window._undeployed_ship_ids.clear()
+            for candidate in engine.world.ships.values():
+                candidate.deployed = True
+            window.runtime_view.refresh()
             window._set_view_system("alpha", center=False)
             window.request_overview_refresh(force=True)
             rows = [window.overview_proxy.get_row(row) for row in range(window.overview_proxy.rowCount())]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 
+from ..domain.squad_follow_service import FOLLOW_LEADER_SYSTEM, FOLLOW_TRANSIT_STATES, FORMATION_FOLLOW
 from ..math2d import Vector2
 from ..models import WarpInterdictionSnapshot
 from ..world import WorldState
@@ -587,8 +588,8 @@ class MovementSystem:
 
     @staticmethod
     def _follow_command_is_current(world: WorldState, ship) -> bool:
-        state = str(getattr(ship.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW")
-        if state not in {"FOLLOW_LEADER_SYSTEM", "WARP_TO_LEADER"}:
+        state = str(getattr(ship.nav, "squad_follow_state", FORMATION_FOLLOW) or FORMATION_FOLLOW)
+        if state not in FOLLOW_TRANSIT_STATES:
             return True
         squad_key = f"{ship.team.value}:{ship.squad_id}"
         location = world.squad_leader_locations.get(squad_key)
@@ -599,7 +600,7 @@ class MovementSystem:
         if int(getattr(ship.nav, "squad_follow_leader_location_version", -1)) != int(location.location_version):
             return False
         ship_system = str(getattr(ship.nav, "system_id", "") or "")
-        if state == "FOLLOW_LEADER_SYSTEM":
+        if state == FOLLOW_LEADER_SYSTEM:
             return ship_system != location.system_id
         return ship_system == location.system_id
 

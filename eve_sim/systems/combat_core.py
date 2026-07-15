@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
+from typing import Any
+import weakref
 
+from ..fit_runtime import RuntimeStatEngine
+from ..models import Team
+from ..pyfa_bridge import PyfaBridge
+from ..replay.schema import CombatEventSink
 from ..system_identity import normalize_system_namespace
+from ..timing_wheel import TimingWheel
 from .authoritative_tick import AuthoritativeTickMixin
 from .bubbles import BubblesMixin
 from .command_bursts import CommandBurstsMixin
-from .combat_common import *  # noqa: F403
 from .damage_missile import DamageMissileMixin
 from .damage_turret import DamageTurretMixin
 from .ewar import EwarMixin
@@ -15,6 +22,7 @@ from .logistics import CombatLogisticsMixin
 from .module_cycles import ModuleCyclesMixin
 from .projectiles import ProjectilesMixin
 from .runtime_projection import RuntimeProjectionMixin
+from .models import CycleTargetSnapshot, ModuleStaticMetadata
 
 
 class CombatStateCloneError(RuntimeError):
@@ -99,6 +107,18 @@ class CombatSystem(
     def set_event_rng_context(self, rng_seed: int, rng_counter: int = 0) -> None:
         self._event_rng_seed = int(rng_seed)
         self._event_rng_counter = int(rng_counter)
+
+    def module_target_metadata(self, module):
+        """Expose module targeting metadata without leaking mixin-private APIs."""
+        return self._module_static_metadata(module)
+
+    def module_target_mode_choices(self, module) -> tuple[str, ...]:
+        metadata = self.module_target_metadata(module)
+        return self._module_target_mode_choices(module, metadata)
+
+    @classmethod
+    def copy_runtime_dynamic_state(cls, source_runtime, target_runtime) -> None:
+        cls._copy_runtime_dynamic_state(source_runtime, target_runtime)
 
     def clone_for_system(self, system_id: str) -> "CombatSystem":
         """Clone authoritative combat state without copying external resources."""

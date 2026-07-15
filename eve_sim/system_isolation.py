@@ -13,10 +13,10 @@ from typing import Any
 
 from .agents import ShipAgent
 from .config import EngineConfig
-from .models import Team
 from .pyfa_bridge import PyfaBridge
 from .replay.schema import CombatEvent
 from .sim_logging import get_sim_logger, log_sim_event
+from .squad_identity import squad_key
 from .system_identity import normalize_system_namespace, stable_system_seed
 from .systems import CombatSystem, DeployableSystem, LogisticsSystem, MovementSystem, PerceptionSystem
 from .timing_wheel import TimingWheel
@@ -27,7 +27,7 @@ SYSTEM_SHARD_PROTOCOL_VERSION = 2
 
 
 class SystemExecutionMode(Enum):
-    GLOBAL_LEGACY = "global_legacy"
+    GLOBAL_SERIAL = "global_serial"
     SHARD_SERIAL = "shard_serial"
     SHARD_PROCESS = "shard_process"
     SHARD_SERIAL_DEGRADED = "shard_serial_degraded"
@@ -156,10 +156,6 @@ def has_unassigned_active_entities(world: WorldState) -> bool:
             if _entity_is_active(entity) and not entity_system_id(entity):
                 return True
     return False
-
-
-def _focus_key(team: Team, squad_id: str) -> str:
-    return f"{team.value}:{squad_id}"
 
 
 def _runtime_pressure(ship: Any) -> float:
@@ -306,7 +302,7 @@ def build_system_shard(
     )
 
     shard_squad_keys = {
-        _focus_key(ship.team, ship.squad_id)
+        squad_key(ship.team, ship.squad_id)
         for ship_id, ship in world.ships.items()
         if ship_id in all_local_ship_ids
     }

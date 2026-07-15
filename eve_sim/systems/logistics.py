@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..domain.squad_follow_service import FOLLOW_TRANSIT_STATES, FORMATION_FOLLOW
 from ..models import Team
 from ..world import WorldState
+from .constants import REPAIR_QUEUE_LAYERS
+from .models import ModuleStaticMetadata
 
 
 class LogisticsSystem:
     @staticmethod
     def _ship_is_rejoining_leader(ship) -> bool:
-        state = str(getattr(getattr(ship, "nav", None), "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW")
-        return state in {"FOLLOW_LEADER_SYSTEM", "WARP_TO_LEADER"}
+        state = str(getattr(getattr(ship, "nav", None), "squad_follow_state", FORMATION_FOLLOW) or FORMATION_FOLLOW)
+        return state in FOLLOW_TRANSIT_STATES
 
     @staticmethod
     def _apply_repair(target, amount: float) -> None:
@@ -67,9 +70,6 @@ class LogisticsSystem:
             self._apply_repair(target, repair)
 
 
-from .combat_common import *  # noqa: F403
-
-
 class CombatLogisticsMixin:
     def _mark_all_repair_queues_dirty(self) -> None:
         self._repair_queue_cache.clear()
@@ -78,7 +78,11 @@ class CombatLogisticsMixin:
     def _mark_team_repair_queues_dirty(self, team: Team, *layers: str) -> None:
         if team is None:
             return
-        dirty_layers = tuple(str(layer) for layer in (layers or _REPAIR_QUEUE_LAYERS) if str(layer) in _REPAIR_QUEUE_LAYERS)
+        dirty_layers = tuple(
+            str(layer)
+            for layer in (layers or REPAIR_QUEUE_LAYERS)
+            if str(layer) in REPAIR_QUEUE_LAYERS
+        )
         for layer in dirty_layers:
             stale_keys = [cache_key for cache_key in self._repair_queue_cache.keys() if cache_key[0] == team and cache_key[1] == layer]
             for cache_key in stale_keys:

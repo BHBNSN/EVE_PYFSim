@@ -60,23 +60,3 @@ def deadline_map_from_remaining_view(
         deadlines[key] = now_value + remaining
     return normalized, deadlines
 
-
-def adopt_deadlines_from_remaining_view(
-    deadline_map: MutableMapping[str, float],
-    view_map: MutableMapping[str, float],
-    now: float,
-    *,
-    epsilon: float = 1e-6,
-) -> dict[str, float]:
-    adopted: dict[str, float] = {}
-    now_value = float(now)
-    normalized_view = normalize_remaining_view(view_map, epsilon=epsilon)
-    for key, remaining in normalized_view.items():
-        if key in deadline_map or remaining <= float(epsilon):
-            continue
-        due_at = now_value + remaining
-        deadline_map[key] = due_at
-        view_map[key] = remaining
-        adopted[key] = due_at
-    return adopted
-

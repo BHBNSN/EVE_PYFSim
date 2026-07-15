@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 
+from ..domain.squad_follow_service import FOLLOW_TRANSIT_STATES, FORMATION_FOLLOW
 from ..math2d import Vector2
 from ..models import (
     CombatState,
@@ -21,6 +22,7 @@ from ..models import (
     Team,
     VitalState,
 )
+from ..squad_identity import squad_key
 from ..world import WorldState
 from .movement import MovementSystem
 
@@ -34,10 +36,6 @@ class DeployableSystem:
         self.combat = combat_system
         self.movement = movement_system
         self._sequence = 0
-
-    @staticmethod
-    def _focus_key(team: Team, squad_id: str) -> str:
-        return f"{team.value}:{squad_id}"
 
     @staticmethod
     def _entity_system_id(entity) -> str:
@@ -519,6 +517,17 @@ class DeployableSystem:
             changed += 1
         return changed
 
+    def clear_fighter_squad_navigation(self, world: WorldState, team: Team, squad_id: str) -> int:
+        """Clear player-issued navigation for a fighter squad through the public deployable API."""
+        changed = 0
+        for fighter in self._fighter_squad_members(world, team, squad_id):
+            if fighter.state == "recalling":
+                continue
+            self.movement._cancel_warp(fighter)
+            self.movement._clear_navigation_command(fighter)
+            changed += 1
+        return changed
+
     def command_fighter_squad_warp(
         self,
         world: WorldState,
@@ -852,7 +861,7 @@ class DeployableSystem:
             owner.deployable_control.drone_attack_command_at = 0.0
         if str(getattr(owner.deployable_control, "pending_drone_attack_target_id", "") or "").strip():
             return
-        focus_key = self._focus_key(owner.team, owner.squad_id)
+        focus_key = squad_key(owner.team, owner.squad_id)
         target_id = self._first_valid_queue_target(world, owner.team, world.squad_focus_queues.get(focus_key, []), source=owner)
         if not target_id:
             return
@@ -868,7 +877,7 @@ class DeployableSystem:
         if explicit is not None:
             candidates.append((explicit.ship_id, float(control.fighter_attack_command_at or 0.0), "command"))
 
-        fighter_focus_key = self._focus_key(fighter.team, fighter.squad_id)
+        fighter_focus_key = squad_key(fighter.team, fighter.squad_id)
         fighter_focus = self._first_valid_queue_target(world, fighter.team, world.squad_focus_queues.get(fighter_focus_key, []), source=fighter)
         if fighter_focus:
             candidates.append((fighter_focus, float(world.squad_focus_updated_at.get(fighter_focus_key, world.now) or world.now), "command"))
@@ -876,7 +885,7 @@ class DeployableSystem:
         if candidates:
             return max(candidates, key=lambda item: item[1])
 
-        mother_focus_key = self._focus_key(owner.team, getattr(fighter, "owner_squad_id", "") or owner.squad_id)
+        mother_focus_key = squad_key(owner.team, getattr(fighter, "owner_squad_id", "") or owner.squad_id)
         mother_focus = self._first_valid_queue_target(world, owner.team, world.squad_focus_queues.get(mother_focus_key, []), source=owner)
         if mother_focus:
             return mother_focus, float(world.squad_focus_updated_at.get(mother_focus_key, world.now) or world.now), "mother_focus"
@@ -1422,10 +1431,7 @@ class DeployableSystem:
         for owner in world.ships.values():
             if not owner.vital.alive:
                 continue
-            if str(getattr(owner.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW") in {
-                "FOLLOW_LEADER_SYSTEM",
-                "WARP_TO_LEADER",
-            }:
+            if str(getattr(owner.nav, "squad_follow_state", FORMATION_FOLLOW) or FORMATION_FOLLOW) in FOLLOW_TRANSIT_STATES:
                 continue
             self._process_pending_owner_commands(world, owner)
             self._resolve_owner_drone_focus(world, owner)
@@ -1436,10 +1442,7 @@ class DeployableSystem:
             owner = world.ships.get(drone.owner_ship_id)
             if not self._update_asset_connection(world, drone, owner):
                 continue
-            if owner is not None and str(getattr(owner.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW") in {
-                "FOLLOW_LEADER_SYSTEM",
-                "WARP_TO_LEADER",
-            }:
+            if owner is not None and str(getattr(owner.nav, "squad_follow_state", FORMATION_FOLLOW) or FORMATION_FOLLOW) in FOLLOW_TRANSIT_STATES:
                 drone.target_id = None
             if drone.state == "recalling":
                 if advance_physics:
@@ -1480,10 +1483,7 @@ class DeployableSystem:
             owner = world.ships.get(fighter.owner_ship_id)
             if not self._update_asset_connection(world, fighter, owner):
                 continue
-            if owner is not None and str(getattr(owner.nav, "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW") in {
-                "FOLLOW_LEADER_SYSTEM",
-                "WARP_TO_LEADER",
-            }:
+            if owner is not None and str(getattr(owner.nav, "squad_follow_state", FORMATION_FOLLOW) or FORMATION_FOLLOW) in FOLLOW_TRANSIT_STATES:
                 fighter.target_id = None
             if apply_effects:
                 self._advance_fighter_timers(fighter, dt)

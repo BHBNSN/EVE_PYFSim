@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+from typing import Any
+
+from ..domain.squad_follow_service import FOLLOW_TRANSIT_STATES, FORMATION_FOLLOW
+from ..fit_runtime import FitRuntime
+from ..models import ShipProfile
+from ..world import WorldState
 
 
 class LockingMixin:
@@ -22,9 +27,9 @@ class LockingMixin:
 
     @classmethod
     def _ship_combat_suppressed(cls, ship, now: float | None = None) -> bool:
-        follow_state = str(getattr(getattr(ship, "nav", None), "squad_follow_state", "FORMATION_FOLLOW") or "FORMATION_FOLLOW")
+        follow_state = str(getattr(getattr(ship, "nav", None), "squad_follow_state", FORMATION_FOLLOW) or FORMATION_FOLLOW)
         return (
-            follow_state in {"FOLLOW_LEADER_SYSTEM", "WARP_TO_LEADER"}
+            follow_state in FOLLOW_TRANSIT_STATES
             or cls._ship_in_warp(ship)
             or cls._ship_is_gate_cloaked(ship, now)
         )

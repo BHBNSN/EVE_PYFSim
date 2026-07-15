@@ -524,6 +524,9 @@ class ShipEntity:
     deployable_control: DeployableControlState = field(default_factory=DeployableControlState)
     ship_group_id: str = ""
     command_priority: int = 0
+    deployed: bool = True
+    fit_text: str = ""
+    locked_module_charges: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

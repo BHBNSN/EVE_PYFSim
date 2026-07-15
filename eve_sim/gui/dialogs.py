@@ -1,21 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-from copy import deepcopy
+from dataclasses import dataclass, replace
 import json
-import math
-from pathlib import Path
-import random
-import time
 from typing import Any, Callable, Literal, cast
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QSortFilterProxyModel, QTimer, Qt, QLocale, Signal, QCoreApplication
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PySide6.QtCore import QModelIndex, QTimer, Qt, Signal, QCoreApplication
 from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
     QAbstractItemView,
@@ -25,14 +16,9 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
-    QMainWindow,
-    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
-    QSplitter,
-    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QTableView,
@@ -41,58 +27,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..agents import CommanderAgent
-from ..config import EngineConfig, UiConfig
 from ..fleet_setup import (
-    ManualShipSetup,
     ParsedModuleSpec,
-    build_world_from_manual_setup,
     EftFitParser,
     RuntimeFromEftFactory,
     get_charge_option_values_for_module,
     get_fit_backend_status,
-    get_common_chargeable_modules,
-    get_module_reload_time_sec,
     module_supports_unloaded_charge,
     resolve_module_type_name,
     get_type_display_name,
 )
 from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-
-from ..lan_session import ClientLanSession, HostLanSession
-from ..lan_commands import (
-    CMD_INDUCE_FLEET_AT,
-    CMD_INDUCE_SQUAD_AT,
-    CMD_SQUAD_APPROACH,
-    CMD_SQUAD_ATTACK,
-    CMD_SQUAD_CANCEL_PREFOCUS,
-    CMD_SQUAD_CLEAR_FOCUS,
-    CMD_SQUAD_LEADER_SPEED_LIMIT,
-    CMD_SQUAD_MOVE,
-    CMD_SQUAD_PREFOCUS,
-    CMD_SQUAD_PROPULSION,
-    CMD_SYNC_SETUP,
-    SQUAD_FOCUS_COMMANDS,
-)
-from ..math2d import Vector2
 from ..module_control import effective_module_target_mode, normalize_module_manual_mode, normalize_module_target_mode
-from ..models import (
-    CombatState,
-    FitDescriptor,
-    FleetIntent,
-    NavigationState,
-    QualityLevel,
-    QualityState,
-    ShipEntity,
-    ShipProfile,
-    Team,
-    VitalState,
-)
-from ..pyfa_bridge import PyfaBridge
-from ..sim_logging import get_sim_logger, log_sim_event
-from ..simulation_engine import SimulationEngine
-from ..systems import CombatSystem
+from ..models import QualityLevel, ShipProfile, Team
 from ..user_errors import display_user_error
+from .adapters.runtime_view import WorldViewSource
 from .models import SetupRow, UiPreferences
 from .table_models import FleetSetupTableModel, SetupRowDelegate
 
@@ -505,7 +454,7 @@ class OverviewOptionsDialog(QDialog):
 class ShipStatusDialog(QDialog):
     def __init__(
         self,
-        engine: SimulationEngine,
+        runtime_view: WorldViewSource,
         ship_id: str,
         language_getter: Callable[[], str],
         fit_text_getter: Callable[[str], str | None],
@@ -517,10 +466,11 @@ class ShipStatusDialog(QDialog):
         module_mode_getter: Callable[[str, str], str],
         module_mode_setter: Callable[[str, str, str], tuple[bool, str]],
         module_control_sync_setter: Callable[[str, str, str, str], tuple[bool, str]],
+        module_target_rules_getter: Callable[[str, str], tuple[tuple[str, ...], str]],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.engine = engine
+        self.runtime_view = runtime_view
         self.ship_id = ship_id
         self._language_getter = language_getter
         self._fit_text_getter = fit_text_getter
@@ -532,6 +482,7 @@ class ShipStatusDialog(QDialog):
         self._module_mode_getter = module_mode_getter
         self._module_mode_setter = module_mode_setter
         self._module_control_sync_setter = module_control_sync_setter
+        self._module_target_rules_getter = module_target_rules_getter
         self._parser = EftFitParser()
         self._runtime_engine = RuntimeStatEngine()
         self._cached_fit_text: str = ""
@@ -1022,14 +973,14 @@ class ShipStatusDialog(QDialog):
     def _module_target_mode_choices(self, module: ModuleRuntime | None) -> tuple[str, ...]:
         if module is None:
             return tuple()
-        metadata = self.engine.combat._module_static_metadata(module)
-        return tuple(self.engine.combat._module_target_mode_choices(module, metadata))
+        choices, _default_mode = self._module_target_rules_getter(self.ship_id, str(module.module_id))
+        return choices
 
     def _module_default_target_mode(self, module: ModuleRuntime | None) -> str:
         if module is None:
             return "auto"
-        metadata = self.engine.combat._module_static_metadata(module)
-        return normalize_module_target_mode(getattr(metadata.decision_rule, "target_mode", "auto"))
+        _choices, default_mode = self._module_target_rules_getter(self.ship_id, str(module.module_id))
+        return normalize_module_target_mode(default_mode)
 
     def _module_target_mode_options(
         self,
@@ -1262,7 +1213,7 @@ class ShipStatusDialog(QDialog):
     def _incoming_lock_status(self, ship, lang: str) -> tuple[str, str]:
         locked_by: list[str] = []
         locking_by: list[tuple[str, float]] = []
-        for other in self.engine.world.ships.values():
+        for other in self.runtime_view.world.ships.values():
             if other.ship_id == ship.ship_id or not other.vital.alive:
                 continue
             if ship.ship_id in other.combat.lock_targets:
@@ -1713,8 +1664,8 @@ class ShipStatusDialog(QDialog):
             ),
             (QCoreApplication.translate("eve_sim", 'Target'), str(ship.combat.current_target or QCoreApplication.translate("eve_sim", 'None'))),
             (QCoreApplication.translate("eve_sim", 'Locked Targets'), f"{len(ship.combat.lock_targets)} / {max(0, int(profile.max_locked_targets))}"),
-            (QCoreApplication.translate("eve_sim", 'Incoming ECM'), self._format_ecm_incoming_status(lang, ship, float(self.engine.world.now))),
-            (QCoreApplication.translate("eve_sim", 'Last ECM Attempt'), self._format_ecm_attempt_status(lang, ship, float(self.engine.world.now))),
+            (QCoreApplication.translate("eve_sim", 'Incoming ECM'), self._format_ecm_incoming_status(lang, ship, float(self.runtime_view.world.now))),
+            (QCoreApplication.translate("eve_sim", 'Last ECM Attempt'), self._format_ecm_attempt_status(lang, ship, float(self.runtime_view.world.now))),
         ]
         headers = (QCoreApplication.translate("eve_sim", 'Metric'), QCoreApplication.translate("eve_sim", 'Value'))
         signature = self._table_signature(rows, headers)
@@ -1928,7 +1879,7 @@ class ShipStatusDialog(QDialog):
         self.setWindowTitle(f"{QCoreApplication.translate("eve_sim", 'Ship Status')} - {self.ship_id}")
         self._retitle_tabs()
         self._refresh_lock_controls_if_needed()
-        ship = self.engine.world.ships.get(self.ship_id)
+        ship = self.runtime_view.world.ships.get(self.ship_id)
         if ship is None:
             self._clear_views_for_missing_ship(lang)
             return

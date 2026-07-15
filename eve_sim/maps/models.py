@@ -34,8 +34,6 @@ class MapSystemDefinition:
     system_id: str
     name: str
     radius_m: float
-    # Kept only for backward-compatible JSON loading; simulation uses per-system local coordinates.
-    origin: Vector2 = field(default_factory=lambda: Vector2(0.0, 0.0))
     buildings: list[MapBuildingDefinition] = field(default_factory=list)
     spawn_anchors: list[MapSpawnAnchorDefinition] = field(default_factory=list)
 

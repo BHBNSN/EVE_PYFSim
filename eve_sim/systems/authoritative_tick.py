@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+import time
+from typing import Any
+
+from ..math2d import Vector2
+from ..models import ShipProfile
+from ..replay.schema import CombatEvent
+from ..sim_logging import log_sim_event
+from ..squad_identity import squad_key
+from ..world import WorldState
+from .models import CycleTargetSnapshot
 
 
 class AuthoritativeTickMixin:
@@ -469,7 +478,7 @@ class AuthoritativeTickMixin:
                     ship.combat.current_target = None
 
             if not ship.combat.current_target:
-                queue = list(world.squad_focus_queues.get(self._focus_key(ship.team, ship.squad_id), []))
+                queue = list(world.squad_focus_queues.get(squad_key(ship.team, ship.squad_id), []))
                 for candidate_id in queue:
                     candidate = world.combat_entity(candidate_id)
                     if (

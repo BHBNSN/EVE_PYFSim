@@ -5,16 +5,13 @@ from typing import Callable
 from PySide6.QtCore import QCoreApplication, QTimer, Qt
 from PySide6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
-from ..config import EngineConfig, UiConfig
+from ..config import UiConfig
 from ..maps import deserialize_map_definition, instantiate_structures
-from ..math2d import Vector2
 from ..models import Team
-from ..pyfa_bridge import PyfaBridge
 from ..replay import ReplayPlayer
-from ..replay.snapshot_mapper import apply_snapshot_to_world
-from ..simulation_engine import SimulationEngine
-from ..systems import CombatSystem
+from ..serialization import SnapshotLoader
 from ..world import WorldState
+from .adapters.runtime_view import ReplayRuntimeView
 from .battle_canvas import BattleCanvas
 
 
@@ -32,22 +29,18 @@ class ReplayPlaybackDialog(QDialog):
         self._current_index = 0
         self._playing = False
         self._frame_accumulator = 0.0
+        self._snapshot_loader = SnapshotLoader()
 
         self.world = WorldState()
         self._install_map_metadata()
+        self.runtime_view = ReplayRuntimeView(self.world)
         canvas_cfg = UiConfig(
             width=min(int(ui_cfg.width), 1200),
             height=min(int(ui_cfg.height), 760),
             world_to_screen_scale=float(ui_cfg.world_to_screen_scale),
         )
-        self.engine = SimulationEngine(
-            self.world,
-            EngineConfig(physics_substeps=1),
-            CombatSystem(PyfaBridge()),
-        )
-
         self.canvas = BattleCanvas(
-            self.engine,
+            self.runtime_view,
             canvas_cfg,
             lambda *_args: None,
             lambda *_args: None,
@@ -162,7 +155,7 @@ class ReplayPlaybackDialog(QDialog):
             return
         self._current_index = max(0, min(int(index), self.player.snapshot_count - 1))
         snapshot = self.player.snapshot_at_index(self._current_index)
-        apply_snapshot_to_world(self.world, snapshot.snapshot)
+        self._snapshot_loader.apply_replica(self.world, snapshot.snapshot)
         if not self.canvas.current_view_system_id:
             for ship in self.world.ships.values():
                 self.canvas.current_view_system_id = str(getattr(ship.nav, "system_id", "") or "")
@@ -196,6 +189,4 @@ class ReplayPlaybackDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
-        if hasattr(self.engine, "close"):
-            self.engine.close()
         super().closeEvent(event)

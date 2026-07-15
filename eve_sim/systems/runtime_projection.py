@@ -1,25 +1,49 @@
 from __future__ import annotations
 
-import sys
+from copy import deepcopy
+from dataclasses import replace
+import math
+import time
+from typing import Any
+import weakref
 
-from .combat_common import *  # noqa: F403
+from ..combat_control_workset import (
+    runtime_decision_rule_groups,
+    runtime_controlled_entry_lookup,
+    runtime_controlled_module_ids,
+)
+from ..fleet_setup import (
+    _module_affects_local_pyfa_profile,
+    _runtime_local_profile_state_signature,
+    get_runtime_resolve_cache_key,
+    resolve_runtime_from_pyfa_runtime,
+)
+from ..fit_runtime import EffectClass, FitRuntime, ModuleRuntime, ModuleState, ProjectedImpact
+from ..models import ShipProfile
+from ..remote_snapshot_signatures import (
+    normalized_snapshot_projection_signature as shared_normalized_snapshot_projection_signature,
+    projected_snapshot_list_signature as shared_projected_snapshot_list_signature,
+    projected_snapshot_module_signature as shared_projected_snapshot_module_signature,
+)
+from ..world import WorldState
+from .constants import PYFA_PROJECTION_RANGE_BUCKET_M
+from .models import (
+    CycleTargetSnapshot,
+    ModuleDecisionRule,
+    ModuleStaticMetadata,
+    RuntimeModuleBuckets,
+    _FORMULA_PROJECTED_KEYS,
+    _PROFILE_PASSTHROUGH_ATTRS,
+    _RUNTIME_MODULE_OBJECT_CACHE_DIAGNOSTIC_KEYS,
+)
 
 
 class RuntimeProjectionMixin:
-    @staticmethod
-    def _compat_combat_core_function(name: str, fallback):
-        combat_core = sys.modules.get("eve_sim.systems.combat_core")
-        if combat_core is None:
-            return fallback
-        return getattr(combat_core, name, fallback)
-
     def _get_runtime_resolve_cache_key(self, runtime, command_boosters, projected_sources):
-        resolver = self._compat_combat_core_function("get_runtime_resolve_cache_key", get_runtime_resolve_cache_key)
-        return resolver(runtime, command_boosters, projected_sources)
+        return get_runtime_resolve_cache_key(runtime, command_boosters, projected_sources)
 
     def _resolve_runtime_from_pyfa_runtime(self, runtime, command_boosters, projected_sources):
-        resolver = self._compat_combat_core_function("resolve_runtime_from_pyfa_runtime", resolve_runtime_from_pyfa_runtime)
-        return resolver(runtime, command_boosters, projected_sources)
+        return resolve_runtime_from_pyfa_runtime(runtime, command_boosters, projected_sources)
 
     @staticmethod
     def _copy_profile_passthrough_fields(base: ShipProfile, target: ShipProfile) -> None:
@@ -660,28 +684,12 @@ class RuntimeProjectionMixin:
         return shared_projected_snapshot_list_signature(
             snapshots,
             module_signature_builder=cls._projected_snapshot_module_signature,
-            bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M,
+            bucket_m=PYFA_PROJECTION_RANGE_BUCKET_M,
         )
 
-    @classmethod
-    def _projected_snapshot_legacy_module_signature(cls, snapshot: dict[str, Any]) -> tuple[Any, ...]:
-        state_raw = snapshot.get("state_by_module_id")
-        state_by_module_id: dict[str, Any] = state_raw if isinstance(state_raw, dict) else {}
-        command_raw = snapshot.get("command_booster_snapshots")
-        command_snapshots = [snap for snap in command_raw if isinstance(snap, dict)] if isinstance(command_raw, list) else []
-        return (
-            "legacy_source",
-            str(snapshot.get("fit_key", "") or ""),
-            tuple((str(module_id), str(state)) for module_id, state in state_by_module_id.items()),
-            cls._command_snapshot_list_signature(command_snapshots),
-        )
-
-    @classmethod
-    def _projected_snapshot_module_signature(cls, snapshot: dict[str, Any]) -> tuple[Any, ...]:
-        return shared_projected_snapshot_module_signature(
-            snapshot,
-            legacy_builder=cls._projected_snapshot_legacy_module_signature,
-        )
+    @staticmethod
+    def _projected_snapshot_module_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        return shared_projected_snapshot_module_signature(snapshot)
 
     def _module_affects_pyfa_remote_inputs(self, module) -> bool:
         metadata = self._module_static_metadata(module)
@@ -775,13 +783,13 @@ class RuntimeProjectionMixin:
     @staticmethod
     def _quantize_pyfa_projection_range(distance: float) -> float:
         safe_distance = max(0.0, float(distance or 0.0))
-        if _PYFA_PROJECTION_RANGE_BUCKET_M <= 0.0:
+        if PYFA_PROJECTION_RANGE_BUCKET_M <= 0.0:
             return safe_distance
-        return math.floor(safe_distance / _PYFA_PROJECTION_RANGE_BUCKET_M) * _PYFA_PROJECTION_RANGE_BUCKET_M
+        return math.floor(safe_distance / PYFA_PROJECTION_RANGE_BUCKET_M) * PYFA_PROJECTION_RANGE_BUCKET_M
 
     @classmethod
     def _normalized_snapshot_projection_signature(cls, snapshot: dict[str, Any]) -> tuple[str, Any]:
-        return shared_normalized_snapshot_projection_signature(snapshot, bucket_m=_PYFA_PROJECTION_RANGE_BUCKET_M)
+        return shared_normalized_snapshot_projection_signature(snapshot, bucket_m=PYFA_PROJECTION_RANGE_BUCKET_M)
 
     def _pyfa_projection_snapshot_params(self, module, target_snapshot: CycleTargetSnapshot) -> tuple[str, float]:
         projected_effects = [

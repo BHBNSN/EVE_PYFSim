@@ -1,97 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-from copy import deepcopy
-import json
 import math
 from pathlib import Path
-import random
 import time
-from typing import Any, Callable, Literal, cast
+from typing import Callable
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QRectF, QSortFilterProxyModel, QTimer, Qt, QLocale, QCoreApplication
+from PySide6.QtCore import QPoint, QRectF, Qt, QCoreApplication
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QHBoxLayout,
-    QHeaderView,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMenu,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QSpinBox,
-    QSplitter,
-    QStyledItemDelegate,
-    QTableView,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QMenu, QWidget
 
-from ..agents import CommanderAgent
-from ..config import EngineConfig, UiConfig
-from ..fleet_setup import (
-    ManualShipSetup,
-    ParsedModuleSpec,
-    build_world_from_manual_setup,
-    EftFitParser,
-    RuntimeFromEftFactory,
-    recompute_profile_from_pyfa_runtime,
-    get_charge_options_for_module,
-    get_fit_backend_status,
-    get_common_chargeable_modules,
-    get_ship_icon_key,
-    get_type_display_name,
-    get_module_reload_time_sec,
-    resolve_module_type_name,
-)
-from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState, RuntimeStatEngine
-
-from ..lan_session import ClientLanSession, HostLanSession
-from ..lan_commands import (
-    CMD_INDUCE_FLEET_AT,
-    CMD_INDUCE_SQUAD_AT,
-    CMD_SQUAD_APPROACH,
-    CMD_SQUAD_ATTACK,
-    CMD_SQUAD_CANCEL_PREFOCUS,
-    CMD_SQUAD_CLEAR_FOCUS,
-    CMD_SQUAD_LEADER_SPEED_LIMIT,
-    CMD_SQUAD_MOVE,
-    CMD_SQUAD_PREFOCUS,
-    CMD_SQUAD_PROPULSION,
-    CMD_SYNC_SETUP,
-    SQUAD_FOCUS_COMMANDS,
-)
+from ..config import UiConfig
+from ..fleet_setup import get_ship_icon_key, get_type_display_name
+from ..fit_runtime import EffectClass, ModuleRuntime, ModuleState
 from ..math2d import Vector2
-from ..models import (
-    CombatState,
-    FitDescriptor,
-    FleetIntent,
-    NavigationState,
-    QualityLevel,
-    QualityState,
-    ShipEntity,
-    ShipProfile,
-    Team,
-    VitalState,
-)
-from ..pyfa_bridge import PyfaBridge
-from ..sim_logging import get_sim_logger, log_sim_event
-from ..simulation_engine import SimulationEngine
-from ..systems import CombatSystem
-
-
-
+from ..models import ShipEntity, Team
+from ..squad_identity import squad_key
+from .adapters.runtime_view import WorldViewSource
 from .models import AreaCycleOverlay
 class BattleCanvas(QWidget):
     _SHIP_ICON_SIZE_PX = 25
@@ -116,7 +40,7 @@ class BattleCanvas(QWidget):
 
     def __init__(
         self,
-        engine: SimulationEngine,
+        runtime_view: WorldViewSource,
         ui_cfg: UiConfig,
         on_issue_move: Callable[[str, Vector2], None],
         on_issue_approach: Callable[[str, str], None],
@@ -145,7 +69,7 @@ class BattleCanvas(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.engine = engine
+        self.runtime_view = runtime_view
         self.ui_cfg = ui_cfg
         self.on_issue_move = on_issue_move
         self.on_issue_approach = on_issue_approach
@@ -198,10 +122,6 @@ class BattleCanvas(QWidget):
         self._visual_ship_frame_ids: dict[str, int] = {}
         self._visual_ship_system_ids: dict[str, str] = {}
         self._rendering_visual_frame = False
-
-    @staticmethod
-    def _focus_key(team: Team, squad_id: str) -> str:
-        return f"{team.value}:{squad_id}"
 
     def _ui_text(self, text: str) -> str:
         if not str(self.language_getter() or "").lower().startswith("zh"):
@@ -449,7 +369,7 @@ class BattleCanvas(QWidget):
         return not current or (bool(target) and current == target)
 
     def _current_system_definition(self):
-        map_definition = getattr(self.engine.world, "map_definition", None)
+        map_definition = getattr(self.runtime_view.world, "map_definition", None)
         current = str(self.current_view_system_id or "").strip()
         if map_definition is None or not current:
             return None
@@ -477,11 +397,11 @@ class BattleCanvas(QWidget):
         except Exception:
             return 0.0
         try:
-            tidi_factor = max(0.0, min(1.0, float(getattr(self.engine, "tidi_factor", 1.0) or 1.0)))
+            tidi_factor = max(0.0, min(1.0, float(getattr(self.runtime_view, "tidi_factor", 1.0) or 1.0)))
         except Exception:
             tidi_factor = 1.0
         try:
-            max_dt = max(0.0, float(getattr(self.engine, "_dt", 1.0)))
+            max_dt = max(0.0, float(getattr(self.runtime_view, "simulation_dt", 1.0)))
         except Exception:
             max_dt = 1.0
         return max(0.0, min(max_dt, elapsed_wall * tidi_factor))
@@ -524,7 +444,7 @@ class BattleCanvas(QWidget):
         return self._project_position(projectile.position, getattr(projectile, "velocity", None))
 
     def _prune_visual_ship_positions(self) -> None:
-        live_ship_ids = {str(ship_id) for ship_id in self.engine.world.ships.keys()}
+        live_ship_ids = {str(ship_id) for ship_id in self.runtime_view.world.ships.keys()}
         stale = [ship_id for ship_id in self._visual_ship_positions.keys() if ship_id not in live_ship_ids]
         for ship_id in stale:
             self._visual_ship_positions.pop(ship_id, None)
@@ -537,7 +457,7 @@ class BattleCanvas(QWidget):
     def _pick_ship_at(self, p: QPoint, max_px_distance: float = 14.0):
         chosen = None
         chosen_dist = max_px_distance
-        for ship in self.engine.world.ships.values():
+        for ship in self.runtime_view.world.ships.values():
             if not self.ship_visible_getter(ship.ship_id):
                 continue
             if not ship.vital.alive:
@@ -556,7 +476,7 @@ class BattleCanvas(QWidget):
     def _pick_deployable_at(self, p: QPoint, max_px_distance: float = 12.0):
         chosen = None
         chosen_dist = max_px_distance
-        for entity in list(self.engine.world.drones.values()) + list(self.engine.world.fighters.values()):
+        for entity in list(self.runtime_view.world.drones.values()) + list(self.runtime_view.world.fighters.values()):
             if not entity.vital.alive:
                 continue
             if not self._matches_current_view_system(getattr(entity.nav, "system_id", "")):
@@ -573,7 +493,7 @@ class BattleCanvas(QWidget):
     def _pick_beacon_at(self, p: QPoint, max_px_distance: float = 14.0):
         chosen = None
         chosen_dist = max_px_distance
-        for beacon in self.engine.world.structures.values():
+        for beacon in self.runtime_view.world.structures.values():
             if not self._matches_current_view_system(getattr(beacon, "system_id", "")):
                 continue
             sx, sy = self._to_screen(beacon.position)
@@ -635,7 +555,7 @@ class BattleCanvas(QWidget):
         self.update()
 
     def focus_ship(self, ship_id: str) -> None:
-        ship = self.engine.world.ships.get(str(ship_id))
+        ship = self.runtime_view.world.ships.get(str(ship_id))
         if ship is None:
             return
         self.current_view_system_id = str(getattr(ship.nav, "system_id", "") or self.current_view_system_id)
@@ -644,7 +564,7 @@ class BattleCanvas(QWidget):
         self.center_on_world(ship.nav.position)
 
     def focus_structure(self, structure_id: str) -> None:
-        structure = self.engine.world.structures.get(str(structure_id))
+        structure = self.runtime_view.world.structures.get(str(structure_id))
         if structure is None:
             return
         self.current_view_system_id = str(getattr(structure, "system_id", "") or self.current_view_system_id)
@@ -653,7 +573,7 @@ class BattleCanvas(QWidget):
         self.center_on_world(structure.position)
 
     def focus_system(self, system_id: str, padding_ratio: float = 0.82) -> None:
-        map_definition = getattr(self.engine.world, "map_definition", None)
+        map_definition = getattr(self.runtime_view.world, "map_definition", None)
         if map_definition is None:
             return
         system = map_definition.system_by_id(str(system_id))
@@ -675,7 +595,7 @@ class BattleCanvas(QWidget):
         if current:
             self.focus_system(current, padding_ratio=padding_ratio)
             return
-        map_definition = getattr(self.engine.world, "map_definition", None)
+        map_definition = getattr(self.runtime_view.world, "map_definition", None)
         if map_definition is not None and getattr(map_definition, "systems", None):
             first_system_id = str(getattr(map_definition.systems[0], "system_id", "") or "")
             if first_system_id:
@@ -724,16 +644,16 @@ class BattleCanvas(QWidget):
         if system is not None:
             radius = max(1_000.0, float(system.radius_m or 1_000.0))
             return -radius, -radius, radius, radius
-        if not self.engine.world.ships:
+        if not self.runtime_view.world.ships:
             return -100_000.0, -100_000.0, 100_000.0, 100_000.0
         xs = [
             float(ship.nav.position.x)
-            for ship in self.engine.world.ships.values()
+            for ship in self.runtime_view.world.ships.values()
             if self._matches_current_view_system(getattr(ship.nav, "system_id", ""))
         ]
         ys = [
             float(ship.nav.position.y)
-            for ship in self.engine.world.ships.values()
+            for ship in self.runtime_view.world.ships.values()
             if self._matches_current_view_system(getattr(ship.nav, "system_id", ""))
         ]
         if not xs or not ys:
@@ -909,9 +829,9 @@ class BattleCanvas(QWidget):
 
     def _selected_squad_leader_ship(self):
         controlled_team = self.controlled_team_getter()
-        leader_key = self._focus_key(controlled_team, self.selected_squad)
-        leader_id = self.engine.world.squad_leaders.get(leader_key)
-        leader_ship = self.engine.world.ships.get(leader_id) if leader_id else None
+        leader_key = squad_key(controlled_team, self.selected_squad)
+        leader_id = self.runtime_view.world.squad_leaders.get(leader_key)
+        leader_ship = self.runtime_view.world.ships.get(leader_id) if leader_id else None
         if (
             leader_ship is None
             or not leader_ship.vital.alive
@@ -920,7 +840,7 @@ class BattleCanvas(QWidget):
         ):
             members = [
                 s
-                for s in self.engine.world.ships.values()
+                for s in self.runtime_view.world.ships.values()
                 if (
                     s.team == controlled_team
                     and s.squad_id == self.selected_squad
@@ -960,10 +880,10 @@ class BattleCanvas(QWidget):
         return 0.0
 
     def _sync_area_cycle_overlays(self) -> None:
-        now = float(self.engine.world.now)
+        now = float(self.runtime_view.world.now)
         cycle_restart_margin = 0.2
         for key, overlay in list(self._area_cycle_overlays.items()):
-            ship = self.engine.world.ships.get(overlay.ship_id)
+            ship = self.runtime_view.world.ships.get(overlay.ship_id)
             if ship is None or ship.runtime is None or not ship.vital.alive or not self.ship_visible_getter(overlay.ship_id):
                 self._area_cycle_overlays.pop(key, None)
                 continue
@@ -977,7 +897,7 @@ class BattleCanvas(QWidget):
             if cycle_left <= 0.0 or now >= overlay.expires_at:
                 self._area_cycle_overlays.pop(key, None)
 
-        for ship in self.engine.world.ships.values():
+        for ship in self.runtime_view.world.ships.values():
             if not ship.vital.alive or ship.runtime is None or not self.ship_visible_getter(ship.ship_id):
                 continue
             for module in ship.runtime.modules:
@@ -1011,15 +931,15 @@ class BattleCanvas(QWidget):
         self._sync_area_cycle_overlays()
         overlays: list[AreaCycleOverlay] = []
         for overlay in self._area_cycle_overlays.values():
-            ship = self.engine.world.ships.get(overlay.ship_id)
+            ship = self.runtime_view.world.ships.get(overlay.ship_id)
             if ship is None or not self._matches_current_view_system(getattr(ship.nav, "system_id", "")):
                 continue
             overlays.append(overlay)
         return overlays
 
     def _iter_active_projectile_blasts(self):
-        now = float(self.engine.world.now)
-        for blast in self.engine.world.projectile_blasts.values():
+        now = float(self.runtime_view.world.now)
+        for blast in self.runtime_view.world.projectile_blasts.values():
             if float(blast.expires_at) <= now:
                 continue
             if str(blast.kind) != "bomb":
@@ -1029,8 +949,8 @@ class BattleCanvas(QWidget):
             yield blast
 
     def _iter_active_bubble_fields(self):
-        now = float(self.engine.world.now)
-        for field in self.engine.world.bubble_fields.values():
+        now = float(self.runtime_view.world.now)
+        for field in self.runtime_view.world.bubble_fields.values():
             if not bool(getattr(field, "alive", True)):
                 continue
             if float(getattr(field, "expires_at", now + 1.0)) <= now and getattr(field, "anchor_ship_id", None) is None:
@@ -1038,7 +958,7 @@ class BattleCanvas(QWidget):
             field_system_id = str(getattr(field, "system_id", "") or "")
             if not field_system_id:
                 anchor_ship_id = str(getattr(field, "anchor_ship_id", "") or getattr(field, "source_ship_id", "") or "")
-                anchor_ship = self.engine.world.ships.get(anchor_ship_id) if anchor_ship_id else None
+                anchor_ship = self.runtime_view.world.ships.get(anchor_ship_id) if anchor_ship_id else None
                 field_system_id = str(getattr(getattr(anchor_ship, "nav", None), "system_id", "") or "")
             if not self._matches_current_view_system(field_system_id):
                 continue
@@ -1072,7 +992,7 @@ class BattleCanvas(QWidget):
                 painter.fillRect(self.rect(), QColor(15, 18, 24))
             scale = self.world_scale()
 
-            for beacon in self.engine.world.structures.values():
+            for beacon in self.runtime_view.world.structures.values():
                 if not self._matches_current_view_system(getattr(beacon, "system_id", "")):
                     continue
                 r = max(2.0, float(beacon.radius) * scale)
@@ -1093,12 +1013,12 @@ class BattleCanvas(QWidget):
             for overlay in self._iter_active_area_overlays():
                 expand_duration = max(0.0, float(getattr(overlay, "expand_duration_sec", 0.0) or 0.0))
                 if expand_duration > 0.0:
-                    progress = max(0.0, min(1.0, (float(self.engine.world.now) - float(overlay.started_at)) / expand_duration))
+                    progress = max(0.0, min(1.0, (float(self.runtime_view.world.now) - float(overlay.started_at)) / expand_duration))
                 else:
                     progress = 1.0
                 radius_px = max(1.0, float(overlay.radius_m) * scale * progress)
                 center = overlay.center
-                ship = self.engine.world.ships.get(str(getattr(overlay, "ship_id", "") or ""))
+                ship = self.runtime_view.world.ships.get(str(getattr(overlay, "ship_id", "") or ""))
                 if ship is not None:
                     center = self._ship_render_position(ship)
                 rect = self._screen_circle_rect(center, radius_px)
@@ -1143,10 +1063,10 @@ class BattleCanvas(QWidget):
                     painter.setBrush(border)
                     painter.drawEllipse(QRectF(point[0] - 2.0, point[1] - 2.0, 4.0, 4.0))
 
-            for projectile in self.engine.world.projectiles.values():
+            for projectile in self.runtime_view.world.projectiles.values():
                 projectile_system_id = str(getattr(projectile, "system_id", "") or "")
                 if not projectile_system_id:
-                    source_ship = self.engine.world.ships.get(str(getattr(projectile, "source_ship_id", "") or ""))
+                    source_ship = self.runtime_view.world.ships.get(str(getattr(projectile, "source_ship_id", "") or ""))
                     projectile_system_id = str(getattr(getattr(source_ship, "nav", None), "system_id", "") or "")
                 if not self._matches_current_view_system(projectile_system_id):
                     continue
@@ -1160,7 +1080,7 @@ class BattleCanvas(QWidget):
                 painter.drawEllipse(rect)
 
             controlled_team = self.controlled_team_getter()
-            for drone in self.engine.world.drones.values():
+            for drone in self.runtime_view.world.drones.values():
                 if not drone.vital.alive or not self._matches_current_view_system(getattr(drone.nav, "system_id", "")):
                     continue
                 point = self._screen_point_if_visible(self._project_position(drone.nav.position, drone.nav.velocity), 8.0)
@@ -1197,7 +1117,7 @@ class BattleCanvas(QWidget):
                     painter.setBrush(color)
                     painter.drawEllipse(x - 4, y - 4, 8, 8)
 
-            for fighter in self.engine.world.fighters.values():
+            for fighter in self.runtime_view.world.fighters.values():
                 if not fighter.vital.alive or not self._matches_current_view_system(getattr(fighter.nav, "system_id", "")):
                     continue
                 point = self._screen_point_if_visible(self._project_position(fighter.nav.position, fighter.nav.velocity), 10.0)
@@ -1300,7 +1220,7 @@ class BattleCanvas(QWidget):
             controlled_team = self.controlled_team_getter()
             visible_ships = [
                 ship
-                for ship in self.engine.world.ships.values()
+                for ship in self.runtime_view.world.ships.values()
                 if self.ship_visible_getter(ship.ship_id)
                 and self._matches_current_view_system(getattr(ship.nav, "system_id", ""))
             ]
@@ -1369,7 +1289,7 @@ class BattleCanvas(QWidget):
             painter.drawText(12, 20, info)
 
             controlled_team = self.controlled_team_getter()
-            focus_queue = list(self.engine.world.squad_focus_queues.get(self._focus_key(controlled_team, self.selected_squad), []))
+            focus_queue = list(self.runtime_view.world.squad_focus_queues.get(squad_key(controlled_team, self.selected_squad), []))
             current_focus = focus_queue[0] if focus_queue else QCoreApplication.translate("eve_sim", 'None')
             prefocus_list = ", ".join(focus_queue[1:]) if len(focus_queue) > 1 else QCoreApplication.translate("eve_sim", 'None')
             right_x = max(12, self.width() - 520)

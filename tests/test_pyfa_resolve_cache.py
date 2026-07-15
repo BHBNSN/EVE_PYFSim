@@ -252,6 +252,7 @@ Remote Sensor Dampener II
             "state_by_module_id": {str(module.module_id): str(module.state.value) for module in projected_runtime.modules},
             "command_booster_snapshots": [],
             "pyfa_projection_range": 1_000.0,
+            "pyfa_projection_module_signature": ("test-projected-source",),
         }
 
         _PYFA_RUNTIME_RESOLVED_CACHE.clear()
@@ -331,6 +332,7 @@ Warp Scrambler II
             "command_booster_snapshots": [],
             "pyfa_projection_range": 5_000.0,
             "pyfa_projection_key_mode": "exact_range",
+            "pyfa_projection_module_signature": ("test-scram-source",),
         }
 
         target_runtime.modules[0].state = target_runtime.modules[0].state.ACTIVE
@@ -421,6 +423,7 @@ Remote Sensor Dampener II
             "state_by_module_id": {str(module.module_id): str(module.state.value) for module in projected_a_runtime.modules},
             "command_booster_snapshots": [],
             "pyfa_projection_range": 1_000.0,
+            "pyfa_projection_module_signature": ("test-projected-a",),
         }
         snapshot_b = {
             "fit_key": projected_b_runtime.fit_key,
@@ -428,6 +431,7 @@ Remote Sensor Dampener II
             "state_by_module_id": {str(module.module_id): str(module.state.value) for module in projected_b_runtime.modules},
             "command_booster_snapshots": [],
             "pyfa_projection_range": 2_000.0,
+            "pyfa_projection_module_signature": ("test-projected-b",),
         }
 
         _PYFA_RUNTIME_RESOLVED_CACHE.clear()
@@ -468,6 +472,7 @@ Remote Sensor Dampener II
             "command_booster_snapshots": [],
             "pyfa_projection_key_mode": "in_range",
             "pyfa_projection_range": 1_000.0,
+            "pyfa_projection_module_signature": ("test-constant-projection",),
         }
         snapshot_far = {
             **snapshot_near,
@@ -506,6 +511,7 @@ Remote Sensor Dampener II
             "command_booster_snapshots": [],
             "pyfa_projection_key_mode": "exact_range",
             "pyfa_projection_range": 45_000.0,
+            "pyfa_projection_module_signature": ("projected-module",),
         }
         snapshot_same_bucket = {
             **snapshot_bucket_a,

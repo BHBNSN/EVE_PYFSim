@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import unittest
 
 from eve_sim.fit_runtime import EffectClass, FitRuntime, HullProfile, ModuleEffect, ModuleRuntime, ModuleState, SkillProfile
+from eve_sim.domain.ship_fit_service import ShipFitService
+from eve_sim.serialization.runtime_ship_factory import RuntimeReplicaShipFactory
+from eve_sim.serialization.snapshot_loader import SnapshotLoader
 from eve_sim.gui.main_window import MainWindow
+from eve_sim.application.contracts import ShipSetupSpec
+from eve_sim.lan_match_coordinator import LanMatchCoordinator
 from eve_sim.lan_commands import CMD_SYNC_SETUP
 from eve_sim.math2d import Vector2
 from eve_sim.models import CombatState, FitDescriptor, NavigationState, QualityLevel, QualityState, ShipEntity, ShipProfile, Team, VitalState
@@ -288,59 +293,54 @@ class _FakeAmmoFactory(_FakeFactory):
 class RegressionTests(unittest.TestCase):
     def test_client_resends_setup_after_reconnect(self) -> None:
         lan_client = _FakeLanClient()
-        dummy = SimpleNamespace()
-        dummy.network_mode = "client"
-        dummy.lan_client = lan_client
-        dummy._setup_synced = True
-        dummy._flush_tick_ops = lambda: None
-        dummy._build_setup_sync_payload = lambda: [{"ship_id": "RED-001"}]
-        dummy._apply_remote_snapshot = lambda packet: None
-        dummy._update_approach_targets = lambda: None
-        dummy._ui_tick_counter = 0
-        dummy._ui_refresh_interval_ticks = 99
-        dummy._overview_refresh_interval_ticks = 99
-        dummy._sync_blue_squads = lambda: None
-        dummy.request_overview_refresh = lambda force=False: None
-        dummy.refresh_blue_roster = lambda: None
-        dummy.engine = SimpleNamespace(world=SimpleNamespace(tick=1))
+        query_service = SimpleNamespace(scenario_ship_specs=lambda _team: (
+            ShipSetupSpec(
+                ship_id="RED-001",
+                squad_id="RED-ALPHA",
+                ship_group_id="test",
+                fit_text="[Test, Fit]",
+                position=Vector2(0.0, 0.0),
+                velocity=Vector2(0.0, 0.0),
+                facing_deg=0.0,
+                system_id="alpha",
+                deployed=False,
+                alive=False,
+                shield=0.0,
+                armor=0.0,
+                structure=0.0,
+                cap=0.0,
+                quality_level="REGULAR",
+                quality_reaction_delay=0.0,
+                quality_ignore_order_probability=0.0,
+                quality_formation_jitter=0.0,
+            ),
+        ))
+        coordinator = LanMatchCoordinator(
+            SimpleNamespace(query_service=query_service),
+            mode="client",
+            client=lan_client,
+        )
 
-        MainWindow.on_tick(dummy)
-        self.assertFalse(dummy._setup_synced)
+        coordinator.poll_client(Team.RED)
+        self.assertEqual(lan_client.sent_commands, [])
 
         lan_client.connected = True
-        MainWindow.on_tick(dummy)
+        coordinator.poll_client(Team.RED)
 
-        self.assertTrue(dummy._setup_synced)
         self.assertEqual(len(lan_client.sent_commands), 1)
         self.assertEqual(lan_client.sent_commands[0]["kind"], CMD_SYNC_SETUP)
 
     def test_existing_remote_ship_rebuilds_when_fit_text_changes(self) -> None:
         engine = SimpleNamespace(world=WorldState(), register_ship=lambda ship_id: None)
-        dummy = SimpleNamespace(
-            engine=engine,
-            _ship_fit_texts={},
-            _ship_locked_module_charges={},
-            _parser=_FakeParser(),
-            _factory=_FakeFactory(),
-            network_mode="client",
-            controlled_team=Team.BLUE,
-            blue_commander=SimpleNamespace(squad_ids=[]),
-            red_commander=SimpleNamespace(squad_ids=[]),
-        )
-        dummy._build_remote_ship_artifacts = lambda ship_id, data, existing=None: MainWindow._build_remote_ship_artifacts(
-            dummy,
-            ship_id,
-            data,
-            existing=existing,
-        )
+        replica_factory = RuntimeReplicaShipFactory(_FakeParser(), _FakeFactory())
 
-        first = MainWindow._ensure_remote_ship(
-            dummy,
+        first = replica_factory.ensure_ship(
+            engine.world,
             "RED-001",
             {"team": "RED", "squad_id": "SQ1", "fit_text": "fit-a", "quality_level": "REGULAR"},
         )
-        updated = MainWindow._ensure_remote_ship(
-            dummy,
+        updated = replica_factory.ensure_ship(
+            engine.world,
             "RED-001",
             {"team": "RED", "squad_id": "SQ1", "fit_text": "fit-b", "quality_level": "REGULAR"},
         )
@@ -352,51 +352,28 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(updated.runtime.fit_key, "fit-b")
         self.assertAlmostEqual(updated.nav.max_speed, 1700.0)
 
-    def test_remote_snapshot_syncs_locked_module_charges(self) -> None:
+    def test_snapshot_loader_syncs_locked_module_charges(self) -> None:
         engine = SimpleNamespace(world=WorldState(), register_ship=lambda ship_id: None)
-        dummy = SimpleNamespace(
-            engine=engine,
-            _ship_fit_texts={},
-            _ship_locked_module_charges={},
-            _undeployed_ship_ids=set(),
-            _status_dialogs={},
-            _parser=_FakeParser(),
-            _factory=_FakeFactory(),
-            network_mode="client",
-            controlled_team=Team.BLUE,
-            blue_commander=SimpleNamespace(squad_ids=[]),
-            red_commander=SimpleNamespace(squad_ids=[]),
-            _lan_debug=lambda _message: None,
-            _apply_host_engine_config=lambda payload: None,
-        )
-        dummy._build_remote_ship_artifacts = lambda ship_id, data, existing=None: MainWindow._build_remote_ship_artifacts(
-            dummy,
-            ship_id,
-            data,
-            existing=existing,
-        )
-        dummy._ensure_remote_ship = lambda ship_id, data: MainWindow._ensure_remote_ship(dummy, ship_id, data)
-
-        MainWindow._apply_remote_snapshot(
-            dummy,
+        parser = _FakeParser()
+        factory = _FakeFactory()
+        loader = SnapshotLoader(RuntimeReplicaShipFactory(parser, factory))
+        loader.apply_delta(
+            engine.world,
             {
-                "snapshot": {
-                    "tick": 1,
-                    "now": 0.0,
-                    "ships": {
-                        "RED-001": {
-                            "team": "RED",
-                            "squad_id": "SQ1",
-                            "fit_text": "fit-a",
-                            "locked_module_charges": {"mod-1": ""},
-                        }
-                    },
+                "tick": 1,
+                "now": 0.0,
+                "ships": {
+                    "RED-001": {
+                        "team": "RED",
+                        "squad_id": "SQ1",
+                        "fit_text": "fit-a",
+                        "locked_module_charges": {"mod-1": ""},
+                    }
                 }
             },
         )
 
-        self.assertIn("RED-001", dummy._ship_locked_module_charges)
-        self.assertEqual(dummy._ship_locked_module_charges["RED-001"]["mod-1"], "")
+        self.assertEqual(engine.world.ships["RED-001"].locked_module_charges["mod-1"], "")
 
     def test_attach_logger_keeps_detailed_logging_enabled(self) -> None:
         combat = CombatSystem(PyfaBridge())
@@ -422,22 +399,9 @@ class RegressionTests(unittest.TestCase):
             register_ship=lambda ship_id: None,
             combat=CombatSystem(PyfaBridge()),
         )
-        dummy = SimpleNamespace(
-            engine=engine,
-            _parser=_FakeParser(),
-            _factory=_FakeAmmoFactory(),
-            _ship_fit_texts={ship.ship_id: "fit-a"},
-            _ship_locked_module_charges={},
-            manual_setup=[],
-            _ship_initial_fit_key=lambda s: MainWindow._ship_initial_fit_key(dummy, s),
-            _preserve_runtime_dynamic_state=lambda source_runtime, target_runtime: MainWindow._preserve_runtime_dynamic_state(source_runtime, target_runtime),
-            _prune_ship_locked_module_charges=lambda ship_id, runtime_module_ids: MainWindow._prune_ship_locked_module_charges(dummy, ship_id, runtime_module_ids),
-            _sync_manual_setup_fit_text=lambda ship_id, fit_text: None,
-        )
+        service = ShipFitService(_FakeParser(), _FakeAmmoFactory(), engine.combat)
+        service.replace_fit(engine.world, Team.BLUE, ship.ship_id, "fit-b")
 
-        ok, _message, _parsed = MainWindow._rebuild_ship_from_fit_text(dummy, ship.ship_id, "fit-b", "zh_CN")
-
-        self.assertTrue(ok)
         self.assertEqual(ship.runtime.modules[0].state, ModuleState.ACTIVE)
         self.assertAlmostEqual(ship.runtime.modules[0].charge_remaining, 7.0)
         self.assertEqual(ship.runtime.modules[1].state, ModuleState.ACTIVE)

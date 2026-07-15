@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
-from ..agents import refresh_global_squad_leaders
+from ..fit_runtime import ModuleState
 from ..math2d import Vector2
+from ..maps import deserialize_map_definition, instantiate_structures
+from ..module_control import normalize_module_manual_mode, normalize_module_target_mode
 from ..models import (
     BubbleField,
     CombatState,
@@ -25,6 +28,8 @@ from ..models import (
     VitalState,
 )
 from ..world import WorldState
+from ..models import SquadLeaderLocation
+from ..timer_views import deadline_map_from_remaining_view
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -80,7 +85,7 @@ def _fit_from_ship_snapshot(ship_id: str, data: Mapping[str, Any]) -> FitDescrip
     return FitDescriptor(
         fit_key=str(ship_id),
         ship_name=str(data.get("ship_name") or ship_id),
-        role="replay",
+        role=str(data.get("role") or "replay"),
         base_dps=0.0,
         volley=0.0,
         optimal_range=120_000.0,
@@ -130,6 +135,13 @@ def _ship_from_snapshot(ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
         system_id=str(data.get("system_id") or ""),
     )
     nav.gate.target_structure_id = str(data.get("gate_target_structure_id") or "") or None
+    nav.command_mode = str(data.get("command_mode") or "move")
+    raw_command_target = data.get("command_target")
+    nav.command_target = _vector(raw_command_target) if isinstance(raw_command_target, Mapping) else None
+    nav.command_target_ship_id = str(data.get("command_target_ship_id") or "") or None
+    nav.command_target_structure_id = str(data.get("command_target_structure_id") or "") or None
+    nav.command_range_m = _float(data.get("command_range_m"))
+    nav.command_orbit_clockwise = _bool(data.get("command_orbit_clockwise"), True)
     nav.cloak.active = _bool(data.get("gate_cloak_active"))
     nav.cloak.expires_at = _float(data.get("gate_cloak_expires_at"))
     nav.cloak.source = str(data.get("gate_cloak_source") or "")
@@ -164,6 +176,9 @@ def _ship_from_snapshot(ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
         squad_id=str(data.get("squad_id") or ""),
         ship_group_id=str(data.get("ship_group_id") or ""),
         command_priority=int(data.get("command_priority") or 0),
+        deployed=_bool(data.get("deployed"), True),
+        fit_text=str(data.get("fit_text") or ""),
+        locked_module_charges=_str_dict(data.get("locked_module_charges")),
         fit=fit,
         profile=profile,
         nav=nav,
@@ -408,6 +423,14 @@ def apply_snapshot_to_world(world: WorldState, snapshot: Mapping[str, Any]) -> W
     world.tick = int(_float(snapshot.get("tick"), 0.0))
     world.now = _float(snapshot.get("now", snapshot.get("at", 0.0)))
 
+    raw_map = snapshot.get("map")
+    if isinstance(raw_map, Mapping):
+        map_definition = deserialize_map_definition(dict(raw_map))
+        world.map_id = str(map_definition.map_id or "")
+        world.map_name = str(map_definition.name or "")
+        world.map_definition = map_definition
+        world.structures = instantiate_structures(map_definition)
+
     raw_ships = snapshot.get("ships")
     world.ships = {
         str(ship_id): _ship_from_snapshot(str(ship_id), ship_data)
@@ -470,5 +493,273 @@ def apply_snapshot_to_world(world: WorldState, snapshot: Mapping[str, Any]) -> W
     }
     world.squad_propulsion_commands = _bool_dict(snapshot.get("squad_propulsion_commands"))
     world.squad_leader_speed_limits = _float_dict(snapshot.get("squad_leader_speed_limits"))
-    refresh_global_squad_leaders(world)
+    _restore_squad_leader_locations(world)
     return world
+
+def _restore_squad_leader_locations(world: WorldState) -> None:
+    locations: dict[str, SquadLeaderLocation] = {}
+    for key, leader_id in world.squad_leaders.items():
+        leader = world.ships.get(str(leader_id))
+        if leader is None or not leader.vital.alive:
+            continue
+        locations[str(key)] = SquadLeaderLocation(
+            leader_id=leader.ship_id,
+            system_id=str(leader.nav.system_id or ""),
+            location_version=int(world.squad_leader_location_versions.get(str(key), 0) or 0),
+        )
+    world.squad_leader_locations = locations
+
+
+class ReplicaShipFactory(Protocol):
+    """Creates or enriches replica ships without coupling serialization to an engine."""
+
+    def ensure_ship(self, world: WorldState, ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
+        ...
+
+
+class BasicReplicaShipFactory:
+    def ensure_ship(self, world: WorldState, ship_id: str, data: Mapping[str, Any]) -> ShipEntity:
+        ship = world.ships.get(ship_id)
+        if ship is None:
+            ship = _ship_from_snapshot(ship_id, data)
+            world.ships[ship_id] = ship
+        return ship
+
+
+@dataclass(frozen=True, slots=True)
+class ReplicaApplyResult:
+    added_ship_ids: tuple[str, ...]
+    removed_ship_ids: tuple[str, ...]
+
+
+def _update_replica_ship(ship: ShipEntity, data: Mapping[str, Any], now: float) -> None:
+    ship.squad_id = str(data.get("squad_id", ship.squad_id))
+    ship.ship_group_id = str(data.get("ship_group_id", ship.ship_group_id) or "")
+    ship.command_priority = int(data.get("command_priority", ship.command_priority) or 0)
+    ship.team = _team(data.get("team"), ship.team)
+
+    position = data.get("position")
+    if isinstance(position, Mapping):
+        ship.nav.position = Vector2(
+            _float(position.get("x"), ship.nav.position.x),
+            _float(position.get("y"), ship.nav.position.y),
+        )
+    velocity = data.get("velocity")
+    if isinstance(velocity, Mapping):
+        ship.nav.velocity = Vector2(
+            _float(velocity.get("x"), ship.nav.velocity.x),
+            _float(velocity.get("y"), ship.nav.velocity.y),
+        )
+    ship.nav.facing_deg = _float(data.get("facing_deg"), ship.nav.facing_deg)
+    ship.nav.system_id = str(data.get("system_id", ship.nav.system_id) or ship.nav.system_id)
+    ship.nav.command_mode = str(data.get("command_mode") or "move")
+    raw_command_target = data.get("command_target")
+    ship.nav.command_target = _vector(raw_command_target) if isinstance(raw_command_target, Mapping) else None
+    ship.nav.command_target_ship_id = str(data.get("command_target_ship_id") or "") or None
+    ship.nav.command_target_structure_id = str(data.get("command_target_structure_id") or "") or None
+    ship.nav.command_range_m = _float(data.get("command_range_m"), ship.nav.command_range_m)
+    ship.nav.command_orbit_clockwise = _bool(
+        data.get("command_orbit_clockwise"),
+        ship.nav.command_orbit_clockwise,
+    )
+    ship.nav.gate.target_structure_id = str(data.get("gate_target_structure_id", "") or "").strip() or None
+    ship.nav.cloak.active = _bool(data.get("gate_cloak_active"), ship.nav.cloak.active)
+    ship.nav.cloak.expires_at = _float(data.get("gate_cloak_expires_at"), ship.nav.cloak.expires_at)
+    ship.nav.cloak.source = str(data.get("gate_cloak_source", ship.nav.cloak.source) or "")
+    ship.nav.squad_follow_state = str(data.get("squad_follow_state", ship.nav.squad_follow_state) or "FORMATION_FOLLOW")
+    ship.nav.squad_follow_leader_id = str(data.get("squad_follow_leader_id", ship.nav.squad_follow_leader_id) or "") or None
+    ship.nav.squad_follow_leader_location_version = int(
+        data.get("squad_follow_leader_location_version", ship.nav.squad_follow_leader_location_version) or 0
+    )
+    ship.nav.squad_follow_warp_ready = _bool(data.get("squad_follow_warp_ready"), ship.nav.squad_follow_warp_ready)
+
+    ship.vital.shield = _float(data.get("shield"), ship.vital.shield)
+    ship.vital.armor = _float(data.get("armor"), ship.vital.armor)
+    ship.vital.structure = _float(data.get("structure"), ship.vital.structure)
+    ship.vital.shield_max = _float(data.get("shield_max"), ship.vital.shield_max)
+    ship.vital.armor_max = _float(data.get("armor_max"), ship.vital.armor_max)
+    ship.vital.structure_max = _float(data.get("structure_max"), ship.vital.structure_max)
+    ship.vital.cap = _float(data.get("cap"), ship.vital.cap)
+    ship.vital.cap_max = _float(data.get("cap_max"), ship.vital.cap_max)
+    ship.vital.alive = _bool(data.get("alive"), ship.vital.alive)
+    ship.deployed = _bool(data.get("deployed"), ship.deployed)
+    if "fit_text" in data:
+        ship.fit_text = str(data.get("fit_text") or "")
+    if "locked_module_charges" in data:
+        ship.locked_module_charges = _str_dict(data.get("locked_module_charges"))
+
+    ship.combat.current_target = str(data.get("target") or "") or None
+    ship.combat.projected_targets = _str_dict(data.get("projected_targets"))
+    prelocked_targets = data.get("prelocked_targets")
+    ship.combat.prelocked_targets = (
+        {str(target_id) for target_id in prelocked_targets}
+        if isinstance(prelocked_targets, list)
+        else set()
+    )
+    ship.combat.prelock_timers = _float_dict(data.get("prelock_timers"))
+
+    module_cycle_timers = data.get("module_cycle_timers")
+    if isinstance(module_cycle_timers, Mapping):
+        timers, deadlines = deadline_map_from_remaining_view(module_cycle_timers, now)
+        ship.combat.module_cycle_timers = timers
+        ship.combat.module_cycle_deadlines = deadlines
+    else:
+        ship.combat.module_cycle_timers.clear()
+        ship.combat.module_cycle_deadlines.clear()
+
+    ship.combat.ecm_jam_sources = _float_dict(data.get("ecm_jam_sources"))
+    ship.combat.ecm_last_attempt_target = str(data.get("ecm_last_attempt_target") or "") or None
+    ship.combat.ecm_last_attempt_module = str(data.get("ecm_last_attempt_module") or "") or None
+    raw_success = data.get("ecm_last_attempt_success")
+    ship.combat.ecm_last_attempt_success = raw_success if isinstance(raw_success, bool) else None
+    ship.combat.ecm_last_attempt_chance = max(0.0, min(1.0, _float(data.get("ecm_last_attempt_chance"))))
+    ship.combat.ecm_last_attempt_at = _float(data.get("ecm_last_attempt_at"), -1e9)
+    ship.combat.ecm_last_attempt_target_by_module = _str_dict(data.get("ecm_last_attempt_target_by_module"))
+    ship.combat.ecm_last_attempt_success_by_module = _bool_dict(data.get("ecm_last_attempt_success_by_module"))
+    ship.combat.ecm_last_attempt_at_by_module = _float_dict(data.get("ecm_last_attempt_at_by_module"))
+
+    manual_modes = data.get("module_manual_modes")
+    ship.combat.module_manual_modes = (
+        {str(module_id): normalize_module_manual_mode(mode) for module_id, mode in manual_modes.items() if str(module_id)}
+        if isinstance(manual_modes, Mapping)
+        else {}
+    )
+    target_modes = data.get("module_target_modes")
+    ship.combat.module_target_modes = (
+        {str(module_id): normalize_module_target_mode(mode) for module_id, mode in target_modes.items() if str(module_id)}
+        if isinstance(target_modes, Mapping)
+        else {}
+    )
+
+    module_states = data.get("module_states")
+    if isinstance(module_states, Mapping) and ship.runtime is not None:
+        state_map = {str(module_id): str(state) for module_id, state in module_states.items()}
+        for module in ship.runtime.modules:
+            state_name = state_map.get(module.module_id)
+            if state_name in ModuleState.__members__:
+                module.state = module.normalized_state(ModuleState[state_name])
+
+
+class SnapshotLoader:
+    """Authoritative snapshot restoration entry point for replay, replicas and tests."""
+
+    def __init__(self, replica_ship_factory: ReplicaShipFactory | None = None) -> None:
+        self._replica_ship_factory = replica_ship_factory or BasicReplicaShipFactory()
+
+    def load_world(self, snapshot: Mapping[str, Any]) -> WorldState:
+        world = WorldState()
+        self.apply_replica(world, snapshot)
+        return world
+
+    def apply_replica(self, replica: WorldState, snapshot: Mapping[str, Any]) -> WorldState:
+        full_snapshot = dict(snapshot)
+        raw_ships = snapshot.get("ships")
+        incoming_ship_ids = {
+            str(ship_id)
+            for ship_id in raw_ships
+        } if isinstance(raw_ships, Mapping) else set()
+        full_snapshot["removed_ship_ids"] = sorted(set(replica.ships) - incoming_ship_ids)
+        self.apply_delta(replica, full_snapshot)
+        return replica
+
+    def apply_delta(self, replica: WorldState, snapshot: Mapping[str, Any]) -> ReplicaApplyResult:
+        """Apply a LAN-style partial snapshot while preserving unchanged ships."""
+        replica.tick = int(_float(snapshot.get("tick"), replica.tick))
+        replica.now = _float(snapshot.get("now"), replica.now)
+
+        raw_map = snapshot.get("map")
+        if isinstance(raw_map, Mapping):
+            map_definition = deserialize_map_definition(dict(raw_map))
+            replica.map_id = str(map_definition.map_id or "")
+            replica.map_name = str(map_definition.name or "")
+            replica.map_definition = map_definition
+            replica.structures = instantiate_structures(map_definition)
+
+        removed_ids = tuple(
+            str(ship_id)
+            for ship_id in snapshot.get("removed_ship_ids", [])
+            if str(ship_id)
+        ) if isinstance(snapshot.get("removed_ship_ids"), list) else ()
+        for ship_id in removed_ids:
+            replica.ships.pop(ship_id, None)
+
+        raw_focus_queues = snapshot.get("squad_focus_queues")
+        if isinstance(raw_focus_queues, Mapping):
+            replica.squad_focus_queues = {
+                str(key): [str(item) for item in value if str(item)]
+                for key, value in raw_focus_queues.items()
+                if isinstance(value, list)
+            }
+        raw_focus_updated = snapshot.get("squad_focus_updated_at")
+        if isinstance(raw_focus_updated, Mapping):
+            replica.squad_focus_updated_at = {str(key): _float(value) for key, value in raw_focus_updated.items() if str(key)}
+        raw_leaders = snapshot.get("squad_leaders")
+        if isinstance(raw_leaders, Mapping):
+            replica.squad_leaders = _str_dict(raw_leaders)
+        raw_versions = snapshot.get("squad_leader_location_versions")
+        if isinstance(raw_versions, Mapping):
+            replica.squad_leader_location_versions = {str(key): int(value) for key, value in raw_versions.items()}
+        raw_propulsion = snapshot.get("squad_propulsion_commands")
+        if isinstance(raw_propulsion, Mapping):
+            replica.squad_propulsion_commands = _bool_dict(raw_propulsion)
+        raw_speed_limits = snapshot.get("squad_leader_speed_limits")
+        if isinstance(raw_speed_limits, Mapping):
+            replica.squad_leader_speed_limits = _float_dict(raw_speed_limits)
+
+        added_ids: list[str] = []
+        raw_ships = snapshot.get("ships")
+        if isinstance(raw_ships, Mapping):
+            for raw_ship_id, raw in raw_ships.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                ship_id = str(raw_ship_id)
+                was_present = ship_id in replica.ships
+                ship = self._replica_ship_factory.ensure_ship(replica, ship_id, raw)
+                if not was_present:
+                    added_ids.append(ship_id)
+                _update_replica_ship(ship, raw, replica.now)
+                deployed = _bool(raw.get("deployed"), True)
+                if not deployed:
+                    ship.vital.alive = False
+
+        raw_drones = snapshot.get("drones")
+        if isinstance(raw_drones, Mapping):
+            replica.drones = {
+                str(drone_id): _drone_from_snapshot(str(drone_id), raw)
+                for drone_id, raw in raw_drones.items()
+                if isinstance(raw, Mapping)
+            }
+        raw_fighters = snapshot.get("fighters")
+        if isinstance(raw_fighters, Mapping):
+            replica.fighters = {
+                str(fighter_id): _fighter_from_snapshot(str(fighter_id), raw)
+                for fighter_id, raw in raw_fighters.items()
+                if isinstance(raw, Mapping)
+            }
+        raw_projectiles = snapshot.get("projectiles")
+        if isinstance(raw_projectiles, Mapping):
+            replica.projectiles = {
+                str(projectile_id): _projectile_from_snapshot(str(projectile_id), raw)
+                for projectile_id, raw in raw_projectiles.items()
+                if isinstance(raw, Mapping)
+            }
+        raw_blasts = snapshot.get("projectile_blasts")
+        if isinstance(raw_blasts, Mapping):
+            replica.projectile_blasts = {
+                str(blast_id): _blast_from_snapshot(str(blast_id), raw)
+                for blast_id, raw in raw_blasts.items()
+                if isinstance(raw, Mapping)
+            }
+        raw_bubbles = snapshot.get("bubble_fields")
+        if isinstance(raw_bubbles, Mapping):
+            replica.bubble_fields = {
+                str(field_id): _bubble_from_snapshot(str(field_id), raw)
+                for field_id, raw in raw_bubbles.items()
+                if isinstance(raw, Mapping)
+            }
+
+        _restore_squad_leader_locations(replica)
+        return ReplicaApplyResult(
+            added_ship_ids=tuple(added_ids),
+            removed_ship_ids=removed_ids,
+        )

@@ -429,7 +429,6 @@ class MapEditorDialog(QDialog):
         system = self.current_system()
         if system is not None:
             system.name = self.edit_system_name.text().strip() or system.system_id
-            system.origin = Vector2(0.0, 0.0)
             system.radius_m = max(0.1 * AU_METERS, float(self.spin_system_radius.value()) * AU_METERS)
         building = self.current_building()
         if building is not None:
@@ -483,7 +482,6 @@ class MapEditorDialog(QDialog):
         system = MapSystemDefinition(
             system_id=system_id,
             name=QCoreApplication.translate("eve_sim", "System {index}").format(index=next_index),
-            origin=Vector2(0.0, 0.0),
             radius_m=30.0 * AU_METERS,
             buildings=[],
             spawn_anchors=[

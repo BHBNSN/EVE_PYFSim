@@ -1,6 +1,21 @@
 from __future__ import annotations
 
-from .combat_common import *  # noqa: F403
+import math
+from typing import Any
+
+from ..math2d import Vector2
+from ..models import ProjectileBlast, ProjectileEntity, ShipProfile
+from ..system_identity import normalize_system_namespace
+from ..world import WorldState
+from .constants import REPAIR_QUEUE_LAYERS
+from .models import (
+    DamageTuple,
+    ModuleStaticMetadata,
+    _apply_damage_sequence,
+    _layer_effective_damage,
+    _scale_damage,
+    _sum_damage,
+)
 
 
 class ProjectilesMixin:
@@ -108,7 +123,7 @@ class ProjectilesMixin:
         radius = max(0.0, float(radius_m or 0.0))
         if radius <= 0.0:
             return
-        namespace = normalize_system_namespace(system_id or self._system_id or "legacy")
+        namespace = normalize_system_namespace(system_id or self._system_id or "global")
         self._projectile_blast_seq += 1
         blast_id = f"blast:{namespace}:{self._projectile_blast_seq}"
         world.projectile_blasts[blast_id] = ProjectileBlast(
@@ -314,7 +329,7 @@ class ProjectilesMixin:
                     },
                 )
         if dirty_layers or (alive_before and not target.vital.alive):
-            self._mark_team_repair_queues_dirty(target.team, *(dirty_layers or _REPAIR_QUEUE_LAYERS))
+            self._mark_team_repair_queues_dirty(target.team, *(dirty_layers or REPAIR_QUEUE_LAYERS))
         return max(0.0, applied)
 
     def _spawn_projectile(
@@ -367,7 +382,7 @@ class ProjectilesMixin:
             age=0.0,
         )
         kind = "bomb" if metadata.is_bomb_launcher else "missile"
-        namespace = normalize_system_namespace(source_system_id or self._system_id or "legacy")
+        namespace = normalize_system_namespace(source_system_id or self._system_id or "global")
         self._projectile_seq += 1
         projectile_id = f"proj:{namespace}:{self._projectile_seq}"
         shield_max = max(0.0, float(effect.projected_add.get("weapon_projectile_shield_hp", 0.0) or 0.0))
